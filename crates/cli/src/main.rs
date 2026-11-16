@@ -56,6 +56,11 @@ fn run() -> Result<(), String> {
             let p = uni_core::ops::preview(&env, id).map_err(|e| e.0)?;
             println!("{}", serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?);
         }
+        "history" => {
+            let env = Env::from_process_env().map_err(|e| e.0)?;
+            let h = uni_core::ops::history(&env).map_err(|e| e.0)?;
+            println!("{}", serde_json::to_string_pretty(&h).map_err(|e| e.to_string())?);
+        }
         _ => println!("uni {}\nusage: uni list [--json] | show <id> | plan <id> | history | sandbox-seed | sandbox-clean", env!("CARGO_PKG_VERSION")),
     }
     Ok(())

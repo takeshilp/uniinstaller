@@ -19,6 +19,8 @@ use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_
 use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 use windows::core::{PCWSTR, w};
 
+pub type PollCallback = Box<dyn Fn(&[ProcInfo]) + Send + Sync>;
+
 pub struct RunOptions {
     pub timeout: Duration,
     pub poll: Duration,
@@ -26,7 +28,7 @@ pub struct RunOptions {
     /// Set by the UI: stop waiting, kill nothing.
     pub stop: Arc<AtomicBool>,
     /// Called after every poll with the live tracked processes.
-    pub on_poll: Option<Box<dyn Fn(&[ProcInfo]) + Send + Sync>>,
+    pub on_poll: Option<PollCallback>,
 }
 
 impl Default for RunOptions {

@@ -58,7 +58,7 @@ pub fn expand_env(s: &str) -> String {
 }
 
 fn decode_utf16(bytes: &[u8]) -> String {
-    let u: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let u: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     String::from_utf16_lossy(&u).trim_end_matches('\0').to_string()
 }
 

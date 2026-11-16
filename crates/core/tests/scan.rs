@@ -17,7 +17,7 @@ fn find_path<'a>(plan: &'a Plan, p: &Path) -> &'a Candidate {
     plan.candidates.iter().find(|c| path_of(c).is_some_and(|x| paths::norm(x) == paths::norm(p))).unwrap_or_else(|| panic!("no candidate for {}", p.display()))
 }
 
-fn find_key<'a>(plan: &'a Plan, f: impl Fn(&RegPath) -> bool) -> Vec<&'a Candidate> {
+fn find_key(plan: &Plan, f: impl Fn(&RegPath) -> bool) -> Vec<&Candidate> {
     plan.candidates.iter().filter(|c| matches!(&c.target, Target::RegKey { key } if f(key))).collect()
 }
 

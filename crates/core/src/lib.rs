@@ -1,5 +1,6 @@
 //! Uniinstaller core: no UI, shared by the CLI and the GUI.
 pub mod command;
+pub mod elevation;
 pub mod env;
 pub mod inventory;
 pub mod model;
