@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Uniinstaller</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="titlebar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <span class="logo" data-tauri-drag-region>U</span>
+      <span class="appname" data-tauri-drag-region>Uniinstaller</span>
+      <span id="modepill" data-tauri-drag-region></span>
+    </div>
+    <div class="chrome">
+      <button class="cbtn" data-act="settings" aria-label="Настройки"><span class="ic">&#xE713;</span></button>
+      <button class="cbtn" data-act="win-min" aria-label="Свернуть"><span class="ic">&#xE921;</span></button>
+      <button class="cbtn" data-act="win-max" aria-label="Развернуть"><span class="ic" id="maxglyph">&#xE922;</span></button>
+      <button class="cbtn close" data-act="win-close" aria-label="Закрыть"><span class="ic">&#xE8BB;</span></button>
+    </div>
+  </header>
+  <div id="popover" hidden></div>
+  <div id="banner"></div>
+  <main id="main"></main>
+  <footer id="bar" hidden></footer>
+  <div id="modal"></div>
+  <div id="toast"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
