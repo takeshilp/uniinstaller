@@ -44,6 +44,12 @@ fn run() -> Result<(), String> {
                 eprintln!("{} programs{}", apps.len(), if env.sandbox { " (sandbox)" } else { "" });
             }
         }
+        "show" => {
+            let id = args.get(1).ok_or("usage: uni show <id>")?;
+            let env = Env::from_process_env().map_err(|e| e.0)?;
+            let d = uni_core::ops::describe(&env, id).map_err(|e| e.0)?;
+            println!("{}", serde_json::to_string_pretty(&d).map_err(|e| e.to_string())?);
+        }
         _ => println!("uni {}\nusage: uni list [--json] | show <id> | plan <id> | history | sandbox-seed | sandbox-clean", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
