@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(name_variants("Setup"), Vec::<String>::new());
         assert_eq!(name_variants("Updater 3.0"), vec!["Updater 3.0"], "the stripped variant is a stop word");
         assert_eq!(name_variants("Ab"), Vec::<String>::new());
-        assert_eq!(publisher_variants("Acme, Inc."), vec!["Acme, Inc.", "Acme"]);
+        assert_eq!(publisher_variants("Acme, Inc."), vec!["Acme"], "a name ending with a dot is dropped");
         assert_eq!(publisher_variants("Acme Corporation"), vec!["Acme Corporation", "Acme"]);
         assert_eq!(publisher_variants("Sandbox Soft"), vec!["Sandbox Soft"]);
     }
