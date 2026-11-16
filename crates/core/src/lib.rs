@@ -5,6 +5,7 @@ pub mod inventory;
 pub mod model;
 pub mod ops;
 pub mod paths;
+pub mod scan;
 pub mod registry;
 pub mod sandbox;
 pub mod safety;
