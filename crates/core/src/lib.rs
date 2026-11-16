@@ -3,6 +3,7 @@ pub mod command;
 pub mod env;
 pub mod inventory;
 pub mod model;
+pub mod native;
 pub mod ops;
 pub mod paths;
 pub mod scan;
