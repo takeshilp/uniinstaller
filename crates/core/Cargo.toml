@@ -9,6 +9,7 @@ name = "uni_core"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+winreg = "0.56"
 windows = { version = "0.62", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com",
   "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment",

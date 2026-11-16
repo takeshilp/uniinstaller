@@ -1,8 +1,12 @@
 //! Uniinstaller core: no UI, shared by the CLI and the GUI.
 pub mod env;
+pub mod inventory;
 pub mod model;
 pub mod paths;
+pub mod registry;
+pub mod sandbox;
 pub mod safety;
+pub mod shortcuts;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
