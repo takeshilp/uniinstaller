@@ -1,0 +1,19 @@
+[package]
+name = "uni-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "uni_core"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+windows = { version = "0.62", features = [
+  "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com",
+  "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment",
+  "Win32_System_SystemInformation", "Win32_System_Threading",
+  "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging" ] }
+
+[dev-dependencies]
+tempfile = "3"

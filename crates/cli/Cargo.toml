@@ -1,0 +1,12 @@
+[package]
+name = "uni-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "uni"
+path = "src/main.rs"
+
+[dependencies]
+uni-core.workspace = true
+serde_json.workspace = true
