@@ -6,14 +6,18 @@ $ErrorActionPreference = 'Stop'
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 $results = Join-Path $RunDir '_results'
 $rank = @{ PASS = 0; RISK = 1; FAIL = 2; ERROR = 3 }
-$unexpandedCv = 'software\microsoft\windows\currentversion'   # scenarios spell it out; kept only for readable messages
 
 function Test-ReparsePoint([string]$Path) {
     $attr = (Get-Item -LiteralPath $Path -Force).Attributes
     return [bool]($attr -band [IO.FileAttributes]::ReparsePoint)
 }
 function Read-Json([string]$Path) { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
-function Norm-Id([string]$id) { ($id.ToLower() -replace '^(key|value):hkcu32:', '$1:hkcu64:') }
+# HKCU\Software is shared between views, and HKLM\...\CurrentVersion\App Paths mirrors the 64-bit view in the 32-bit view (observed in the
+# guest: removing the hklm32 key makes the hklm64 key vanish). Such ids are one physical object, so they are folded onto the 64 view.
+function Norm-Id([string]$id) {
+    $x = $id.ToLower() -replace '^(key|value):hkcu32:', '$1:hkcu64:'
+    return ($x -replace '^(key|value):hklm32:(software\\microsoft\\windows\\currentversion\\app paths\\)', '$1:hklm64:$2')
+}
 function New-Map { New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal) }
 
 function Load-Tsv([string]$Path, $Errors) {
@@ -23,7 +27,7 @@ function Load-Tsv([string]$Path, $Errors) {
         $parts = $line.Split("`t")
         if ($parts.Count -lt 2) { continue }
         if ($parts[0] -eq 'e') { [void]$Errors.Add("$($parts[1]) $($parts[2])"); continue }
-        $map[$parts[1]] = $parts[0] + "`t" + $(if ($parts.Count -gt 2) { $parts[2] } else { '' })
+        $map[(Norm-Id $parts[1])] = $parts[0] + "`t" + $(if ($parts.Count -gt 2) { $parts[2] } else { '' })
     }
     return $map
 }
@@ -131,7 +135,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         foreach ($raw in @($sc.$cls)) {
             $t = [string]$raw
             foreach ($k in $tok.Keys) { $t = $t.Replace("{$k}", $tok[$k]) }
-            $t = $t.ToLower().TrimEnd('\')
+            $t = (Norm-Id $t.TrimEnd('\'))
             if (-not ($t.StartsWith('key:') -or $t.StartsWith('value:'))) { $t = "path:$t" }
             $isKey = $t.StartsWith('key:'); $isPath = $t.StartsWith('path:')
             $k2 = if ($isKey) { $t.Substring(4) } else { '' }

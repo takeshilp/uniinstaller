@@ -7,7 +7,7 @@ if (-not (Test-Guest)) { Write-Output 'refused: not a Windows Sandbox guest'; ex
 # Never use two variable names that differ only in case: PowerShell treats them as one ($T holds the tokens).
 $out = 'C:\out'; $lab = 'C:\lab'; $bin = 'C:\labbin'
 $done = [ordered]@{ ok = $false; error = $null; exitCodes = [ordered]@{} }
-function Step([string]$text) { Add-Content "$out\progress.log" "$(Get-Date -Format o) $text" }
+function Step([string]$text) { Add-Content "$out\progress.log" "$(Get-Date -Format o) $text" -Encoding UTF8 }
 function Read-Json([string]$file) { Get-Content "$out\$file" -Raw -Encoding UTF8 | ConvertFrom-Json }
 # Start-Process -Wait also waits for descendants (a stuck msiexec client), so wait for the process itself only.
 function Wait-Exit($proc, [int]$Minutes, [string]$What) {

@@ -1,6 +1,6 @@
 { "about": "Two per-machine apps of one vendor: a suite with a plugin nested in its folder, and a SharedDLLs refcount on a shared file.",
   "install": ["labsuite.exe", "labplugin.exe"], "after_install": [], "target": "Lab Suite", "select": "unblocked",
-  "owned": ["{PUBDESKTOP}\\Lab Suite.lnk", "{APPDATA}\\Lab Vendor\\Lab Suite",
+  "owned": ["{PUBDESKTOP}\\Lab Suite.lnk", "{COMMONPROGRAMS}\\Lab Vendor\\Lab Suite.lnk", "{PF}\\Lab Vendor\\Lab Suite\\labsuite.exe", "{PF}\\Lab Vendor\\Lab Suite\\uninstall.exe", "{APPDATA}\\Lab Vendor\\Lab Suite",
     "key:hklm64:software\\lab vendor\\lab suite", "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labsuite", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labsuite.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labsuite"],
   "userdoc": [],
   "control": ["{PF}\\Lab Vendor", "{PF}\\Lab Vendor\\Lab Suite", "{PF}\\Lab Vendor\\Lab Suite\\Plugin", "{CF}\\Lab Vendor", "{PUBDESKTOP}\\Lab Suite Plugin.lnk",

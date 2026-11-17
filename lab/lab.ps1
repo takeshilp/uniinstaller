@@ -51,6 +51,7 @@ function Wait-Guest([string]$Dir) {
 function Escape-Xml([string]$text) { [Security.SecurityElement]::Escape($text) }
 
 $all = @(Get-ChildItem "$PSScriptRoot\scenarios\*.json" | ForEach-Object { $_.BaseName })
+$Scenario = @($Scenario | ForEach-Object { $_ -split ',' } | Where-Object { $_ })   # -File passes "a,b" as one string
 if (-not $Scenario) { $Scenario = $all }
 foreach ($name in $Scenario) { if ($all -notcontains $name) { throw "unknown scenario $name (known: $($all -join ', '))" } }
 Assert-NoSandbox
