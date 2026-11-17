@@ -301,7 +301,8 @@ mod tests {
         std::fs::write(t.path().join(SANDBOX_MARKER), b"").unwrap();
         let e = Env::from_sandbox_var(Some(t.path().as_os_str().to_owned())).unwrap();
         assert!(e.sandbox);
-        assert!(crate::paths::is_inside(&e.data_dir, t.path()));
+        // Env::sandbox canonicalizes the root, so compare against the canonical form (CI temp dirs are 8.3 paths).
+        assert!(crate::paths::is_inside(&e.data_dir, &crate::paths::canonical(t.path()).unwrap()));
         // Absent variable -> the real system, read-only.
         let s = Env::from_sandbox_var(None).unwrap();
         assert!(!s.sandbox);
