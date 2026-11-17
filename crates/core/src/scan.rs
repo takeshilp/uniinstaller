@@ -186,6 +186,7 @@ pub struct Eval {
 }
 
 /// Volume serial of the drive that holds `data_dir` (the quarantine lives there).
+// shortcut: other-volume leftovers are blocked (see paths::move_path), per-volume quarantine later.
 pub fn data_volume(env: &Env) -> std::result::Result<u32, String> {
     let mut p = env.data_dir.clone();
     while !p.exists() {

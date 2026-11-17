@@ -170,6 +170,7 @@ pub struct Env {
 }
 
 impl Env {
+    // shortcut: elevating with a different admin account changes %LOCALAPPDATA%, so history looks empty there; fixed by the stage-2 helper.
     pub fn system() -> Result<Env> {
         // shortcut: only the current user's HKCU and profile are scanned, add other users' hives in stage 2.
         let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or_else(|| Error("LOCALAPPDATA is not set".into()))?;

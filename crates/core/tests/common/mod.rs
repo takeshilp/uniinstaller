@@ -7,6 +7,7 @@ use uni_core::env::Env;
 use uni_core::paths::file_id;
 use uni_core::sandbox;
 
+// shortcut: only registry plumbing is tested (HKCU is not redirected between views), test HKLM WOW64 redirection in a VM lab.
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 pub struct Fixture {

@@ -249,6 +249,7 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     Ok(op)
 }
 
+// shortcut: a locked file is reported as Locked and retried by hand, there is no Restart Manager; add it in stage 2.
 fn is_final(s: ItemStatus) -> bool {
     matches!(s, ItemStatus::Removed | ItemStatus::NotFound)
 }

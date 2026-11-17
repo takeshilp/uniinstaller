@@ -192,6 +192,7 @@ pub fn has_doc_ext(name: &str) -> bool {
     Path::new(name).extension().and_then(|e| e.to_str()).map(|e| DOC_EXT.contains(&e.to_lowercase().as_str())).unwrap_or(false)
 }
 
+// shortcut: path leftovers on another volume than data_dir are Blocked (OtherVolume), add a per-volume quarantine folder if users need it.
 /// `MoveFileExW(src, dst, 0)`: never replaces an existing target and never copies across volumes.
 pub fn move_path(src: &Path, dst: &Path) -> io::Result<()> {
     let w = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
