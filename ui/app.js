@@ -1,11 +1,11 @@
-import { S, plural } from './strings.js';
+import { S } from './strings.js';
 
 const T = window.__TAURI__;
 const invoke = (cmd, args) => T.core.invoke(cmd, args);
 const appWindow = T.window.getCurrentWindow();
 const $ = (s) => document.querySelector(s);
 
-// Registry and file system strings are untrusted: every dynamic string goes through esc().
+// Registry and file system strings are untrusted (the WebView may run elevated): every dynamic string goes through esc().
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const ic = (code) => `<span class="ic">${code}</span>`;
 const nf = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
@@ -19,23 +19,49 @@ const fmtDate = (ms) => new Date(ms).toLocaleString('ru-RU', { day: 'numeric', m
 // shortcut: a letter tile instead of the extracted program icon, extract via ExtractIconEx if users want it.
 const letter = (name) => esc((name || '?').trim().charAt(0).toUpperCase());
 const pill = ([kind, text]) => `<span class="pill ${kind}">${esc(text)}</span>`;
+const GROUPS = ['programFiles', 'shortcuts', 'registry', 'data'];
+const lastPart = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
+const regDisplay = (k) => `${k.hive.toUpperCase()}\\${k.path} (${k.view})`;
 
 const state = {
   view: 'list', tab: 'programs',
   info: null, apps: null, appsError: null, query: '',
   details: null, detailsError: null,
-  busy: false,
+  history: null, historyError: null,
+  appId: null, plan: null, preview: false, op: null,
+  selected: new Set(), expanded: new Set(),
+  busy: false, loading: null, elapsed: 0, procs: [],
+  outcome: null, modal: null, toast: null, popover: false, error: null,
+  update: null, updating: false,
 };
 
 function set(patch) { Object.assign(state, patch); render(); }
+const fail = (e) => set({ error: String(e), busy: false, loading: null });
+
+// ---------- helpers on plans and operations ----------
+const candName = (c) => c.target.type === 'path' ? lastPart(c.target.path) : c.target.type === 'regKey' ? lastPart(c.target.key.path) : c.target.name || '(по умолчанию)';
+const candWhere = (c) => c.target.type === 'path' ? c.target.path : c.target.type === 'regKey' ? regDisplay(c.target.key) : `${regDisplay(c.target.key)} → ${c.target.name}`;
+const isRegistry = (c) => c.target.type !== 'path';
+const groupable = (c) => c.blocks.length === 0 && (c.tier === 'safe' || c.tier === 'review');
+const groupOf = (g) => (state.plan?.candidates || []).filter((c) => c.group === g);
+const selectedCands = () => (state.plan?.candidates || []).filter((c) => state.selected.has(c.id) && c.blocks.length === 0);
+const initialSelection = (plan) => new Set(plan.candidates.filter((c) => c.selected && c.blocks.length === 0).map((c) => c.id));
+const restorable = (op) => op.items.filter((i) => (i.quarantine || i.regBackup) && i.restore !== 'restored');
+const retryable = (op) => op.items.filter((i) => ['accessDenied', 'locked', 'failed', 'changed'].includes(i.status));
+const itemGroup = (op, i) => {
+  const c = op.plan?.candidates.find((x) => x.id === i.candidateId);
+  if (c) return c.group;
+  return i.target.type === 'path' ? (/\.lnk$/i.test(i.target.path) ? 'shortcuts' : 'programFiles') : 'registry';
+};
 
 // ---------- views ----------
 const views = {};
+const dis = () => (state.busy ? 'disabled' : '');
 
-views.list = () => {
-  const tabs = `<div class="seg" role="tablist">
-    <button class="${state.tab === 'programs' ? 'on' : ''}" data-act="tab" data-tab="programs">${S.tabPrograms}</button>
-    <button class="${state.tab === 'history' ? 'on' : ''}" data-act="tab" data-tab="history">${S.tabHistory}</button></div>`;
+views.list = () => (state.tab === 'history' ? viewHistory() : viewPrograms());
+
+function viewPrograms() {
+  const tabs = tabsHtml();
   const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div>${tabs}</div>`;
   let body;
   if (state.appsError) {
@@ -47,7 +73,38 @@ views.list = () => {
       <p class="count" id="count"></p><div id="list"></div>`;
   }
   return { html: `<div class="col">${head}${body}</div>`, bar: '' };
-};
+}
+
+function tabsHtml() {
+  return `<div class="seg" role="tablist">
+    <button class="${state.tab === 'programs' ? 'on' : ''}" data-act="tab" data-tab="programs">${S.tabPrograms}</button>
+    <button class="${state.tab === 'history' ? 'on' : ''}" data-act="tab" data-tab="history">${S.tabHistory}</button></div>`;
+}
+
+function viewHistory() {
+  const head = `<div class="head"><div><h1 class="display">${S.historyTitle}</h1><p class="subtitle">${S.historySub}</p></div>${tabsHtml()}</div>`;
+  let body;
+  if (state.historyError) body = `<div class="strip danger"><span>${esc(state.historyError)}</span></div>`;
+  else if (!state.history) body = '<div class="skel"></div>'.repeat(3);
+  else if (!state.history.length) body = `<div class="card muted">${S.historyEmpty}</div>`;
+  else {
+    body = state.history.map((h) => {
+      if (h.type === 'broken') {
+        return `<div class="card row"><span class="tile sm warn">${ic('')}</span>
+          <span class="grow"><div class="name">${esc(h.id)}</div><div class="muted mono">${esc(h.path)}</div></span>
+          ${pill(['danger', S.broken])}
+          <button class="iconbtn" data-act="folder" data-path="${esc(h.path)}" title="${S.openFolder}">${ic('')}</button></div>`;
+      }
+      const op = h.op;
+      return `<button class="card row" data-act="open-op" data-id="${esc(op.id)}">
+        <span class="tile letter sm">${letter(op.app.displayName)}</span>
+        <span class="grow"><div class="name">${esc(op.app.displayName)}</div>
+          <div class="muted">${esc(fmtDate(op.createdMs))} · ${S.objects(op.items.length)}</div></span>
+        ${pill(S.opStatusPill[op.status] || ['muted', op.status])}${ic('')}</button>`;
+    }).join('');
+  }
+  return { html: `<div class="col">${head}${body}</div>`, bar: '' };
+}
 
 function filtered() {
   const q = state.query.trim().toLowerCase();
@@ -65,15 +122,15 @@ function renderList() {
       <span class="grow"><div class="name">${esc(a.displayName)}</div>
         <div class="muted">${esc([a.publisher, a.displayVersion].filter(Boolean).join(' · ') || '—')}</div></span>
       <span class="muted">${a.estimatedSizeKb != null ? fmtSize(a.estimatedSizeKb * 1024) : ''}</span>
-      ${pill(a.perUser ? ['muted', S.onlyMe] : ['muted', S.forAll])}
-      ${ic('')}
+      ${pill(['muted', a.perUser ? S.onlyMe : S.forAll])}${ic('')}
     </button>`).join('') : `<div class="card muted">${S.nothingFound}</div>`;
 }
 
 views.card = () => {
   const d = state.details;
-  if (state.detailsError) return { html: `<div class="col"><button class="link back" data-act="home">${ic('')} ${S.allPrograms}</button><div class="strip danger">${esc(state.detailsError)}</div></div>`, bar: '' };
-  if (!d) return { html: `<div class="col"><div class="skel"></div></div>`, bar: '' };
+  const back = `<button class="link back" data-act="home">${ic('')} ${S.allPrograms}</button>`;
+  if (state.detailsError) return { html: `<div class="col">${back}<div class="strip danger">${esc(state.detailsError)}</div></div>`, bar: '' };
+  if (!d) return { html: `<div class="col">${back}<div class="skel"></div></div>`, bar: '' };
   const a = d.app;
   const folder = (p) => p ? `<button class="iconbtn" data-act="folder" data-path="${esc(p)}" title="${S.showInFolder}">${ic('')}</button>` : '';
   const row = (k, v, mono, path) => `<dt>${k}</dt><dd><span class="${mono ? 'mono' : ''}">${v}</span>${folder(path)}</dd>`;
@@ -81,8 +138,7 @@ views.card = () => {
   const warn = !a.perUser && !state.info.elevated && !state.info.sandbox
     ? `<div class="strip warn"><span>${S.perMachineWarn}</span><button class="btn secondary" data-act="admin">${S.restartAdmin}</button></div>` : '';
   const err = d.launchError ? `<div class="strip danger"><span><b>${S.launchErrorTitle}.</b> ${esc(d.launchError)}</span></div>` : '';
-  const html = `<div class="col">
-    <button class="link back" data-act="home">${ic('')} ${S.allPrograms}</button>
+  const html = `<div class="col">${back}
     <div class="head" style="justify-content:flex-start;align-items:center;gap:20px">
       <span class="tile letter lg">${letter(a.displayName)}</span>
       <div><h1 class="display" style="font-size:40px">${esc(a.displayName)}</h1><p class="subtitle" style="margin-top:6px">${sub || '—'}</p></div></div>
@@ -90,7 +146,7 @@ views.card = () => {
     <div class="card"><h3 style="margin-bottom:16px">${S.details}</h3><dl class="kv">
       ${row(S.kId, esc(a.id), true)}
       ${a.productCode ? row(S.kProduct, esc(a.productCode), true) : ''}
-      ${row(S.kSources, a.sources.map((s) => esc(`${s.hive.toUpperCase()}\\${s.path} (${s.view})`)).join('<br>'), true)}
+      ${row(S.kSources, a.sources.map((s) => esc(regDisplay(s))).join('<br>'), true)}
       ${row(S.kDir, a.installLocation ? esc(a.installLocation) : S.unknown, !!a.installLocation, a.installLocation)}
       ${row(S.kIcon, a.displayIcon ? esc(a.displayIcon) : S.unknown, !!a.displayIcon)}
       ${row(S.kUninstall, a.uninstallString ? esc(a.uninstallString) : S.unknown, !!a.uninstallString)}
@@ -99,13 +155,202 @@ views.card = () => {
       ${row(S.kDate, esc(a.installDate || S.unknown))}
       ${row(S.kSize, a.estimatedSizeKb != null ? fmtSize(a.estimatedSizeKb * 1024) : S.unknown)}
     </dl></div></div>`;
-  return { html, bar: '' };
+  const bar = `<div><div class="lbl">${S.sizeEstimate}</div><div class="tot">${a.estimatedSizeKb != null ? fmtSize(a.estimatedSizeKb * 1024) : '—'}</div></div>
+    <div class="acts"><button class="btn secondary" data-act="preview" ${dis()}>${S.previewLeftovers}</button>
+    <button class="btn primary" data-act="confirm" ${dis()} ${d.launchError ? 'disabled' : ''}>${S.runUninstaller}</button></div>`;
+  return { html, bar };
 };
+
+views.loading = () => ({ html: `<div class="center"><div class="spinner"></div><h1 class="display" style="font-size:32px">${esc(state.loading)}</h1></div>`, bar: '' });
+
+views.running = () => {
+  const list = state.procs.map((p) => esc(p.image)).join('<br>') || '…';
+  return {
+    html: `<div class="center"><div class="spinner"></div>
+      <h1 class="display" style="font-size:36px">${S.waitingTitle}</h1>
+      <p class="subtitle" style="max-width:560px">${S.waitingSub}</p>
+      <div class="mono muted" id="elapsed">${fmtElapsed(state.elapsed)}</div>
+      <div class="card proc"><div class="muted" style="margin-bottom:6px">${S.waitingProcs}</div><div class="mono muted" id="procs">${list}</div></div>
+      <button class="btn secondary" data-act="stop-wait">${S.stopWaiting}</button>
+      <div class="faint" style="font-size:13px">${S.stopNote}</div></div>`,
+    bar: '',
+  };
+};
+const fmtElapsed = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+views.outcome = () => {
+  const o = state.outcome;
+  return {
+    html: `<div class="col"><div class="center" style="align-items:flex-start;text-align:left">
+      <h1 class="display" style="font-size:40px">${esc(o.title)}</h1>
+      ${o.sub ? `<p class="subtitle">${esc(o.sub)}</p>` : ''}
+      ${o.detail ? `<div class="card mono muted pre" style="margin-top:12px">${esc(o.detail)}</div>` : ''}
+      <div style="margin-top:16px;display:flex;gap:12px">
+        ${o.canScan ? `<button class="btn secondary" data-act="scan-op" ${dis()}>${S.searchLeftovers}</button>` : ''}
+        <button class="btn primary" data-act="home">${S.toPrograms}</button></div></div></div>`,
+    bar: '',
+  };
+};
+
+function reviewGroupCard(g) {
+  const cands = groupOf(g);
+  if (!cands.length) return '';
+  const toggleable = cands.filter(groupable);
+  const nSel = toggleable.filter((c) => state.selected.has(c.id)).length;
+  const allSafe = cands.filter((c) => c.blocks.length === 0).every((c) => c.tier === 'safe') && cands.some((c) => c.blocks.length === 0);
+  const open = state.expanded.has(g);
+  const [title, desc] = S.groups[g];
+  const size = cands.reduce((s, c) => s + c.size, 0);
+  const checked = toggleable.length && nSel === toggleable.length;
+  const indet = nSel > 0 && nSel < toggleable.length;
+  const head = `<div class="group-head" data-act="expand" data-group="${g}">
+    <input type="checkbox" data-act="toggle-group" data-group="${g}" ${checked ? 'checked' : ''} ${indet ? 'data-indet' : ''} ${!toggleable.length || state.preview ? 'disabled' : ''} aria-label="${esc(title)}">
+    <span class="tile ${allSafe ? '' : 'warn'}">${ic(S.groupIcon[g])}</span>
+    <span class="grow"><h3>${esc(title)}</h3><div class="desc">${esc(desc)}</div></span>
+    <span class="sizeval">${fmtSize(size)}</span>
+    <span class="badge ${allSafe ? 'safe' : 'call'}">${allSafe ? S.badgeSafe : S.badgeCall}</span>
+    <span class="ic chev">${open ? '' : ''}</span></div>`;
+  let kids = '';
+  if (open) {
+    const sorted = [...cands.filter((c) => c.tier !== 'weak'), ...cands.filter((c) => c.tier === 'weak')];
+    kids = `<div class="children">${sorted.map(childRow).join('')}</div>`;
+  }
+  return `<div class="card">${head}${kids}</div>`;
+}
+
+function childRow(c) {
+  const best = [...c.evidence].sort((a, b) => b.points - a.points)[0];
+  const tip = c.evidence.map((e) => `${S.evidence[e.code] || e.code} (${e.points > 0 ? '+' : ''}${e.points})`).join('\n');
+  const why = c.tier === 'weak' ? S.weakMatch : `${best ? S.evidence[best.code] || best.code : ''} · ${S.score(c.score)}`;
+  const blocked = c.blocks.length
+    ? `<div class="bl">${esc(S.blocked(c.blocks.map((b) => `${S.blockCode[b.code] || b.code}${b.detail ? ` (${b.detail})` : ''}`).join('; ')))}</div>` : '';
+  const folder = c.target.type === 'path'
+    ? `<button class="iconbtn" data-act="folder" data-path="${esc(c.target.path)}" title="${S.showInFolder}">${ic('')}</button>` : '';
+  return `<div class="child ${c.tier === 'weak' ? 'weakrow' : ''}" title="${esc(tip)}">
+    <input type="checkbox" data-act="toggle" data-id="${esc(c.id)}" ${state.selected.has(c.id) ? 'checked' : ''} ${c.blocks.length || state.preview ? 'disabled' : ''}>
+    <span class="grow"><div class="t">${esc(candName(c))}</div><div class="s">${esc(candWhere(c))}</div>
+      <div class="s">${esc(why)}</div>${blocked}</span>
+    <span class="sizeval muted" style="font-size:15px">${isRegistry(c) ? '' : fmtSize(c.size)}</span>${folder}</div>`;
+}
+
+views.review = () => {
+  const plan = state.plan, op = state.op;
+  const total = plan.candidates.filter((c) => c.blocks.length === 0).reduce((s, c) => s + c.size, 0);
+  const eyebrow = state.preview ? S.previewEyebrow : S.removedEyebrow(op.app.displayName, op.native?.exitCode);
+  const strips = [];
+  if (plan.stillRunning?.length) strips.push(`<div class="strip warn"><span>${esc(S.stillRunning(plan.stillRunning.join(', ')))}</span></div>`);
+  if (plan.installDirStatus.type === 'rejected') strips.push(`<div class="strip warn"><span>${esc(S.dirRejected(plan.installDirStatus.reason))}</span></div>`);
+  if (plan.installDirStatus.type === 'notSet') strips.push(`<div class="strip warn"><span>${S.dirNotSet}</span></div>`);
+  const head = `<div class="head"><div><p class="eyebrow">${esc(eyebrow)}</p>
+    <div class="big">${fmtSize(total)}<small>${S.leftovers}</small></div>
+    <p class="subtitle">${S.reviewSub}</p></div>
+    <button class="link" data-act="export-json">${S.exportJson}</button></div>`;
+  const groups = GROUPS.map(reviewGroupCard).join('');
+  const body = plan.candidates.length ? groups : `<div class="card"><h3>${S.noLeftovers}</h3>
+    <div style="margin-top:14px"><button class="btn primary" data-act="home">${S.done}</button></div></div>`;
+  const sel = selectedCands();
+  const regN = sel.filter(isRegistry).length;
+  const selSize = sel.reduce((s, c) => s + c.size, 0);
+  const bar = state.preview
+    ? `<div></div><div class="acts"><button class="btn secondary" data-act="back-card">${S.back}</button>
+       <button class="btn primary" data-act="export-json">${S.exportJson}</button></div>`
+    : `<div><div class="lbl">${S.selected}</div><div class="tot">${fmtSize(selSize)}${regN ? `<small>· ${S.registryRecords(regN)}</small>` : ''}</div></div>
+       <div class="acts"><button class="btn secondary" data-act="scan-op" ${dis()}>${S.scanAgain}</button>
+       <button class="btn primary" data-act="apply" ${dis()} ${sel.length ? '' : 'disabled'}>${ic('')} ${S.deleteSelected}</button></div>`;
+  return { html: `<div><button class="link back" data-act="home">${ic('')} ${S.allPrograms}</button>${strips.join('')}${head}${body}</div>`, bar: plan.candidates.length || state.preview ? bar : '' };
+};
+
+views.result = () => {
+  const op = state.op;
+  const failed = op.items.filter((i) => ['removed', 'notFound'].includes(i.status)).length;
+  const verify = op.verify;
+  const vLines = verify
+    ? [verify.appStillListed ? S.verifyListed : S.verifyGone, verify.reappeared.length ? S.verifyReappeared(verify.reappeared.length) : S.verifyClean] : [];
+  const verCard = vLines.length ? `<div class="card"><h3 style="margin-bottom:8px">${S.verification}</h3>${vLines.map((l) => `<div class="muted">${esc(l)}</div>`).join('')}</div>` : '';
+  const denied = op.items.some((i) => i.status === 'accessDenied') && !state.info.elevated
+    ? `<div class="strip warn"><span>${S.deniedStrip}</span>${state.info.sandbox ? '' : `<button class="btn secondary" data-act="admin">${S.restartAdmin}</button>`}</div>` : '';
+  const rowsFor = (g) => op.items.filter((i) => itemGroup(op, i) === g).map((i) => {
+    const p = i.restore ? S.restoreStatus[i.restore] : S.itemStatus[i.status];
+    const name = i.target.type === 'path' ? lastPart(i.target.path) : i.target.type === 'regKey' ? lastPart(i.target.key.path) : i.target.name;
+    const where = i.target.type === 'path' ? i.target.path : i.target.type === 'regKey' ? regDisplay(i.target.key) : `${regDisplay(i.target.key)} → ${i.target.name}`;
+    const note = i.restoreDetail || i.detail;
+    return `<div class="child"><span class="grow"><div class="t">${esc(name)}</div><div class="s">${esc(where)}</div>${note ? `<div class="s">${esc(note)}</div>` : ''}</span>${pill(p || ['muted', i.status])}</div>`;
+  }).join('');
+  const groups = GROUPS.map((g) => {
+    const r = rowsFor(g);
+    return r ? `<div class="card"><h3 style="margin-bottom:6px">${esc(S.groups[g][0])}</h3>${r}</div>` : '';
+  }).join('');
+  const nRest = restorable(op).length, nRetry = retryable(op).length;
+  const scanLabel = ['awaitingReview', 'pendingReboot', 'running'].includes(op.status);
+  const bar = `<div><div class="lbl">${S.canRestore(nRest)}</div></div>
+    <div class="acts">${nRest ? `<button class="btn secondary" data-act="restore" ${dis()}>${S.restoreAll}</button>` : ''}
+    ${nRetry ? `<button class="btn secondary" data-act="retry" ${dis()}>${S.retryFailed}</button>` : ''}
+    ${scanLabel ? `<button class="btn primary" data-act="scan-op" ${dis()}>${S.searchLeftovers}</button>` : `<button class="btn primary" data-act="home">${S.toPrograms}</button>`}</div>`;
+  const html = `<div class="col"><div class="head"><div><p class="eyebrow">${esc(S.resultEyebrow(op.app.displayName, fmtDate(op.createdMs)))}</p>
+    <h1 class="display" style="font-size:44px">${esc(S.opStatus[op.status] || op.status)}</h1>
+    <p class="subtitle">${esc(S.resultCounts(failed, op.items.length))}${op.statusDetail ? ` · ${esc(op.statusDetail)}` : ''}</p></div>
+    <button class="link" data-act="export-report">${S.exportReport}</button></div>
+    ${denied}${verCard}${groups}</div>`;
+  return { html, bar };
+};
+
+// ---------- popover, modal, toast, banner ----------
+function renderPopover() {
+  const p = $('#popover');
+  p.hidden = !state.popover;
+  if (!state.popover) return;
+  const i = state.info;
+  p.innerHTML = `<div class="card"><h3 style="margin-bottom:12px">${S.settings}</h3><dl class="kv" style="grid-template-columns:110px 1fr">
+    <dt>${S.version}</dt><dd><span>${esc(i.version)}</span></dd>
+    <dt>${S.rights}</dt><dd><span>${i.elevated ? S.rightsAdmin : S.rightsUser}</span></dd>
+    ${i.sandbox ? `<dt>${S.sandboxPath}</dt><dd><span class="mono">${esc(i.dataDir)}</span></dd>` : ''}
+    <dt>${S.dataFolder}</dt><dd><span class="mono">${esc(i.dataDir)}</span><button class="iconbtn" data-act="folder" data-path="${esc(i.dataDir)}">${ic('')}</button></dd></dl>
+    <div style="margin-top:14px"><button class="btn secondary" data-act="check-update" ${dis()}>${S.checkUpdates}</button></div>
+    <div class="muted" id="upmsg" style="margin-top:8px"></div></div>`;
+}
+
+function renderModal() {
+  const m = $('#modal');
+  if (!state.modal) { m.innerHTML = ''; return; }
+  const d = state.details;
+  const cmd = d.launch ? [d.launch.exe, d.launch.args].filter(Boolean).join(' ') : '';
+  m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
+    <h2 id="mt">${esc(S.confirmTitle(d.app.displayName))}</h2>
+    <div class="muted">${S.willRun}</div><div class="cmd">${esc(cmd)}</div>
+    <div class="muted">${S.confirmNote}</div>
+    <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
+    <button class="btn primary" data-act="modal-run">${S.run}</button></div></div></div>`;
+  $('#mcancel').focus();
+}
+
+let toastTimer;
+function renderToast() {
+  const t = $('#toast');
+  t.innerHTML = state.toast ? `<div class="t"><span class="mono">${esc(state.toast.text)}</span>${state.toast.path ? `<button class="link" data-act="folder" data-path="${esc(state.toast.path)}">${S.openFolder}</button>` : ''}</div>` : '';
+  clearTimeout(toastTimer);
+  if (state.toast) toastTimer = setTimeout(() => set({ toast: null }), 9000);
+}
+
+function renderBanner() {
+  const b = $('#banner');
+  if (state.error) {
+    b.innerHTML = `<div class="strip danger"><span>${S.error}: ${esc(state.error)}</span><button class="btn secondary" data-act="dismiss-error">OK</button></div>`;
+  } else if (state.updating) {
+    b.innerHTML = `<div class="strip info"><span>${S.updating}</span></div>`;
+  } else if (state.update) {
+    const off = state.busy || state.op?.status === 'running' ? 'disabled' : '';
+    b.innerHTML = `<div class="strip info"><span>${esc(S.updateAvailable(state.update))}</span><span><button class="btn secondary" data-act="update-install" ${off}>${S.updateNow}</button>
+      <button class="link" data-act="update-later" style="margin-left:10px">${S.later}</button></span></div>`;
+  } else b.innerHTML = '';
+}
 
 // ---------- rendering ----------
 function render() {
   const v = views[state.view]();
-  $('#main').innerHTML = v.html;
+  const main = $('#main');
+  const top = main.scrollTop;
+  main.innerHTML = v.html;
+  main.scrollTop = top;
   const bar = $('#bar');
   bar.hidden = !v.bar;
   bar.innerHTML = v.bar;
@@ -113,6 +358,7 @@ function render() {
   $('#modepill').innerHTML = state.info?.sandbox ? `<span class="pill warn">${S.sandboxPill}</span>`
     : state.info?.elevated ? `<span class="pill muted">${S.adminPill}</span>` : '';
   if (state.view === 'list') renderList();
+  renderPopover(); renderModal(); renderToast(); renderBanner();
 }
 
 // ---------- actions ----------
@@ -121,22 +367,131 @@ async function loadApps() {
   try { set({ apps: await invoke('list_apps') }); } catch (e) { set({ appsError: String(e) }); }
 }
 
+async function loadHistory() {
+  set({ history: null, historyError: null });
+  try { set({ history: await invoke('history') }); } catch (e) { set({ historyError: String(e) }); }
+}
+
 async function openCard(id) {
-  set({ view: 'card', details: null, detailsError: null });
+  set({ view: 'card', appId: id, details: null, detailsError: null });
   try { set({ details: await invoke('describe_app', { id }) }); } catch (e) { set({ detailsError: String(e) }); }
+}
+
+async function doPreview() {
+  set({ view: 'loading', loading: S.previewLeftovers + '…', busy: true });
+  try {
+    const plan = await invoke('preview_plan', { id: state.appId });
+    set({ view: 'review', plan, preview: true, op: null, busy: false, loading: null, selected: initialSelection(plan), expanded: new Set() });
+  } catch (e) { set({ view: 'card', busy: false, loading: null, error: String(e) }); }
+}
+
+let timer;
+async function startUninstall() {
+  set({ modal: null, view: 'running', busy: true, elapsed: 0, procs: [] });
+  timer = setInterval(() => { state.elapsed++; const el = $('#elapsed'); if (el) el.textContent = fmtElapsed(state.elapsed); }, 1000);
+  let op;
+  try { op = await invoke('uninstall', { id: state.appId }); } catch (e) { clearInterval(timer); set({ view: 'card', busy: false, error: String(e) }); return; }
+  clearInterval(timer);
+  state.busy = false;
+  await afterNative(op);
+}
+
+async function afterNative(op) {
+  state.op = op;
+  const n = op.native || {};
+  if (op.status === 'awaitingReview') return scanOp(op.id);
+  const o = { canScan: false, detail: [n.exitCode != null ? S.exitCode(n.exitCode) : '', n.launchError || '', op.statusDetail || ''].filter(Boolean).join('\n') };
+  if (n.launchError) o.title = S.outNotStarted;
+  else if (op.status === 'pendingReboot') { o.title = S.outReboot; o.sub = S.outRebootSub; }
+  else if (op.status === 'running') { o.title = n.timedOut ? S.outTimeout : S.outRunning; o.canScan = true; }
+  else if (op.status === 'failed') o.title = S.outStillInstalled;
+  else o.title = S.opStatus[op.status] || op.status;
+  set({ view: 'outcome', outcome: o, op, busy: false });
+}
+
+async function scanOp(opId) {
+  set({ view: 'loading', loading: S.loadingRegistry, busy: true });
+  try {
+    const op = await invoke('scan_leftovers', { opId });
+    set({ view: 'review', op, plan: op.plan, preview: false, busy: false, loading: null, selected: initialSelection(op.plan), expanded: new Set() });
+  } catch (e) {
+    set({ view: state.op ? 'result' : 'list', busy: false, loading: null, error: String(e) });
+  }
+}
+
+async function runOp(cmd, args) {
+  set({ busy: true });
+  try { set({ op: await invoke(cmd, args), view: 'result', busy: false }); } catch (e) { fail(e); }
+}
+
+async function exportJson() {
+  try {
+    const path = state.preview ? await invoke('export_plan', { id: state.appId }) : await invoke('export_report', { opId: state.op.id });
+    set({ toast: { text: path, path } });
+  } catch (e) { fail(e); }
+}
+
+function toggleGroup(g) {
+  const cands = groupOf(g).filter(groupable);
+  const all = cands.every((c) => state.selected.has(c.id));
+  cands.forEach((c) => (all ? state.selected.delete(c.id) : state.selected.add(c.id)));
+  render();
 }
 
 const actions = {
   'win-min': () => appWindow.minimize(),
   'win-max': () => appWindow.toggleMaximize(),
   'win-close': () => appWindow.close(),
+  settings: () => set({ popover: !state.popover }),
   reload: () => loadApps(),
-  home: () => set({ view: 'list', tab: 'programs' }),
-  tab: (el) => set({ tab: el.dataset.tab, view: 'list' }),
+  home: () => set({ view: 'list', tab: 'programs', popover: false }),
+  tab: (el) => { set({ tab: el.dataset.tab, view: 'list' }); if (el.dataset.tab === 'history') loadHistory(); },
   open: (el) => openCard(el.dataset.id),
+  'open-op': (el) => {
+    const h = state.history.find((x) => x.type === 'ok' && x.op.id === el.dataset.id);
+    if (h) set({ op: h.op, plan: h.op.plan, view: 'result' });
+  },
   folder: (el) => invoke('open_in_explorer', { path: el.dataset.path }).catch(() => {}),
-  admin: () => invoke('restart_as_admin').catch((e) => alert(e)),
+  admin: () => invoke('restart_as_admin').catch(fail),
+  preview: () => doPreview(),
+  'back-card': () => set({ view: 'card', preview: false }),
+  confirm: () => set({ modal: true }),
+  'modal-cancel': () => set({ modal: null }),
+  'modal-cancel-overlay': (el, e) => { if (e.target === el) set({ modal: null }); },
+  'modal-run': () => startUninstall(),
+  'stop-wait': () => invoke('stop_waiting'),
+  expand: (el, e) => {
+    if (e.target.closest('input')) return;
+    const g = el.dataset.group;
+    if (state.expanded.has(g)) state.expanded.delete(g); else state.expanded.add(g);
+    render();
+  },
+  toggle: (el) => { if (el.checked) state.selected.add(el.dataset.id); else state.selected.delete(el.dataset.id); render(); },
+  'toggle-group': (el) => toggleGroup(el.dataset.group),
+  'export-json': () => exportJson(),
+  'export-report': () => exportJson(),
+  'scan-op': () => scanOp(state.op.id),
+  apply: () => runOp('apply', { opId: state.op.id, ids: selectedCands().map((c) => c.id) }),
+  restore: () => runOp('restore', { opId: state.op.id }),
+  retry: () => runOp('apply', { opId: state.op.id, ids: retryable(state.op).map((i) => i.candidateId) }),
+  'dismiss-error': () => set({ error: null }),
+  'check-update': () => checkUpdate(true),
+  'update-later': () => set({ update: null }),
+  'update-install': () => installUpdate(),
 };
+
+async function checkUpdate(manual) {
+  const msg = (t) => { const el = $('#upmsg'); if (el) el.textContent = t; };
+  try {
+    const v = await invoke('update_check');
+    if (v) set({ update: v }); else if (manual) msg(S.upToDate);
+  } catch (e) { if (manual) msg(S.updateCheckFailed); }
+}
+
+async function installUpdate() {
+  set({ updating: true });
+  try { await invoke('update_install'); } catch (e) { set({ updating: false, error: String(e) }); }
+}
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-act]');
@@ -144,13 +499,33 @@ document.addEventListener('click', (e) => {
   const fn = actions[el.dataset.act];
   if (fn) fn(el, e);
 });
+document.addEventListener('click', (e) => {
+  if (state.popover && !e.target.closest('#popover') && !e.target.closest('[data-act="settings"]')) set({ popover: false });
+});
 
 document.addEventListener('input', (e) => {
   if (e.target.id === 'q') { state.query = e.target.value; renderList(); }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (state.modal) set({ modal: null }); else if (state.popover) set({ popover: false });
+});
+
+T.event.listen('native-progress', (ev) => {
+  state.procs = ev.payload;
+  const el = $('#procs');
+  if (el) el.innerHTML = state.procs.map((p) => esc(p.image)).join('<br>') || '…';
+});
+
+appWindow.onResized?.(async () => {
+  const g = $('#maxglyph');
+  if (g) g.textContent = (await appWindow.isMaximized()) ? '' : '';
 });
 
 (async function init() {
   state.info = await invoke('app_info');
   render();
   loadApps();
+  checkUpdate(false);
 })();
