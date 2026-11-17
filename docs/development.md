@@ -33,6 +33,40 @@ installed), Sandbox Orphan (batch uninstaller leaves its key), Sandbox Broken (l
 `sandbox-clean` refuses unless the folder carries the `.uniinstaller-sandbox` marker.
 Debug builds refuse `begin`, `run_native`, `apply` and `restore` for any non-sandbox environment, so `tauri dev` can never uninstall a real program.
 
+## The lab (Windows Sandbox, real installers)
+Purpose: run real installers and the product's real uninstall, scan, apply and restore flow inside Windows Sandbox and measure the
+result with an independent inventory (recall, false deletions, restore, resume after a kill). This is the only place the
+`Env::system()` destructive flow ever runs.
+- Prerequisites: Windows Sandbox with the `wsb` CLI; .NET SDK 8 (`lab/build.ps1` installs WiX 5 into `target\lab\tools` from nuget.org
+  on the first build); NSIS from the Tauri cache (`npm run tauri build` once) or from PATH.
+- Run all scenarios: `powershell -NoProfile -ExecutionPolicy Bypass -File lab/lab.ps1`. One: add `-Scenario <name>[,<name>]`.
+  Re-analyse an old run without a sandbox: `powershell -NoProfile -ExecutionPolicy Bypass -File lab/analyze.ps1 -RunDir target\lab\out\<run>`.
+  `-TimeoutMin <n>` caps a scenario (default 20; a guest finishes in about 10 s, so only `-TimeoutMin 0` exercises the timeout path); `-StopStale` stops a Windows Sandbox that is already running (only Windows Sandbox
+  processes and `wsb stop` are ever used).
+- Runtime: a build takes about 30 s, a sandbox boot plus scenario about 30 s; a full run is a few minutes. Each launch opens a sandbox
+  window on the desktop. Agents should run it in the background.
+- Never run `target/lab/build/*` or `lab/guest/*` on the host: they install, delete and shut down. The only host-side call allowed is
+  `target\lab\build\uni-lab.exe check`, which must refuse (exit 2). Real installs, uninstalls, applies and restores happen in the guest only.
+- Outputs under `target\lab\out\<run>\`: `_in\` (staged guest input, mapped read-only as `C:\lab`), `<scenario>\` (raw guest output,
+  mapped read-write as `C:\out`), `<scenario>.wsb`, `_results\` (`<scenario>.json`, `<scenario>.md`, `summary.md`).
+- Delete old runs only with `cmd /c rmdir /s /q <run>`, never with PowerShell `Remove-Item -Recurse`: PowerShell 5.1 can follow reparse
+  points the guest created.
+- One lab run at a time; `target\lab\lab.lock` enforces it, and a second `lab.ps1` refuses ("another lab.ps1 run is active"). A Windows
+  Sandbox that is already running makes `lab.ps1` refuse until it is closed or `-StopStale` is given.
+- Lab scripts are ASCII-only and never use two variable names that differ only in case (PowerShell 5.1). Check with
+  `grep -rnP '[^\x00-\x7F]' lab/`.
+- Verdicts: ERROR (the run is not trustworthy: driver, guest or exit-code problem, nothing measured), FAIL (a product defect: false
+  deletion, inconsistent apply report, inexact restore, changed scan, bad resume), RISK (a user-data or control object removed that the
+  product offered without a block and the policy `unblocked` ticked), PASS. Recall and precision are reported, not gated. Known gaps
+  (service, task, Classes, locked file, MSI with empty InstallLocation) are listed and never fail a scenario.
+- Adding a scenario: `lab/scenarios/<name>.json` with `install` (files in `target\lab\build`, built by `lab/build.ps1`), `after_install`
+  (`file`, `delete`, `regval` actions), `target` (the DisplayName), `select` (`default` or `unblocked`), optional `lock`, `crash`,
+  `expect_begin_error`, and the four manifest classes `owned`, `userdoc`, `control`, `gap`. Patterns start with `key:` or `value:` for
+  registry ids, anything else is a path. Tokens: `{PF} {PF86} {CF} {PD} {APPDATA} {LOCALAPPDATA} {DESKTOP} {PUBDESKTOP} {PROGRAMS}
+  {COMMONPROGRAMS} {DOCS} {TASKS}`. Matching is case-insensitive, the longest pattern wins, a `key:` pattern covers its subkeys and values.
+  Spell `software\\microsoft\\windows\\currentversion` out in full. A RISK or FAIL is a product finding: never edit the manifest or the
+  policy to turn it green.
+
 ## Screenshots
 Use a PowerShell `System.Drawing` `CopyFromScreen` script kept outside the repo (find the window by title, `SetProcessDPIAware`, capture its rect).
 Real-system screenshots: list, card, confirmation modal (opened and cancelled) and preview only.
