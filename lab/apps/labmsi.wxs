@@ -1,0 +1,27 @@
+<!-- Uniinstaller lab test MSI: per-machine, inert payload, no UI tables. lab/build.ps1 passes the defines. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$(var.Name)" Manufacturer="Lab Vendor" Version="1.0.0.0" Language="1033"
+           ProductCode="$(var.ProductCode)" UpgradeCode="$(var.UpgradeCode)" Scope="perMachine">
+    <MediaTemplate EmbedCab="yes" />
+    <?if $(var.SetLoc) = 1 ?>
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
+    <?endif?>
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="VendorFolder" Name="Lab Vendor">
+        <Directory Id="INSTALLFOLDER" Name="$(var.Name)" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <Feature Id="Main">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="AppExe" Source="$(var.PayloadDir)\labapp.exe" Name="$(var.Exe)" KeyPath="yes">
+          <Shortcut Id="StartMenu" Directory="ProgramMenuFolder" Name="$(var.Name)" Advertise="no" />
+        </File>
+        <File Id="Readme" Source="$(var.PayloadDir)\readme.txt" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Lab Vendor\$(var.Name)" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run" Name="$(var.RunName)" Type="string" Value="&quot;[INSTALLFOLDER]$(var.Exe)&quot; /tray" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$(var.Exe)" Type="string" Value="[INSTALLFOLDER]$(var.Exe)" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>
