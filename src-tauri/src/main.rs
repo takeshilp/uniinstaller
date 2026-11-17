@@ -147,6 +147,29 @@ fn restart_as_admin(app: AppHandle, env: State<Env>) -> Res<()> {
     Ok(())
 }
 
+/// The UI ignores errors here (offline, no release yet).
+#[tauri::command]
+async fn update_check(app: AppHandle) -> Res<Option<String>> {
+    use tauri_plugin_updater::UpdaterExt;
+    let u = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())?;
+    Ok(u.map(|u| u.version))
+}
+
+/// On Windows the plugin launches the NSIS installer and exits the process itself.
+// shortcut: the updater is verifiable end to end only after two published releases and has no rollback,
+// do a manual check at the second release.
+#[tauri::command]
+async fn update_install(app: AppHandle) -> Res<()> {
+    use tauri_plugin_updater::UpdaterExt;
+    if ops::is_busy() {
+        return Err("operation in progress".into());
+    }
+    if let Some(u) = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())? {
+        u.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
     let env = match Env::from_process_env() {
         Ok(e) => e,
@@ -157,6 +180,7 @@ fn main() {
         }
     };
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(env)
         .manage(StopFlag(Arc::new(AtomicBool::new(false))))
         .invoke_handler(tauri::generate_handler![
@@ -173,7 +197,9 @@ fn main() {
             restore,
             history,
             open_in_explorer,
-            restart_as_admin
+            restart_as_admin,
+            update_check,
+            update_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running the application");
