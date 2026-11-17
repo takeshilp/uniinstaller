@@ -32,3 +32,7 @@ Details: `docs/development.md`, `docs/architecture.md`.
 When you restart Uniinstaller as administrator, the backups it creates are still stored in your user profile
 (`%LOCALAPPDATA%\uniinstaller-data`), and Uniinstaller itself is installed per user. Another program running under your account could
 tamper with them before an elevated restore. A separate privileged component with a protected store is planned.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
