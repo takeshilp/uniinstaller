@@ -1,0 +1,18 @@
+[package]
+name = "uni-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "uni-lab"
+path = "src/main.rs"
+
+[dependencies]
+uni-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+windows = { version = "0.62", features = ["Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+tempfile = "3"
