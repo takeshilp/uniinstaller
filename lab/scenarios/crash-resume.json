@@ -1,0 +1,5 @@
+{ "about": "Per-user NSIS app with 11 start-menu links; apply is killed after the first quarantined path, then resumed and restored.",
+  "install": ["labmany.exe"], "after_install": [], "target": "Lab Many", "select": "default", "crash": true,
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Many", "{PROGRAMS}\\Lab Many", "{PROGRAMS}\\Lab Vendor", "{DESKTOP}\\Lab Many.lnk", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labmany", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labmany.exe", "key:hkcu64:software\\microsoft\\windows\\currentversion\\uninstall\\labmany"],
+  "userdoc": [], "control": ["{LOCALAPPDATA}\\Programs"], "gap": [] }

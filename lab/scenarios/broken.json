@@ -1,0 +1,7 @@
+{ "about": "Per-user NSIS app whose uninstall.exe is deleted after install: begin must fail and nothing may change.",
+  "install": ["labbroken.exe"],
+  "after_install": [ { "delete": "{LOCALAPPDATA}\\Programs\\Lab Broken\\uninstall.exe" } ],
+  "target": "Lab Broken", "select": "default", "expect_begin_error": true,
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Broken", "{DESKTOP}\\Lab Broken.lnk", "{PROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labbroken", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labbroken.exe", "key:hkcu64:software\\microsoft\\windows\\currentversion\\uninstall\\labbroken"],
+  "userdoc": [], "control": ["{LOCALAPPDATA}\\Programs"], "gap": [] }

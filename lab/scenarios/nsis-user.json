@@ -1,0 +1,7 @@
+{ "about": "Per-user NSIS app with a sloppy uninstaller, user documents, a junction to an outside folder and a locked file.",
+  "install": ["labnotes.exe"], "after_install": [], "target": "Lab Notes", "select": "unblocked",
+  "lock": "{LOCALAPPDATA}\\Programs\\Lab Notes\\app.log",
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Notes", "{DESKTOP}\\Lab Notes.lnk", "{PROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labnotes", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labnotes.exe", "key:hkcu64:software\\microsoft\\windows\\currentversion\\uninstall\\labnotes"],
+  "userdoc": ["{LOCALAPPDATA}\\Programs\\Lab Notes\\My Work", "{LOCALAPPDATA}\\Programs\\Lab Notes\\Saves"],
+  "control": ["{LOCALAPPDATA}\\Programs", "C:\\LabOutside"], "gap": [] }

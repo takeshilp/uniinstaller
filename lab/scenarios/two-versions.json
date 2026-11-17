@@ -1,0 +1,11 @@
+{ "about": "Two versions of one product (Lab Editor 1 and 2) sharing a version-neutral settings folder and registry key.",
+  "install": ["labeditor1.exe", "labeditor2.exe"], "after_install": [], "target": "Lab Editor 1", "select": "unblocked",
+  "owned": ["{PF}\\Lab Vendor\\Lab Editor 1", "{PUBDESKTOP}\\Lab Editor 1.lnk", "{APPDATA}\\Lab Vendor\\Lab Editor 1", "{APPDATA}\\Lab Vendor\\Lab Editor\\settings-LabEditor1.ini",
+    "value:hkcu64:software\\lab vendor\\lab editor|labeditor1", "key:hklm64:software\\lab vendor\\lab editor 1",
+    "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labeditor1", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labeditor1.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labeditor1"],
+  "userdoc": [],
+  "control": ["{PF}\\Lab Vendor", "{PF}\\Lab Vendor\\Lab Editor 2", "{PUBDESKTOP}\\Lab Editor 2.lnk", "{COMMONPROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "{APPDATA}\\Lab Vendor\\Lab Editor", "{APPDATA}\\Lab Vendor\\Lab Editor 2",
+    "key:hkcu64:software\\lab vendor", "key:hkcu64:software\\lab vendor\\lab editor", "key:hklm64:software\\lab vendor", "key:hklm64:software\\lab vendor\\lab editor 2",
+    "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labeditor2", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labeditor2.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labeditor2"],
+  "gap": [] }

@@ -1,0 +1,6 @@
+{ "about": "Per-machine NSIS app with a service, a scheduled task and a file association (known gaps), default policy.",
+  "install": ["labsvc.exe"], "after_install": [], "target": "Lab Service Tool", "select": "default",
+  "owned": ["{PF}\\Lab Vendor", "{PUBDESKTOP}\\Lab Service Tool.lnk", "{COMMONPROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hklm64:software\\lab vendor", "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labservicetool", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labsvc.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labservicetool"],
+  "userdoc": [], "control": [],
+  "gap": ["key:hklm64:system\\currentcontrolset\\services\\labsvctool", "{TASKS}\\Lab Vendor", "key:hklm64:software\\classes\\.labsvc", "key:hklm64:software\\classes\\labsvctool.file"] }

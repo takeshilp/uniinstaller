@@ -1,0 +1,15 @@
+{ "about": "Per-machine x86 MSI with an empty InstallLocation (HKLM 32-bit view); afterwards the app writes a log, settings, FirstRun values and a tray Run value.",
+  "install": ["labmsi-x86.msi"],
+  "after_install": [
+    { "file": "{PF86}\\Lab Vendor\\Lab Msi Bare\\logs\\app.log" },
+    { "file": "{APPDATA}\\Lab Vendor\\Lab Msi Bare\\settings.ini" },
+    { "regval": "hkcu64:Software\\Lab Vendor\\Lab Msi Bare|FirstRun", "data": "1" },
+    { "regval": "hklm32:SOFTWARE\\Lab Vendor\\Lab Msi Bare|FirstRun", "data": "1" },
+    { "regval": "hkcu64:Software\\Microsoft\\Windows\\CurrentVersion\\Run|LabMsiBareTray", "data": "\"{PF86}\\Lab Vendor\\Lab Msi Bare\\labmsibare.exe\" /tray" } ],
+  "target": "Lab Msi Bare", "select": "unblocked",
+  "owned": ["{PF86}\\Lab Vendor", "{APPDATA}\\Lab Vendor", "{COMMONPROGRAMS}\\Lab Msi Bare.lnk",
+    "key:hkcu64:software\\lab vendor", "key:hklm32:software\\lab vendor",
+    "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labmsibaretray",
+    "value:hklm32:software\\microsoft\\windows\\currentversion\\run|labmsibare", "key:hklm32:software\\microsoft\\windows\\currentversion\\app paths\\labmsibare.exe", "key:hklm32:software\\microsoft\\windows\\currentversion\\uninstall\\{6c1a0b52-3d4e-4f60-9a71-0b2c3d4e5f02}",
+    "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labmsibare", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labmsibare.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\{6c1a0b52-3d4e-4f60-9a71-0b2c3d4e5f02}"],
+  "userdoc": [], "control": [], "gap": [] }
