@@ -317,6 +317,34 @@ fn nested_app_registry_is_shared() {
     assert!(own[0].blocks.iter().all(|b| b.code != BlockCode::SharedWithOtherApp), "own entry: {:?}", own[0].blocks);
 }
 
+/// A program Apps & Features hides (SystemComponent=1) is another app all the same.
+#[test]
+fn hidden_app_is_another_app() {
+    let f = Fixture::new();
+    let sd = suite_dir(&f.env);
+    let hd = sd.join("Hidden Helper");
+    let exe = hd.join("helper.exe");
+    fs::create_dir_all(&hd).unwrap();
+    fs::write(&exe, b"MZ fake").unwrap();
+    let entry = f.env.uninstall_roots[0].child("HiddenHelper");
+    set(&entry, "DisplayName", "Hidden Helper");
+    set(&entry, "InstallLocation", &hd.to_string_lossy());
+    registry::set_dword(&registry::create(&entry, KEY_ALL_ACCESS).unwrap(), "SystemComponent", 1).unwrap();
+    set(&f.env.run_roots[0], "HiddenHelper", &format!("\"{}\" /tray", exe.display()));
+    set(&f.env.app_paths_roots[0].child("helper.exe"), "", &exe.to_string_lossy());
+    let lnk = start_menu(&f.env).join(r"Sandbox Soft\Hidden Helper.lnk");
+    uni_core::shortcuts::create(&lnk, &exe).unwrap();
+    assert!(!uni_core::inventory::list_apps(&f.env, false).unwrap().iter().any(|a| a.display_name == "Hidden Helper"), "it is hidden");
+
+    let plan = ops::preview(&f.env, "HKCU64:SandboxSuite").unwrap();
+    assert!(shared(find_path(&plan, &hd)), "{:?}", find_path(&plan, &hd).blocks);
+    assert!(shared(find_value(&plan, "HiddenHelper")), "{:?}", find_value(&plan, "HiddenHelper").blocks);
+    let ap = find_key(&plan, |k| k.path.ends_with(r"AppPaths\helper.exe"));
+    assert_eq!(ap.len(), 1);
+    assert!(shared(ap[0]), "{:?}", ap[0].blocks);
+    assert!(shared(find_path(&plan, &lnk)), "{:?}", find_path(&plan, &lnk).blocks);
+}
+
 /// A nested app without InstallLocation is still seen through its uninstaller and icon folder.
 #[test]
 fn nested_app_without_install_location_is_shared() {

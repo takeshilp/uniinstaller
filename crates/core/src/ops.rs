@@ -101,9 +101,10 @@ pub fn describe(env: &Env, app_id: &str) -> Result<AppDetails> {
     Ok(AppDetails { app, launch, launch_error, trace })
 }
 
-/// Every other listed program: the app itself (same id or an intersecting source) is removed.
+/// Every other listed program, hidden ones included (an entry Apps & Features hides is still installed software that may own what we
+/// would remove): the app itself (same id or an intersecting source) is removed.
 fn others(env: &Env, app: &InstalledApp) -> Result<Vec<InstalledApp>> {
-    Ok(list_apps(env, false)?.into_iter().filter(|a| a.id != app.id && !a.sources.iter().any(|s| app.sources.iter().any(|x| x.same(s)))).collect())
+    Ok(list_apps(env, true)?.into_iter().filter(|a| a.id != app.id && !a.sources.iter().any(|s| app.sources.iter().any(|x| x.same(s)))).collect())
 }
 
 /// Dry run, read-only.

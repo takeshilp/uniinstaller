@@ -438,6 +438,24 @@ fn apply_recomputes_shared_blocks() {
     assert!(lnk.exists());
 }
 
+/// A hidden program that appears after the scan blocks the link at apply, like a visible one.
+#[test]
+fn apply_sees_hidden_apps() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let lnk = desktop(&f.env).join("Sandbox Notes.lnk");
+    let lnk_id = id_ending(&op, r"desktop\sandbox notes.lnk");
+    let helper = f.env.uninstall_roots[0].child("SandboxHelper");
+    set(&helper, "DisplayName", "Sandbox Helper");
+    set(&helper, "DisplayIcon", &notes_dir(&f.env).join("Sandbox Notes.exe").to_string_lossy());
+    set_dword(&helper, "SystemComponent", 1);
+    let applied = ops::apply(&f.env, &op.id, std::slice::from_ref(&lnk_id)).unwrap();
+    let it = applied.items.iter().find(|i| i.candidate_id == lnk_id).unwrap();
+    assert_eq!(it.status, ItemStatus::Blocked, "{:?}", it.detail);
+    assert!(it.detail.as_deref().unwrap_or("").starts_with("SharedWithOtherApp"), "{:?}", it.detail);
+    assert!(lnk.exists());
+}
+
 /// Another program's Uninstall entry is never offered, even when a plan names it and the identity matches.
 #[test]
 fn other_apps_uninstall_entry_is_shared() {
