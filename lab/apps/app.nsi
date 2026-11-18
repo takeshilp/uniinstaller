@@ -72,6 +72,10 @@ Section
   WriteRegStr ${HIVE} "${ARP}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegDWORD ${HIVE} "${ARP}" "NoModify" 1
   WriteRegDWORD ${HIVE} "${ARP}" "NoRepair" 1
+!ifdef HIDDEN
+  ; Hides the entry from Apps & Features, as runtime components and unwanted software do.
+  WriteRegDWORD ${HIVE} "${ARP}" "SystemComponent" 1
+!endif
   WriteRegStr ${HIVE} "${RUNKEY}" "${KEY}" '"$INSTDIR\${EXE}" /tray'
   WriteRegStr ${HIVE} "${APPPATHS}" "" "$INSTDIR\${EXE}"
   WriteRegStr ${HIVE} "${REGKEY}" "InstallDir" "$INSTDIR"

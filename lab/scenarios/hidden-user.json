@@ -1,0 +1,5 @@
+{ "about": "Per-user NSIS app hidden from Apps & Features (SystemComponent=1): listed only with hidden entries, uninstalled after the confirmation.",
+  "install": ["labhidden.exe"], "after_install": [], "target": "Lab Hidden", "select": "unblocked",
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Hidden", "{DESKTOP}\\Lab Hidden.lnk", "{PROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labhidden", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labhidden.exe", "key:hkcu64:software\\microsoft\\windows\\currentversion\\uninstall\\labhidden"],
+  "userdoc": [], "control": ["{LOCALAPPDATA}\\Programs"], "gap": [] }

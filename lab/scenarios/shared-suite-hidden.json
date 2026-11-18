@@ -1,0 +1,10 @@
+{ "about": "As shared-suite, but the nested plugin is hidden from Apps & Features (SystemComponent=1)",
+  "install": ["labsuite.exe", "labpluginhidden.exe"], "after_install": [], "target": "Lab Suite", "select": "unblocked",
+  "owned": ["{PUBDESKTOP}\\Lab Suite.lnk", "{COMMONPROGRAMS}\\Lab Vendor\\Lab Suite.lnk", "{PF}\\Lab Vendor\\Lab Suite\\labsuite.exe", "{PF}\\Lab Vendor\\Lab Suite\\uninstall.exe", "{APPDATA}\\Lab Vendor\\Lab Suite",
+    "key:hklm64:software\\lab vendor\\lab suite", "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labsuite", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labsuite.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labsuite"],
+  "userdoc": [],
+  "control": ["{PF}\\Lab Vendor", "{PF}\\Lab Vendor\\Lab Suite", "{PF}\\Lab Vendor\\Lab Suite\\Plugin", "{CF}\\Lab Vendor", "{PUBDESKTOP}\\Lab Suite Plugin.lnk",
+    "{COMMONPROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor", "{APPDATA}\\Lab Vendor\\Lab Suite Plugin",
+    "key:hklm64:software\\lab vendor", "key:hklm64:software\\lab vendor\\lab suite\\plugin", "value:hklm64:software\\microsoft\\windows\\currentversion\\shareddlls|{CF}\\lab vendor\\labshared.dll",
+    "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labsuiteplugin", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labplugin.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labsuiteplugin"],
+  "gap": [] }
