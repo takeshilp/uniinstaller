@@ -103,7 +103,7 @@ pub fn describe(env: &Env, app_id: &str) -> Result<AppDetails> {
 
 /// Every other listed program: the app itself (same id or an intersecting source) is removed.
 fn others(env: &Env, app: &InstalledApp) -> Result<Vec<InstalledApp>> {
-    Ok(list_apps(env)?.into_iter().filter(|a| a.id != app.id && !a.sources.iter().any(|s| app.sources.iter().any(|x| x.same(s)))).collect())
+    Ok(list_apps(env, false)?.into_iter().filter(|a| a.id != app.id && !a.sources.iter().any(|s| app.sources.iter().any(|x| x.same(s)))).collect())
 }
 
 /// Dry run, read-only.
@@ -187,11 +187,17 @@ pub fn export_report(env: &Env, op_id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Creates the operation record. The captured `app` is the pre-uninstall anchor snapshot.
-pub fn begin(env: &Env, app_id: &str) -> Result<Operation> {
+/// Creates the operation record. The captured `app` is the pre-uninstall anchor snapshot. A hidden entry needs `hidden_ok`, the caller's
+/// proof that the user confirmed it.
+pub fn begin(env: &Env, app_id: &str, hidden_ok: bool) -> Result<Operation> {
     guard(env)?;
     let _g = lock();
     let d = describe(env, app_id)?;
+    // shortcut: every hidden entry gets the same single confirmation; there is no publisher or bundle check (Visual C++ and .NET runtimes,
+    // WiX Burn packages, the WebView2 Runtime), add per-kind warnings if users remove runtimes by mistake.
+    if d.app.hidden.is_some() && !hidden_ok {
+        return Err(Error("a hidden component is uninstalled only after an explicit confirmation".into()));
+    }
     let launch = d.launch.ok_or_else(|| Error(d.launch_error.unwrap_or_else(|| "no usable uninstall command".into())))?;
     if let Some(dir) = d.app.install_location.as_deref()
         && let Ok(exe) = std::env::current_exe()
@@ -448,7 +454,7 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     }
 
     // Verify.
-    let listed = list_apps(env)?;
+    let listed = list_apps(env, true)?;
     let app_still_listed = listed.iter().any(|a| a.id == op.app.id || a.sources.iter().any(|s| op.app.sources.iter().any(|x| x.same(s))));
     let reappeared = op.items.iter().filter(|i| i.status == ItemStatus::Removed && target_exists(&i.target)).map(|i| i.candidate_id.clone()).collect();
     op.verify = Some(Verify { app_still_listed, reappeared });
@@ -643,7 +649,7 @@ mod tests {
         InstalledApp {
             id: "HKCU64:X".into(), key_name: "X".into(), sources: vec![], display_name: "X".into(), display_version: None, publisher: None,
             install_location: None, display_icon: None, uninstall_string: None, quiet_uninstall_string: None, modify_path: None,
-            install_date: None, estimated_size_kb: None, windows_installer: false, product_code: None, per_user: true,
+            install_date: None, estimated_size_kb: None, windows_installer: false, product_code: None, per_user: true, hidden: None,
         }
     }
 

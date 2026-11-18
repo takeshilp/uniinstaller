@@ -63,7 +63,7 @@ fn app_info(env: State<Env>) -> AppInfo {
 #[tauri::command]
 async fn list_apps(env: State<'_, Env>) -> Res<Vec<InstalledApp>> {
     let env = env.inner().clone();
-    blocking(move || s(inventory::list_apps(&env))).await
+    blocking(move || s(inventory::list_apps(&env, false))).await
 }
 
 #[tauri::command]
@@ -102,7 +102,7 @@ async fn uninstall(app: AppHandle, env: State<'_, Env>, stop: State<'_, StopFlag
     let flag = stop.0.clone();
     flag.store(false, Ordering::SeqCst);
     blocking(move || {
-        let op = s(ops::begin(&env, &id))?;
+        let op = s(ops::begin(&env, &id, false))?;
         let opts = RunOptions {
             stop: flag,
             on_poll: Some(Box::new(move |p| {

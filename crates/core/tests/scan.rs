@@ -113,6 +113,7 @@ fn bogus_app(loc: &Path) -> InstalledApp {
         windows_installer: false,
         product_code: None,
         per_user: true,
+        hidden: None,
     }
 }
 

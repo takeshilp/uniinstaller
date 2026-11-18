@@ -9,9 +9,10 @@ use uni_core::ops;
 #[ignore = "reads the real registry and file system"]
 fn real_system_list_and_preview() {
     let env = Env::system().unwrap();
-    let apps = list_apps(&env).unwrap();
+    let apps = list_apps(&env, false).unwrap();
     assert!(!apps.is_empty());
-    println!("{} programs", apps.len());
+    let hidden = list_apps(&env, true).unwrap().len() - apps.len();
+    println!("{} programs, {hidden} hidden", apps.len());
     for a in apps.iter().take(5) {
         let plan = ops::preview(&env, &a.id).unwrap();
         let selected = plan.candidates.iter().filter(|c| c.selected).count();
@@ -22,6 +23,7 @@ fn real_system_list_and_preview() {
 
 /// Read-only: writes the dry run of every listed program to the file named by `UNI_PREVIEW_DUMP`, one line per candidate (tier, score,
 /// preselection, blocks) plus one for the install folder. Diff two dumps to see what a rule change does to real data:
+/// `UNI_PREVIEW_HIDDEN=1` adds the hidden entries.
 /// `UNI_PREVIEW_DUMP=<file> cargo test -p uni-core --test real_system real_system_preview_dump -- --ignored --nocapture`.
 #[test]
 #[ignore = "reads the real registry and file system"]
@@ -32,24 +34,22 @@ fn real_system_preview_dump() {
     };
     let env = Env::system().unwrap();
     let t = std::time::Instant::now();
-    let apps = list_apps(&env).unwrap();
+    let apps = list_apps(&env, std::env::var_os("UNI_PREVIEW_HIDDEN").is_some()).unwrap();
     let mut lines = Vec::new();
     for a in &apps {
         match ops::preview(&env, &a.id) {
-            Err(e) => lines.push(format!("{}	ERROR	{e}", a.id)),
+            Err(e) => lines.push(format!("{}\tERROR\t{e}", a.id)),
             Ok(p) => {
-                lines.push(format!("{}	DIR	{:?}", a.id, p.install_dir_status));
+                lines.push(format!("{}\tDIR\t{:?}", a.id, p.install_dir_status));
                 for c in &p.candidates {
                     let mut b: Vec<String> = c.blocks.iter().map(|b| format!("{:?}: {}", b.code, b.detail)).collect();
                     b.sort();
-                    lines.push(format!("{}	{}	{:?}	{}	{}	{}", a.id, c.id, c.tier, c.score, c.selected, b.join(" | ")));
+                    lines.push(format!("{}\t{}\t{:?}\t{}\t{}\t{}", a.id, c.id, c.tier, c.score, c.selected, b.join(" | ")));
                 }
             }
         }
     }
-    std::fs::write(&out, lines.join("
-") + "
-").unwrap();
+    std::fs::write(&out, lines.join("\n") + "\n").unwrap();
     println!("{} programs, {} lines, {} ms", apps.len(), lines.len(), t.elapsed().as_millis());
 }
 

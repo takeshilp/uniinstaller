@@ -86,6 +86,17 @@ pub struct InstalledApp {
     pub windows_installer: bool,
     pub product_code: Option<String>,
     pub per_user: bool,
+    /// Only for entries Apps & Features hides; absent in manifests and journals of visible programs (0.2.0 ignores it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<HiddenReason>,
+}
+
+/// Why Apps & Features hides an Uninstall entry that the program list shows only on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HiddenReason {
+    /// `SystemComponent` = 1: runtimes, drivers, parts of bundles, and software that hides itself.
+    SystemComponent,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -28,20 +28,22 @@ fn run() -> Result<(), String> {
         }
         "list" => {
             let env = Env::from_process_env().map_err(|e| e.0)?;
-            let apps = inventory::list_apps(&env).map_err(|e| e.0)?;
+            let hidden = args.iter().any(|a| a == "--hidden");
+            let apps = inventory::list_apps(&env, hidden).map_err(|e| e.0)?;
             if args.iter().any(|a| a == "--json") {
                 println!("{}", serde_json::to_string_pretty(&apps).map_err(|e| e.to_string())?);
             } else {
                 for a in &apps {
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}{}",
                         a.id,
                         a.display_name,
                         a.display_version.as_deref().unwrap_or("-"),
-                        a.publisher.as_deref().unwrap_or("-")
+                        a.publisher.as_deref().unwrap_or("-"),
+                        if a.hidden.is_some() { "\thidden" } else { "" }
                     );
                 }
-                eprintln!("{} programs{}", apps.len(), if env.sandbox { " (sandbox)" } else { "" });
+                eprintln!("{} programs{}{}", apps.len(), if hidden { " (hidden included)" } else { "" }, if env.sandbox { " (sandbox)" } else { "" });
             }
         }
         "show" => {
@@ -61,7 +63,7 @@ fn run() -> Result<(), String> {
             let h = uni_core::ops::history(&env).map_err(|e| e.0)?;
             println!("{}", serde_json::to_string_pretty(&h).map_err(|e| e.to_string())?);
         }
-        _ => println!("uni {}\nusage: uni list [--json] | show <id> | plan <id> | history | sandbox-seed | sandbox-clean", env!("CARGO_PKG_VERSION")),
+        _ => println!("uni {}\nusage: uni list [--json] [--hidden] | show <id> | plan <id> | history | sandbox-seed | sandbox-clean", env!("CARGO_PKG_VERSION")),
     }
     Ok(())
 }

@@ -18,7 +18,7 @@ fn opts() -> RunOptions {
 
 /// begin + native uninstaller + leftover scan.
 fn uninstalled(f: &Fixture, id: &str) -> Operation {
-    let op = ops::begin(&f.env, id).unwrap();
+    let op = ops::begin(&f.env, id, false).unwrap();
     let op = ops::run_native(&f.env, &op.id, &opts()).unwrap();
     assert!(op.native.as_ref().unwrap().launch_error.is_none(), "{:?}", op.native);
     ops::scan_leftovers(&f.env, &op.id).unwrap()
@@ -282,7 +282,7 @@ fn restore_validates_quarantine_and_target() {
 #[test]
 fn still_installed_blocks_scan() {
     let f = Fixture::new();
-    let op = ops::begin(&f.env, "HKCU64:SandboxSharedTool").unwrap();
+    let op = ops::begin(&f.env, "HKCU64:SandboxSharedTool", false).unwrap();
     let op = ops::run_native(&f.env, &op.id, &opts()).unwrap();
     assert_eq!(op.entry_after, Some(EntryState::Present));
     assert_eq!(op.status, OpStatus::Failed);
@@ -384,9 +384,9 @@ fn export_report_writes_sanitized_file() {
 #[test]
 fn history_lists_newest_first() {
     let f = Fixture::new();
-    let a = ops::begin(&f.env, NOTES).unwrap();
+    let a = ops::begin(&f.env, NOTES, false).unwrap();
     std::thread::sleep(Duration::from_millis(5));
-    let b = ops::begin(&f.env, "HKCU64:SandboxSuite").unwrap();
+    let b = ops::begin(&f.env, "HKCU64:SandboxSuite", false).unwrap();
     let h = ops::history(&f.env).unwrap();
     let ids: Vec<&str> = h.iter().filter_map(|e| if let HistoryEntry::Ok { op } = e { Some(op.id.as_str()) } else { None }).collect();
     assert_eq!(ids, [b.id.as_str(), a.id.as_str()]);
@@ -397,7 +397,7 @@ fn history_lists_newest_first() {
 fn debug_guard_refuses_system_env() {
     // Env::system() is only constructed, never used for anything but the refused calls: the guard fires first.
     let env = uni_core::env::Env::system().unwrap();
-    let e = ops::begin(&env, "nonexistent").unwrap_err();
+    let e = ops::begin(&env, "nonexistent", false).unwrap_err();
     assert!(e.0.contains("sandbox"), "{e}");
     let e = ops::apply(&env, "op-1", &[]).unwrap_err();
     assert!(e.0.contains("sandbox"), "{e}");
@@ -594,6 +594,7 @@ fn stage1_manifest_loads_and_restores() {
     let op = ops::load(&f.env, "op-1").unwrap();
     assert_eq!(op.schema, 1);
     assert!(op.plan.as_ref().unwrap().trace.is_none());
+    assert!(op.app.hidden.is_none(), "the old format has no hidden mark");
     assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Ok { op } if op.id == "op-1"));
     let restored = ops::restore(&f.env, "op-1").unwrap();
     assert_eq!(restored.status, OpStatus::Restored, "{:#?}", restored.items.iter().map(|i| (&i.candidate_id, i.restore, &i.restore_detail)).collect::<Vec<_>>());
@@ -605,11 +606,64 @@ fn stage1_manifest_loads_and_restores() {
 #[test]
 fn newer_manifest_schema_is_refused() {
     let f = Fixture::new();
-    let op = ops::begin(&f.env, NOTES).unwrap();
+    let op = ops::begin(&f.env, NOTES, false).unwrap();
     let mut o = ops::load(&f.env, &op.id).unwrap();
     o.schema = SCHEMA + 1;
     ops::save(&f.env, &o).unwrap();
     let e = ops::load(&f.env, &op.id).unwrap_err();
     assert!(e.0.contains("newer version"), "{e}");
     assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Broken { .. }), "listed as Broken, not hidden");
+}
+
+fn set_dword(key: &RegPath, name: &str, value: u32) {
+    registry::set_dword(&registry::create(key, winreg::enums::KEY_ALL_ACCESS).unwrap(), name, value).unwrap();
+}
+
+/// What a plan says about each candidate, with the fixture's own root and tag masked, so two fixtures can be compared.
+fn shape(f: &Fixture, op: &Operation) -> Vec<(String, Tier, i32, bool, Vec<String>)> {
+    let root = paths::norm(&f.root);
+    let mut v: Vec<_> = plan(op)
+        .candidates
+        .iter()
+        .map(|c| {
+            let mut b: Vec<String> = c.blocks.iter().map(|b| format!("{:?}", b.code)).collect();
+            b.sort();
+            (c.id.replace(&root, "<root>").replace(&f.tag, "<tag>"), c.tier, c.score, c.selected, b)
+        })
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// A hidden entry is uninstalled only with the explicit confirmation, and then it is the normal flow.
+#[test]
+fn hidden_program_roundtrip() {
+    let f = Fixture::new();
+    for root in &f.env.uninstall_roots[..2] {
+        set_dword(&root.child("SandboxNotes"), "SystemComponent", 1);
+    }
+    let e = ops::begin(&f.env, NOTES, false).unwrap_err();
+    assert!(e.0.contains("hidden"), "{e}");
+    assert!(ops::history(&f.env).unwrap().is_empty(), "a refused begin leaves no record");
+
+    let op = ops::begin(&f.env, NOTES, true).unwrap();
+    assert_eq!(op.app.hidden, Some(HiddenReason::SystemComponent));
+    let op = ops::run_native(&f.env, &op.id, &opts()).unwrap();
+    let op = ops::scan_leftovers(&f.env, &op.id).unwrap();
+    assert_eq!(op.entry_after, Some(EntryState::Gone));
+    let ids = selectable(&op);
+    assert!(ids.len() >= 10, "{ids:?}");
+
+    let before = tree(&f);
+    let applied = ops::apply(&f.env, &op.id, &ids).unwrap();
+    assert_eq!(applied.status, OpStatus::Completed, "{:?}", applied.status_detail);
+    assert!(!applied.verify.as_ref().unwrap().app_still_listed);
+    assert_eq!(ops::load(&f.env, &op.id).unwrap().app.hidden, Some(HiddenReason::SystemComponent));
+    let restored = ops::restore(&f.env, &op.id).unwrap();
+    assert_eq!(restored.status, OpStatus::Restored);
+    assert!(tree(&f) == before, "restore brings back exactly what was removed");
+
+    let g = Fixture::new();
+    let visible = uninstalled(&g, NOTES);
+    assert_eq!(shape(&f, &op), shape(&g, &visible), "a hidden program gets the same plan as a visible one");
 }

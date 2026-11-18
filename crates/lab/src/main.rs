@@ -131,9 +131,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     };
     let core = |e: uni_core::Error| e.0;
     let out = match cmd {
-        "list" => pretty(&inventory::list_apps(&env).map_err(core)?),
+        "list" => pretty(&inventory::list_apps(&env, true).map_err(core)?), // a hidden target is found by name like any other
         "trace" => trace_install(&env, arg(1)?),
-        "begin" => pretty(&ops::begin(&env, arg(1)?).map_err(core)?),
+        "begin" => pretty(&ops::begin(&env, arg(1)?, true).map_err(core)?), // the lab acts as a user who ticked the hidden-component confirmation; the refusal is tested in tests/ops.rs
         "native" => {
             let opts = RunOptions { timeout: Duration::from_secs(300), ..Default::default() };
             pretty(&ops::run_native(&env, arg(1)?, &opts).map_err(core)?)

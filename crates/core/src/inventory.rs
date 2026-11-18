@@ -29,10 +29,8 @@ pub fn app_id(src: &RegPath, key_name: &str) -> String {
     format!("{}{}:{}", hive_name(src.hive), v, key_name)
 }
 
+// shortcut: only SystemComponent entries are listed as hidden; nameless entries, updates (ReleaseType) and ParentKeyName children stay invisible and are not other apps either (none of the last two on the owner's machine, 2026-11-18); list them if unwanted software is seen hiding that way.
 fn read_app(src: RegPath, key_name: &str, k: &winreg::RegKey) -> Option<InstalledApp> {
-    if read_dword(k, "SystemComponent") == Some(1) {
-        return None;
-    }
     let name = read_string(k, "DisplayName", true)?.trim().to_string();
     if name.is_empty() || read_string(k, "ParentKeyName", false).is_some() {
         return None;
@@ -60,39 +58,54 @@ fn read_app(src: RegPath, key_name: &str, k: &winreg::RegKey) -> Option<Installe
         estimated_size_kb: read_dword(k, "EstimatedSize"),
         windows_installer: read_dword(k, "WindowsInstaller") == Some(1),
         product_code: is_guid(key_name).then(|| key_name.to_string()),
+        hidden: (read_dword(k, "SystemComponent") == Some(1)).then_some(HiddenReason::SystemComponent),
     })
 }
 
-pub fn list_apps(env: &Env) -> Result<Vec<InstalledApp>> {
-    let mut apps: Vec<InstalledApp> = Vec::new();
-    let mut seen: HashMap<(String, String, String, String), usize> = HashMap::new();
+/// The programs Apps & Features lists, sorted by name; include_hidden adds the SystemComponent entries it hides.
+pub fn list_apps(env: &Env, include_hidden: bool) -> Result<Vec<InstalledApp>> {
+    let mut found: Vec<InstalledApp> = Vec::new();
     for root in &env.uninstall_roots {
         let Ok(rk) = registry::open(root, KEY_READ) else { continue }; // a missing root is skipped
         let mut names: Vec<String> = rk.enum_keys().flatten().collect();
         names.sort_by_key(|n| n.to_lowercase());
         for name in names {
             let Ok(k) = rk.open_subkey_with_flags(&name, KEY_READ) else { continue };
-            let Some(app) = read_app(root.child(&name), &name, &k) else { continue };
-            let key = (
-                app.display_name.to_lowercase(),
-                app.display_version.clone().unwrap_or_default(),
-                app.uninstall_string.as_deref().unwrap_or("").trim().to_lowercase(),
-                app.install_location.as_deref().map(norm).unwrap_or_default(),
-            );
-            match seen.get(&key) {
-                None => {
-                    seen.insert(key, apps.len());
-                    apps.push(app);
-                }
-                Some(&i) => {
-                    let src = app.sources[0].clone();
-                    // HKCU\Software is shared between the 32- and 64-bit views since Windows 7, so the same
-                    // path read through both views is one physical key (Microsoft, "Registry Keys Affected by WOW64").
-                    let same_physical = src.hive == Hive::Hkcu
-                        && apps[i].sources.iter().any(|x| x.hive == Hive::Hkcu && x.path.eq_ignore_ascii_case(&src.path));
-                    if !same_physical {
-                        apps[i].sources.push(src);
-                    }
+            if let Some(app) = read_app(root.child(&name), &name, &k)
+                && (include_hidden || app.hidden.is_none())
+            {
+                found.push(app);
+            }
+        }
+    }
+    // Visible entries first; the sort is stable, so the default list is built exactly as before.
+    found.sort_by_key(|a| a.hidden.is_some());
+    let mut apps: Vec<InstalledApp> = Vec::new();
+    let mut seen: HashMap<(String, String, String, String), usize> = HashMap::new();
+    for app in found {
+        let key = (
+            app.display_name.to_lowercase(),
+            app.display_version.clone().unwrap_or_default(),
+            app.uninstall_string.as_deref().unwrap_or("").trim().to_lowercase(),
+            app.install_location.as_deref().map(norm).unwrap_or_default(),
+        );
+        match seen.get(&key) {
+            None => {
+                seen.insert(key, apps.len());
+                apps.push(app);
+            }
+            // shortcut: a hidden twin of a listed program (same name, version, uninstall command and folder) is dropped, not merged as a
+            // source, so it never changes the program's id or sources; once the program is gone a leftover twin counts as another app and
+            // rejects the shared folder (fail closed). Merge it if such twins show up as leftovers.
+            Some(&i) if apps[i].hidden.is_none() && app.hidden.is_some() => {}
+            Some(&i) => {
+                let src = app.sources[0].clone();
+                // HKCU\Software is shared between the 32- and 64-bit views since Windows 7, so the same
+                // path read through both views is one physical key (Microsoft, "Registry Keys Affected by WOW64").
+                let same_physical = src.hive == Hive::Hkcu
+                    && apps[i].sources.iter().any(|x| x.hive == Hive::Hkcu && x.path.eq_ignore_ascii_case(&src.path));
+                if !same_physical {
+                    apps[i].sources.push(src);
                 }
             }
         }
@@ -102,7 +115,7 @@ pub fn list_apps(env: &Env) -> Result<Vec<InstalledApp>> {
 }
 
 pub fn find_app(env: &Env, id: &str) -> Result<InstalledApp> {
-    list_apps(env)?.into_iter().find(|a| a.id == id).ok_or_else(|| Error(format!("program not found: {id}")))
+    list_apps(env, true)?.into_iter().find(|a| a.id == id).ok_or_else(|| Error(format!("program not found: {id}")))
 }
 
 /// Whether the program's uninstall entry is gone, orphaned (entry kept, program gone) or still present.
@@ -142,7 +155,7 @@ mod tests {
         let mut a = InstalledApp {
             id: "x".into(), key_name: "x".into(), sources: vec![], display_name: "n".into(), display_version: None, publisher: None,
             install_location: None, display_icon: Some(r#""C:\A B\app.exe",0"#.into()), uninstall_string: None, quiet_uninstall_string: None,
-            modify_path: None, install_date: None, estimated_size_kb: None, windows_installer: false, product_code: None, per_user: true,
+            modify_path: None, install_date: None, estimated_size_kb: None, windows_installer: false, product_code: None, per_user: true, hidden: None,
         };
         assert_eq!(icon_path(&a).unwrap(), PathBuf::from(r"C:\A B\app.exe"));
         a.display_icon = Some(r"C:\a\b.ico".into());

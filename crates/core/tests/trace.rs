@@ -372,7 +372,7 @@ fn trust_follows_the_program_and_its_components() {
 
 /// begin + the program's own uninstaller + leftover scan.
 fn uninstalled(f: &Fixture, id: &str) -> Operation {
-    let op = ops::begin(&f.env, id).unwrap();
+    let op = ops::begin(&f.env, id, false).unwrap();
     let op = ops::run_native(&f.env, &op.id, &opts()).unwrap();
     assert!(op.native.as_ref().unwrap().launch_error.is_none(), "{:?}", op.native);
     ops::scan_leftovers(&f.env, &op.id).unwrap()
@@ -516,7 +516,7 @@ fn untrusted_trace_is_reported_not_used() {
     assert!(ops::preview(&f.env, TRACED).unwrap().trace.unwrap().trusted);
 
     // A hidden component that is still installed after the program's own uninstaller ran.
-    let op = ops::begin(&f.env, TRACED).unwrap();
+    let op = ops::begin(&f.env, TRACED, false).unwrap();
     ops::run_native(&f.env, &op.id, &opts()).unwrap();
     let runtime = f.env.uninstall_roots[0].child("SandboxTracedRuntime");
     assert!(!registry::exists(&runtime), "the uninstall script removed it");

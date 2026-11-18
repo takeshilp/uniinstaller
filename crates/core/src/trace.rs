@@ -490,7 +490,8 @@ fn link(env: &Env, changes: &[TraceChange]) -> Result<TraceLink> {
             _ => None,
         })
         .collect();
-    let mut apps: Vec<InstalledApp> = list_apps(env)?.into_iter().filter(|a| a.sources.iter().any(|s| new.iter().any(|k| k.same(s)))).collect();
+    // visible programs only: a hidden component installed alongside never links (see components_left)
+    let mut apps: Vec<InstalledApp> = list_apps(env, false)?.into_iter().filter(|a| a.sources.iter().any(|s| new.iter().any(|k| k.same(s)))).collect();
     Ok(match apps.len() {
         1 => TraceLink::Linked { app: Box::new(apps.remove(0)) },
         0 => TraceLink::NoProgram {},
@@ -956,6 +957,7 @@ mod tests {
             windows_installer: false,
             product_code: None,
             per_user: true,
+            hidden: None,
         }
     }
     fn key_path(key: &str) -> RegPath {
