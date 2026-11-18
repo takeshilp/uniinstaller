@@ -19,7 +19,7 @@ const fmtDate = (ms) => new Date(ms).toLocaleString('ru-RU', { day: 'numeric', m
 // shortcut: a letter tile instead of the extracted program icon, extract via ExtractIconEx if users want it.
 const letter = (name) => esc((name || '?').trim().charAt(0).toUpperCase());
 const pill = ([kind, text]) => `<span class="pill ${kind}">${esc(text)}</span>`;
-const GROUPS = ['programFiles', 'shortcuts', 'registry', 'data'];
+const GROUPS = ['programFiles', 'shortcuts', 'registry', 'data', 'revert'];
 const lastPart = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
 const regDisplay = (k) => `${k.hive.toUpperCase()}\\${k.path} (${k.view})`;
 
@@ -33,15 +33,30 @@ const state = {
   busy: false, loading: null, elapsed: 0, procs: [],
   outcome: null, modal: null, toast: null, popover: false, error: null,
   update: null, updating: false,
+  trace: null,
 };
 
 function set(patch) { Object.assign(state, patch); render(); }
 const fail = (e) => set({ error: String(e), busy: false, loading: null });
 
 // ---------- helpers on plans and operations ----------
-const candName = (c) => c.target.type === 'path' ? lastPart(c.target.path) : c.target.type === 'regKey' ? lastPart(c.target.key.path) : c.target.name || '(по умолчанию)';
-const candWhere = (c) => c.target.type === 'path' ? c.target.path : c.target.type === 'regKey' ? regDisplay(c.target.key) : `${regDisplay(c.target.key)} → ${c.target.name}`;
+const candName = (c) => c.target.type === 'path' ? lastPart(c.target.path) : c.target.type === 'regKey' ? lastPart(c.target.key.path) : c.target.name || S.regDefault;
+const candWhere = (c) => c.target.type === 'path' ? c.target.path : c.target.type === 'regKey' ? regDisplay(c.target.key) : `${regDisplay(c.target.key)} → ${c.target.name || S.regDefault}`;
+// A registry value for people: text, list, number, else the first bytes in hex. Untrusted: callers pass the result through esc().
+const fmtVal = (v) => {
+  if (!v) return S.valEmpty;
+  const d = v.data || [];
+  const text = () => { let s = ''; for (let i = 0; i + 1 < d.length; i += 2) s += String.fromCharCode(d[i] | (d[i + 1] << 8)); return s; };
+  let out;
+  if (v.kind === 1 || v.kind === 2) out = text().replace(/\0+$/, '');
+  else if (v.kind === 7) out = text().split('\0').filter(Boolean).join(' · ');
+  else if (v.kind === 4 && d.length === 4) out = String((d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24)) >>> 0);
+  else out = d.slice(0, 24).map((b) => b.toString(16).padStart(2, '0')).join(' ') + (d.length > 24 ? ' …' : '');
+  if (!out) return S.valEmpty;
+  return out.length > 80 ? `${out.slice(0, 80)}…` : out;
+};
 const isRegistry = (c) => c.target.type !== 'path';
+const isRevert = (c) => c.target.type === 'regRevert';
 const groupable = (c) => c.blocks.length === 0 && (c.tier === 'safe' || c.tier === 'review');
 const groupOf = (g) => (state.plan?.candidates || []).filter((c) => c.group === g);
 const selectedCands = () => (state.plan?.candidates || []).filter((c) => state.selected.has(c.id) && c.blocks.length === 0);
@@ -51,6 +66,7 @@ const retryable = (op) => op.items.filter((i) => ['accessDenied', 'locked', 'fai
 const itemGroup = (op, i) => {
   const c = op.plan?.candidates.find((x) => x.id === i.candidateId);
   if (c) return c.group;
+  if (i.target.type === 'regRevert') return 'revert';
   return i.target.type === 'path' ? (/\.lnk$/i.test(i.target.path) ? 'shortcuts' : 'programFiles') : 'registry';
 };
 
@@ -62,7 +78,8 @@ views.list = () => (state.tab === 'history' ? viewHistory() : viewPrograms());
 
 function viewPrograms() {
   const tabs = tabsHtml();
-  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div>${tabs}</div>`;
+  const traceBtn = `<button class="btn secondary" data-act="trace-open" ${dis()}>${ic('\uE896')} ${S.traceStart}</button>`;
+  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div><div style="display:flex;gap:12px;align-items:center">${traceBtn}${tabs}</div></div>`;
   let body;
   if (state.appsError) {
     body = `<div class="strip danger"><span>${S.loadError}: ${esc(state.appsError)}</span><button class="btn secondary" data-act="reload">${S.retry}</button></div>`;
@@ -138,11 +155,14 @@ views.card = () => {
   const warn = !a.perUser && !state.info.elevated && !state.info.sandbox
     ? `<div class="strip warn"><span>${S.perMachineWarn}</span><button class="btn secondary" data-act="admin">${S.restartAdmin}</button></div>` : '';
   const err = d.launchError ? `<div class="strip danger"><span><b>${S.launchErrorTitle}.</b> ${esc(d.launchError)}</span></div>` : '';
+  const tr = d.trace
+    ? (d.trace.trusted ? `<div class="strip info"><span>${esc(S.traceOnCard(fmtDate(d.trace.createdMs)))}</span></div>`
+      : `<div class="strip warn"><span>${esc(S.traceUntrusted(fmtDate(d.trace.createdMs), S.distrust[d.trace.distrust] || d.trace.distrust))}</span></div>`) : '';
   const html = `<div class="col">${back}
     <div class="head" style="justify-content:flex-start;align-items:center;gap:20px">
       <span class="tile letter lg">${letter(a.displayName)}</span>
       <div><h1 class="display" style="font-size:40px">${esc(a.displayName)}</h1><p class="subtitle" style="margin-top:6px">${sub || '—'}</p></div></div>
-    ${warn}${err}
+    ${warn}${err}${tr}
     <div class="card"><h3 style="margin-bottom:16px">${S.details}</h3><dl class="kv">
       ${row(S.kId, esc(a.id), true)}
       ${a.productCode ? row(S.kProduct, esc(a.productCode), true) : ''}
@@ -163,20 +183,79 @@ views.card = () => {
 
 views.loading = () => ({ html: `<div class="center"><div class="spinner"></div><h1 class="display" style="font-size:32px">${esc(state.loading)}</h1></div>`, bar: '' });
 
-views.running = () => {
+views.running = () => runningView(S.waitingTitle, S.waitingSub);
+
+function runningView(title, subtitle) {
   const list = state.procs.map((p) => esc(p.image)).join('<br>') || '…';
   return {
     html: `<div class="center"><div class="spinner"></div>
-      <h1 class="display" style="font-size:36px">${S.waitingTitle}</h1>
-      <p class="subtitle" style="max-width:560px">${S.waitingSub}</p>
+      <h1 class="display" style="font-size:36px">${title}</h1>
+      <p class="subtitle" style="max-width:560px">${subtitle}</p>
       <div class="mono muted" id="elapsed">${fmtElapsed(state.elapsed)}</div>
       <div class="card proc"><div class="muted" style="margin-bottom:6px">${S.waitingProcs}</div><div class="mono muted" id="procs">${list}</div></div>
       <button class="btn secondary" data-act="stop-wait">${S.stopWaiting}</button>
       <div class="faint" style="font-size:13px">${S.stopNote}</div></div>`,
     bar: '',
   };
-};
+}
 const fmtElapsed = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+// ---------- install tracing ----------
+const TRACE_LIST_MAX = 20;
+const listCard = (title, items, note) => {
+  if (!items.length) return '';
+  const shown = items.slice(0, TRACE_LIST_MAX).map((x) => `<div class="s mono">${esc(x)}</div>`).join('');
+  const more = items.length > TRACE_LIST_MAX ? `<div class="s">${esc(S.andMore(items.length - TRACE_LIST_MAX))}</div>` : '';
+  return `<div class="card"><h3 style="margin-bottom:8px">${esc(title)}</h3>${note ? `<div class="muted" style="margin-bottom:8px">${esc(note)}</div>` : ''}${shown}${more}</div>`;
+};
+
+views.trace = () => {
+  const t = state.trace;
+  if (t.phase === 'before' || t.phase === 'after') {
+    return { html: `<div class="center"><div class="spinner"></div><h1 class="display" style="font-size:32px">${esc(t.phase === 'before' ? S.traceBefore : S.traceAfter)}</h1>
+      <p class="subtitle">${S.traceSnapshotSub}</p></div>`, bar: '' };
+  }
+  if (t.phase === 'running') return runningView(S.traceWaitingTitle, S.traceWaitingSub);
+  if (t.phase === 'launch') {
+    const n = t.run || {};
+    const failed = !!n.launchError;
+    const title = failed ? S.traceNotStarted : n.exitCode ? S.traceExit(n.exitCode) : S.traceInstalled;
+    const detail = failed ? `<div class="card mono muted pre" style="margin-top:12px">${esc(n.launchError)}</div>` : '';
+    const warn = !failed && (n.stoppedByUser || n.timedOut) ? `<div class="strip warn"><span>${S.traceMayRun}</span></div>` : '';
+    const bar = `<div></div><div class="acts"><button class="btn secondary" data-act="trace-cancel">${S.traceCancel}</button>
+      ${failed ? '' : `<button class="btn primary" data-act="trace-done">${S.traceDone}</button>`}</div>`;
+    return { html: `<div class="col"><div class="center" style="align-items:flex-start;text-align:left">${warn}
+      <h1 class="display" style="font-size:40px">${esc(title)}</h1>${failed ? '' : `<p class="subtitle">${S.traceLaunchOnce}</p>`}${detail}</div></div>`, bar };
+  }
+  if (t.phase === 'done') {
+    const sm = t.summary;
+    const link = sm.link;
+    const strip = link.type === 'linked' ? `<div class="strip info"><span>${esc(S.traceLinked(link.app.displayName))}</span></div>`
+      : link.type === 'severalPrograms' ? `<div class="strip warn"><span>${esc(S.traceSeveral(link.names.join(', ')))}</span></div>`
+      : `<div class="strip warn"><span>${S.traceNoProgram}</span></div>`;
+    const row = (k, v) => `<dt>${k}</dt><dd><span>${esc(v)}</span></dd>`;
+    const secs = ((sm.beforeMs + sm.afterMs) / 1000).toFixed(1);
+    const counts = `<div class="card"><h3 style="margin-bottom:16px">${S.traceCounts}</h3><dl class="kv">
+      ${row(S.tCreated, sm.created)}${row(S.tModifiedValues, sm.modifiedValues.length)}${row(S.tModifiedFiles, sm.modifiedFiles.length)}
+      ${row(S.tDeleted, sm.deleted.length)}${row(S.tNoise, sm.noise)}${row(S.tUnreadable, sm.unreadable)}${row(S.tSnapshot, S.snapshotStat(sm.objects, secs))}</dl></div>`;
+    const lists = listCard(S.tModifiedValues, sm.modifiedValues, S.restorableNote(sm.restorableValues))
+      + listCard(S.tModifiedFiles, sm.modifiedFiles) + listCard(S.tDeleted, sm.deleted);
+    const bar = `<div></div><div class="acts"><button class="btn secondary" data-act="home">${S.toPrograms}</button>
+      ${link.type === 'linked' ? `<button class="btn primary" data-act="trace-open-app" data-id="${esc(link.app.id)}">${S.traceOpenApp}</button>` : ''}</div>`;
+    return { html: `<div class="col"><div class="head"><div><h1 class="display" style="font-size:40px">${S.traceSaved}</h1></div></div>
+      ${strip}${counts}${lists}<div class="strip warn"><span>${S.traceAttribution}</span></div></div>`, bar };
+  }
+  // pick
+  const file = t.picked ? `<span class="mono">${esc(t.picked)}</span>` : `<span class="muted">${S.traceNoFile}</span>`;
+  const bar = `<div></div><div class="acts"><button class="btn secondary" data-act="trace-cancel">${S.cancel}</button>
+    <button class="btn primary" data-act="trace-begin" ${t.picked && !state.busy ? '' : 'disabled'}>${S.traceBegin}</button></div>`;
+  return { html: `<div class="col"><div class="head"><div><h1 class="display">${S.traceTitle}</h1><p class="subtitle">${S.traceSub}</p></div></div>
+    <div class="strip warn"><span>${S.traceNoise}</span></div>
+    <div class="card"><h3 style="margin-bottom:8px">${S.traceScopeTitle}</h3>${S.traceScope.map((l) => `<div class="muted">${esc(l)}</div>`).join('')}
+      <div class="faint" style="margin-top:8px">${S.traceNotScope}</div></div>
+    <div class="card row"><span class="grow"><div class="muted" style="margin-bottom:4px">${S.traceFile}</div>${file}</span>
+      <button class="btn secondary" data-act="trace-pick" ${state.busy ? 'disabled' : ''}>${S.tracePick}</button></div></div>`, bar };
+};
 
 views.outcome = () => {
   const o = state.outcome;
@@ -226,9 +305,10 @@ function childRow(c) {
     ? `<div class="bl">${esc(S.blocked(c.blocks.map((b) => `${S.blockCode[b.code] || b.code}${b.detail ? ` (${b.detail})` : ''}`).join('; ')))}</div>` : '';
   const folder = c.target.type === 'path'
     ? `<button class="iconbtn" data-act="folder" data-path="${esc(c.target.path)}" title="${S.showInFolder}">${ic('')}</button>` : '';
+  const was = c.target.type === 'regRevert' ? `<div class="s">${esc(S.wasNow(fmtVal(c.target.previous), fmtVal(c.ident?.val)))}</div>` : '';
   return `<div class="child ${c.tier === 'weak' ? 'weakrow' : ''}" title="${esc(tip)}">
     <input type="checkbox" data-act="toggle" data-id="${esc(c.id)}" ${state.selected.has(c.id) ? 'checked' : ''} ${c.blocks.length || state.preview ? 'disabled' : ''}>
-    <span class="grow"><div class="t">${esc(candName(c))}</div><div class="s">${esc(candWhere(c))}</div>
+    <span class="grow"><div class="t">${esc(candName(c))}</div><div class="s">${esc(candWhere(c))}</div>${was}
       <div class="s">${esc(why)}</div>${blocked}</span>
     <span class="sizeval muted" style="font-size:15px">${isRegistry(c) ? '' : fmtSize(c.size)}</span>${folder}</div>`;
 }
@@ -241,6 +321,15 @@ views.review = () => {
   if (plan.stillRunning?.length) strips.push(`<div class="strip warn"><span>${esc(S.stillRunning(plan.stillRunning.join(', ')))}</span></div>`);
   if (plan.installDirStatus.type === 'rejected') strips.push(`<div class="strip warn"><span>${esc(S.dirRejected(plan.installDirStatus.reason))}</span></div>`);
   if (plan.installDirStatus.type === 'notSet') strips.push(`<div class="strip warn"><span>${S.dirNotSet}</span></div>`);
+  const tu = plan.trace;
+  if (tu) {
+    const when = fmtDate(tu.createdMs);
+    if (tu.trusted) {
+      strips.push(`<div class="strip info"><span>${esc(S.traceUsed(when))}${tu.reported ? ` ${esc(S.traceReported(tu.reported))}` : ''}</span></div>`);
+    } else {
+      strips.push(`<div class="strip warn"><span>${esc(S.traceNotUsed(when, S.distrust[tu.distrust] || tu.distrust))}</span></div>`);
+    }
+  }
   const head = `<div class="head"><div><p class="eyebrow">${esc(eyebrow)}</p>
     <div class="big">${fmtSize(total)}<small>${S.leftovers}</small></div>
     <p class="subtitle">${S.reviewSub}</p></div>
@@ -262,7 +351,7 @@ views.review = () => {
 
 views.result = () => {
   const op = state.op;
-  const failed = op.items.filter((i) => ['removed', 'notFound'].includes(i.status)).length;
+  const failed = op.items.filter((i) => ['removed', 'notFound', 'reverted'].includes(i.status)).length;
   const verify = op.verify;
   const vLines = verify
     ? [verify.appStillListed ? S.verifyListed : S.verifyGone, verify.reappeared.length ? S.verifyReappeared(verify.reappeared.length) : S.verifyClean] : [];
@@ -271,8 +360,8 @@ views.result = () => {
     ? `<div class="strip warn"><span>${S.deniedStrip}</span>${state.info.sandbox ? '' : `<button class="btn secondary" data-act="admin">${S.restartAdmin}</button>`}</div>` : '';
   const rowsFor = (g) => op.items.filter((i) => itemGroup(op, i) === g).map((i) => {
     const p = i.restore ? S.restoreStatus[i.restore] : S.itemStatus[i.status];
-    const name = i.target.type === 'path' ? lastPart(i.target.path) : i.target.type === 'regKey' ? lastPart(i.target.key.path) : i.target.name;
-    const where = i.target.type === 'path' ? i.target.path : i.target.type === 'regKey' ? regDisplay(i.target.key) : `${regDisplay(i.target.key)} → ${i.target.name}`;
+    const name = i.target.type === 'path' ? lastPart(i.target.path) : i.target.type === 'regKey' ? lastPart(i.target.key.path) : i.target.name || S.regDefault;
+    const where = i.target.type === 'path' ? i.target.path : i.target.type === 'regKey' ? regDisplay(i.target.key) : `${regDisplay(i.target.key)} → ${i.target.name || S.regDefault}`;
     const note = i.restoreDetail || i.detail;
     return `<div class="child"><span class="grow"><div class="t">${esc(name)}</div><div class="s">${esc(where)}</div>${note ? `<div class="s">${esc(note)}</div>` : ''}</span>${pill(p || ['muted', i.status])}</div>`;
   }).join('');
@@ -312,6 +401,16 @@ function renderPopover() {
 function renderModal() {
   const m = $('#modal');
   if (!state.modal) { m.innerHTML = ''; return; }
+  if (state.modal === 'revert') {
+    const n = selectedCands().filter(isRevert).length;
+    m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
+      <h2 id="mt">${esc(S.confirmRevertTitle(n))}</h2>
+      <div class="muted">${S.confirmRevertNote}</div>
+      <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
+      <button class="btn primary" data-act="modal-revert-go">${S.proceed}</button></div></div></div>`;
+    $('#mcancel').focus();
+    return;
+  }
   const d = state.details;
   const cmd = d.launch ? [d.launch.exe, d.launch.args].filter(Boolean).join(' ') : '';
   m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
@@ -424,6 +523,46 @@ async function runOp(cmd, args) {
   try { set({ op: await invoke(cmd, args), view: 'result', busy: false }); } catch (e) { fail(e); }
 }
 
+function applySelected() { return runOp('apply', { opId: state.op.id, ids: selectedCands().map((c) => c.id) }); }
+
+async function traceOpen() {
+  invoke('trace_cancel').catch(() => {});
+  set({ view: 'trace', trace: { phase: 'pick', picked: null }, popover: false });
+}
+
+async function tracePick() {
+  set({ busy: true });
+  try {
+    const picked = await invoke('pick_installer', { title: S.tracePickTitle, filter: S.traceFilter });
+    set({ busy: false, trace: { ...state.trace, picked } });
+  } catch (e) { traceFail(e); }
+}
+
+function traceFail(e) {
+  clearInterval(timer);
+  invoke('trace_cancel').catch(() => {});
+  set({ view: 'trace', trace: { phase: 'pick', picked: null }, busy: false, error: String(e) });
+}
+
+async function traceBegin() {
+  set({ busy: true, trace: { ...state.trace, phase: 'before' } });
+  try { await invoke('trace_begin'); } catch (e) { return traceFail(e); }
+  set({ elapsed: 0, procs: [], trace: { ...state.trace, phase: 'running' } });
+  timer = setInterval(() => { state.elapsed++; const el = $('#elapsed'); if (el) el.textContent = fmtElapsed(state.elapsed); }, 1000);
+  let run;
+  try { run = await invoke('trace_install'); } catch (e) { return traceFail(e); }
+  clearInterval(timer);
+  set({ busy: false, trace: { ...state.trace, phase: 'launch', run } });
+}
+
+async function traceDone() {
+  set({ busy: true, trace: { ...state.trace, phase: 'after' } });
+  let summary;
+  try { summary = await invoke('trace_finish'); } catch (e) { return traceFail(e); }
+  set({ busy: false, trace: { ...state.trace, phase: 'done', summary } });
+  loadApps();
+}
+
 async function exportJson() {
   try {
     const path = state.preview ? await invoke('export_plan', { id: state.appId }) : await invoke('export_report', { opId: state.op.id });
@@ -454,8 +593,14 @@ const actions = {
   folder: (el) => invoke('open_in_explorer', { path: el.dataset.path }).catch(() => {}),
   admin: () => invoke('restart_as_admin').catch(fail),
   preview: () => doPreview(),
+  'trace-open': () => traceOpen(),
+  'trace-pick': () => tracePick(),
+  'trace-begin': () => traceBegin(),
+  'trace-done': () => traceDone(),
+  'trace-cancel': () => { invoke('trace_cancel').catch(() => {}); set({ view: 'list', tab: 'programs', trace: null }); },
+  'trace-open-app': (el) => openCard(el.dataset.id),
   'back-card': () => set({ view: 'card', preview: false }),
-  confirm: () => set({ modal: true }),
+  confirm: () => set({ modal: 'uninstall' }),
   'modal-cancel': () => set({ modal: null }),
   'modal-cancel-overlay': (el, e) => { if (e.target === el) set({ modal: null }); },
   'modal-run': () => startUninstall(),
@@ -471,7 +616,8 @@ const actions = {
   'export-json': () => exportJson(),
   'export-report': () => exportJson(),
   'scan-op': () => scanOp(state.op.id),
-  apply: () => runOp('apply', { opId: state.op.id, ids: selectedCands().map((c) => c.id) }),
+  apply: () => (selectedCands().some(isRevert) ? set({ modal: 'revert' }) : applySelected()),
+  'modal-revert-go': () => { set({ modal: null }); applySelected(); },
   restore: () => runOp('restore', { opId: state.op.id }),
   retry: () => runOp('apply', { opId: state.op.id, ids: retryable(state.op).map((i) => i.candidateId) }),
   'dismiss-error': () => set({ error: null }),

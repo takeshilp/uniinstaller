@@ -3,15 +3,38 @@
 use serde::Serialize;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{AppHandle, Emitter, State};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use uni_core::env::Env;
 use uni_core::model::*;
 use uni_core::native::RunOptions;
-use uni_core::{elevation, inventory, ops, paths};
+use uni_core::{elevation, inventory, ops, paths, trace};
 
 struct StopFlag(Arc<AtomicBool>);
+
+/// The install trace in progress: the installer the user picked and, once begun, the session (the "before" snapshot).
+#[derive(Default)]
+struct TraceState {
+    picked: Option<PathBuf>,
+    session: Option<trace::Session>,
+}
+
+struct TraceSlot(Mutex<TraceState>);
+
+impl TraceSlot {
+    fn get(&self) -> MutexGuard<'_, TraceState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceBegun {
+    objects: u64,
+    ms: u64,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +170,94 @@ fn restart_as_admin(app: AppHandle, env: State<Env>) -> Res<()> {
     Ok(())
 }
 
+/// Asks for the installer to trace. Runs on a worker thread (the dialog blocks); the path stays here, so the UI never sends one back.
+/// In sandbox mode the dialog offers only `.cmd` and `.bat` files and starts in the sandbox's `installers` folder.
+#[tauri::command]
+async fn pick_installer(app: AppHandle, env: State<'_, Env>, slot: State<'_, TraceSlot>, title: String, filter: String) -> Res<Option<PathBuf>> {
+    let sandbox_dir = env.sandbox.then(|| env.data_dir.parent().map(|r| r.join("installers"))).flatten();
+    let exts: &'static [&'static str] = if env.sandbox { &["cmd", "bat"] } else { &["exe", "msi"] };
+    let picked = blocking(move || {
+        let mut d = app.dialog().file().set_title(title).add_filter(filter, exts);
+        if let Some(w) = app.get_webview_window("main") {
+            d = d.set_parent(&w);
+        }
+        if let Some(dir) = sandbox_dir {
+            d = d.set_directory(dir);
+        }
+        Ok(d.blocking_pick_file().and_then(|f| f.into_path().ok()))
+    })
+    .await?;
+    let mut st = slot.get();
+    if picked.is_some() {
+        st.picked = picked; // Cancel keeps the earlier pick
+    }
+    Ok(st.picked.clone())
+}
+
+/// Takes the "before" snapshot of the picked installer's trace (read-only).
+#[tauri::command]
+async fn trace_begin(env: State<'_, Env>, slot: State<'_, TraceSlot>) -> Res<TraceBegun> {
+    let env = env.inner().clone();
+    let path = {
+        let st = slot.get();
+        if st.session.is_some() {
+            return Err("a trace is already in progress".into());
+        }
+        st.picked.clone().ok_or("choose an installer first")?
+    };
+    let session = blocking(move || {
+        let launch = s(trace::installer_launch(&env, &path))?;
+        s(trace::begin(&env, launch))
+    })
+    .await?;
+    let begun = TraceBegun { objects: session.before.objects, ms: session.before.ms };
+    slot.get().session = Some(session);
+    Ok(begun)
+}
+
+/// Runs the installer and waits for its whole process tree; progress goes out as `native-progress` events.
+#[tauri::command]
+async fn trace_install(app: AppHandle, env: State<'_, Env>, stop: State<'_, StopFlag>, slot: State<'_, TraceSlot>) -> Res<NativeRun> {
+    let env = env.inner().clone();
+    let flag = stop.0.clone();
+    flag.store(false, Ordering::SeqCst);
+    let mut session = slot.get().session.take().ok_or("no trace in progress")?;
+    let (session, result) = tauri::async_runtime::spawn_blocking(move || {
+        let opts = RunOptions {
+            stop: flag,
+            on_poll: Some(Box::new(move |p| {
+                let _ = app.emit("native-progress", p.to_vec());
+            })),
+            ..Default::default()
+        };
+        let r = trace::install(&env, &mut session, &opts);
+        (session, r)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let run = session.native.clone();
+    slot.get().session = Some(session);
+    s(result)?;
+    run.ok_or_else(|| "the installer did not run".to_string())
+}
+
+/// Takes the "after" snapshot, saves the journal and returns what it holds. The session is consumed either way.
+#[tauri::command]
+async fn trace_finish(env: State<'_, Env>, slot: State<'_, TraceSlot>) -> Res<TraceSummary> {
+    let env = env.inner().clone();
+    let session = slot.get().session.take().ok_or("no trace in progress")?;
+    if session.native.is_none() {
+        slot.get().session = Some(session);
+        return Err("the installer has not run yet".into());
+    }
+    blocking(move || Ok(trace::summary(&s(trace::finish(&env, session))?))).await
+}
+
+#[tauri::command]
+fn trace_cancel(slot: State<TraceSlot>) {
+    *slot.get() = TraceState::default();
+}
+
 /// The UI ignores errors here (offline, no release yet).
 #[tauri::command]
 async fn update_check(app: AppHandle) -> Res<Option<String>> {
@@ -159,9 +270,9 @@ async fn update_check(app: AppHandle) -> Res<Option<String>> {
 // shortcut: the updater has no rollback and its end-to-end check (0.1.0 -> 0.1.1) is manual,
 // add a rollback path if a broken release ever ships.
 #[tauri::command]
-async fn update_install(app: AppHandle) -> Res<()> {
+async fn update_install(app: AppHandle, slot: State<'_, TraceSlot>) -> Res<()> {
     use tauri_plugin_updater::UpdaterExt;
-    if ops::is_busy() {
+    if ops::is_busy() || slot.get().session.is_some() {
         return Err("operation in progress".into());
     }
     if let Some(u) = app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string())? {
@@ -181,8 +292,10 @@ fn main() {
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(env)
         .manage(StopFlag(Arc::new(AtomicBool::new(false))))
+        .manage(TraceSlot(Mutex::new(TraceState::default())))
         .invoke_handler(tauri::generate_handler![
             app_info,
             list_apps,
@@ -198,6 +311,11 @@ fn main() {
             history,
             open_in_explorer,
             restart_as_admin,
+            pick_installer,
+            trace_begin,
+            trace_install,
+            trace_finish,
+            trace_cancel,
             update_check,
             update_install
         ])
