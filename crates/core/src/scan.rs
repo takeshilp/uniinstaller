@@ -90,11 +90,33 @@ fn eq_any(s: &str, variants: &[String]) -> bool {
     variants.iter().any(|v| v.to_lowercase() == s.to_lowercase())
 }
 
+/// (publisher, name) pairs for settings locations `<root>\<name>` and `<root>\<publisher>\<name>`, every name variant.
+/// The same pairs name the target's candidates and other apps' anchors.
+fn name_pairs(app: &InstalledApp) -> Vec<(Option<String>, String)> {
+    let names = name_variants(&app.display_name);
+    let pubs = app.publisher.as_deref().map(publisher_variants).unwrap_or_default();
+    let mut v: Vec<(Option<String>, String)> = names.iter().map(|n| (None, n.clone())).collect();
+    v.extend(pubs.iter().flat_map(|p| names.iter().map(move |n| (Some(p.clone()), n.clone()))));
+    v
+}
+
+fn data_dir(root: &Path, p: Option<&str>, n: &str) -> PathBuf {
+    p.map_or_else(|| root.join(n), |p| root.join(p).join(n))
+}
+
+/// None when the first component is a reserved vendor key (Microsoft, Classes, ...).
+fn data_key(root: &RegPath, p: Option<&str>, n: &str) -> Option<RegPath> {
+    let first = p.unwrap_or(n);
+    (!RESERVED_SOFTWARE.contains(&first.to_lowercase().as_str())).then(|| p.map_or_else(|| root.child(n), |p| root.child(p).child(n)))
+}
+
 fn ev(code: EvidenceCode, points: i32, detail: impl Into<String>) -> Evidence {
     Evidence { code, points, detail: detail.into() }
 }
 
-/// Other apps' anchors (install dir, uninstaller exe, icon), canonical where they exist.
+/// Other apps' anchors: install dir, uninstaller exe and icon (canonical where they exist), plus their existing settings
+/// folders and Software keys under the same name rule as sections E/F, including the version-free variant.
+// shortcut: a stale entry of an older version of the same product also blocks the target's version-free settings (fail closed).
 pub fn anchors_of(env: &Env, others: &[InstalledApp]) -> Anchors {
     let mut a = Anchors::default();
     for o in others {
@@ -106,6 +128,10 @@ pub fn anchors_of(env: &Env, others: &[InstalledApp]) -> Anchors {
         }
         if let Some(i) = icon_path(o).filter(|i| is_local_abs(i)) {
             a.files.push(canon_if_exists(&i));
+        }
+        for (p, n) in name_pairs(o) {
+            a.data_dirs.extend(env.folders.app_data.iter().map(|r| data_dir(r, p.as_deref(), &n)).filter(|d| d.is_dir()));
+            a.keys.extend(env.software_roots.iter().filter_map(|r| data_key(r, p.as_deref(), &n)).filter(registry::exists));
         }
     }
     a
@@ -216,6 +242,9 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
                 && !is_inside(&l.exe, &ctx.env.folders.windows_dir)
             {
                 blocks.push(block(BlockCode::AppStillInstalled, "the program's uninstaller still exists"));
+            }
+            if let Some(why) = ctx.anchors.key_holding(key) {
+                blocks.push(block(BlockCode::SharedWithOtherApp, why));
             }
             match registry::capture(key) {
                 Ok(node) => Eval { blocks, ident: Ident::Key { node }, size: 0, user_data: false },
@@ -449,14 +478,10 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
     }
 
     // E and F. Settings and user data by exact name (Data group, never preselected).
-    let mut pairs: Vec<(Option<&String>, &String)> = names.iter().map(|n| (None, n)).collect();
-    pairs.extend(pubs.iter().flat_map(|p| names.iter().map(move |n| (Some(p), n))));
+    let pairs = name_pairs(app);
     for root in &env.folders.app_data {
         for (p, n) in &pairs {
-            let path = match p {
-                Some(p) => root.join(p).join(n),
-                None => root.join(n),
-            };
+            let path = data_dir(root, p.as_deref(), n);
             if path.to_str().is_none() || path_kind(&path) != Some(PathKind::Dir) {
                 continue;
             }
@@ -474,14 +499,7 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
     }
     for root in &env.software_roots {
         for (p, n) in &pairs {
-            let first = p.unwrap_or(n);
-            if RESERVED_SOFTWARE.contains(&first.to_lowercase().as_str()) {
-                continue;
-            }
-            let key = match p {
-                Some(p) => root.child(p).child(n),
-                None => root.child(n),
-            };
+            let Some(key) = data_key(root, p.as_deref(), n) else { continue };
             let Ok(k) = registry::open(&key, KEY_READ) else { continue };
             let mut evidence = vec![ev(EvidenceCode::ExactName, W_EXACT_NAME, "key name equals the program name")];
             if p.is_some() {

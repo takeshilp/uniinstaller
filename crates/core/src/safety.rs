@@ -92,11 +92,16 @@ pub fn protected_reason(f: &Folders, path: &Path, group: Group) -> Option<String
     None
 }
 
-/// Other apps' anchors (install dir, uninstaller exe, icon), canonical where they exist.
+/// What other installed apps own: install dirs, uninstaller exes and icons (canonical where they exist), plus their existing
+/// settings folders and Software keys named by the scan's own rule (`scan::name_pairs`).
 #[derive(Debug, Default, Clone)]
 pub struct Anchors {
     pub dirs: Vec<PathBuf>,
     pub files: Vec<PathBuf>,
+    /// Existing `<AppData root>\[<publisher>\]<name>` folders of other apps, every name variant.
+    pub data_dirs: Vec<PathBuf>,
+    /// Existing `<Software root>\[<publisher>\]<name>` keys of other apps, every name variant.
+    pub keys: Vec<RegPath>,
 }
 
 impl Anchors {
@@ -107,6 +112,9 @@ impl Anchors {
                 return Some(format!("contains another app's files: {}", a.display()));
             }
         }
+        if let Some(a) = self.data_dirs.iter().find(|a| same_or_inside(a, path)) {
+            return Some(format!("holds another app's settings folder {}", a.display()));
+        }
         for d in &self.dirs {
             let ours_inside = own_dir.is_some_and(|o| same_or_inside(o, d));
             if is_inside(path, d) && !ours_inside {
@@ -114,6 +122,13 @@ impl Anchors {
             }
         }
         None
+    }
+
+    /// Why a registry key is or holds another app's settings key, if it does (same hive and view).
+    // shortcut: `RegPath::same` compares ASCII-case-insensitively while `below` lowercases Unicode, so two non-ASCII names that
+    // differ only in case are not seen as equal; compare lowercased paths if such a vendor name shows up.
+    pub fn key_holding(&self, key: &RegPath) -> Option<String> {
+        self.keys.iter().find(|k| k.same(key) || k.below(key).is_some()).map(|k| format!("holds another app's settings key {}", k.display()))
     }
 }
 
@@ -223,6 +238,22 @@ mod tests {
             windows_dir: p(r"C:\Windows"),
             system_dir: p(r"C:\Windows\System32"),
         }
+    }
+
+    #[test]
+    fn anchors_settings_rules() {
+        let k = |v: View, s: &str| RegPath::new(Hive::Hklm, v, s);
+        let a = Anchors { data_dirs: vec![PathBuf::from(r"C:\R\Vendor\Editor")], keys: vec![k(View::V64, r"SOFTWARE\Vendor\Editor")], ..Default::default() };
+        let c = |s: &str| a.covering(Path::new(s), None).is_some();
+        assert!(c(r"C:\R\Vendor\Editor"), "equal");
+        assert!(c(r"C:\R\Vendor"), "a vendor folder holding another product");
+        assert!(!c(r"C:\R\Vendor\Editor 1"), "sibling");
+        assert!(!c(r"C:\R\Vendor\Editor\sub"), "a product folder inside a folder named after another app stays offered");
+        assert!(a.key_holding(&k(View::V64, r"software\vendor\editor")).is_some(), "equal, any case");
+        assert!(a.key_holding(&k(View::V64, r"SOFTWARE\Vendor")).is_some(), "a vendor key holding another product");
+        assert!(a.key_holding(&k(View::V64, r"SOFTWARE\Vendor\Editor 1")).is_none());
+        assert!(a.key_holding(&k(View::V64, r"SOFTWARE\Vendor\Editor\Sub")).is_none());
+        assert!(a.key_holding(&k(View::V32, r"SOFTWARE\Vendor\Editor")).is_none(), "the other view is another key");
     }
 
     #[test]

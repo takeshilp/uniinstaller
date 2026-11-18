@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use uni_core::model::*;
 use uni_core::sandbox::*;
 use uni_core::{ops, paths, registry, scan};
+use winreg::enums::KEY_ALL_ACCESS;
 
 fn path_of(c: &Candidate) -> Option<&Path> {
     match &c.target {
@@ -226,4 +227,52 @@ fn other_volume_candidates_are_blocked() {
         assert!(!c.selected);
     }
     assert!(plan.candidates.iter().any(|c| c.group == Group::Registry && c.tier == Tier::Safe));
+}
+
+fn set(key: &RegPath, name: &str, value: &str) {
+    registry::set_string(&registry::create(key, KEY_ALL_ACCESS).unwrap(), name, value, false).unwrap();
+}
+
+fn shared(c: &Candidate) -> bool {
+    c.tier == Tier::Blocked && !c.selected && c.blocks.iter().any(|b| b.code == BlockCode::SharedWithOtherApp)
+}
+
+/// Two versions of one product share a version-neutral settings folder and key (lab `two-versions`).
+#[test]
+fn version_neutral_settings_are_shared() {
+    let f = Fixture::new();
+    let mut dirs = Vec::new();
+    for n in [1, 2] {
+        let dir = pf(&f.env).join(format!(r"Editor Vendor\Sandbox Editor {n}"));
+        let exe = dir.join(format!("editor{n}.exe"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&exe, b"MZ fake").unwrap();
+        let entry = f.env.uninstall_roots[0].child(&format!("SandboxEditor{n}"));
+        set(&entry, "DisplayName", &format!("Sandbox Editor {n}"));
+        set(&entry, "DisplayVersion", &format!("{n}.0"));
+        set(&entry, "Publisher", "Editor Vendor");
+        set(&entry, "InstallLocation", &dir.to_string_lossy());
+        set(&entry, "DisplayIcon", &exe.to_string_lossy());
+        dirs.push(dir);
+    }
+    let vendor = roaming(&f.env).join("Editor Vendor");
+    fs::create_dir_all(vendor.join("Sandbox Editor 1")).unwrap();
+    fs::write(vendor.join(r"Sandbox Editor 1\settings.ini"), b"[1]").unwrap();
+    fs::create_dir_all(vendor.join("Sandbox Editor")).unwrap();
+    fs::write(vendor.join(r"Sandbox Editor\settings-2.ini"), b"[2]").unwrap();
+    let sw = f.env.software_roots[0].child("Editor Vendor");
+    set(&sw.child("Sandbox Editor"), "Editor2", "1");
+    set(&sw.child("Sandbox Editor 1"), "InstallDir", &dirs[0].to_string_lossy());
+
+    let plan = ops::preview(&f.env, "HKCU64:SandboxEditor1").unwrap();
+    assert!(matches!(plan.install_dir_status, DirStatus::Confirmed {}), "{:?}", plan.install_dir_status);
+    let neutral = find_path(&plan, &vendor.join("Sandbox Editor"));
+    assert!(shared(neutral), "{:?}", neutral.blocks);
+    check(find_path(&plan, &vendor.join("Sandbox Editor 1")), 30, Tier::Weak, false);
+    let key = find_key(&plan, |k| k.path.ends_with(r"Editor Vendor\Sandbox Editor"));
+    assert_eq!(key.len(), 1);
+    assert!(shared(key[0]), "{:?}", key[0].blocks);
+    let own = find_key(&plan, |k| k.path.ends_with(r"Editor Vendor\Sandbox Editor 1"));
+    assert_eq!(own.len(), 1);
+    check(own[0], 95, Tier::Safe, false);
 }
