@@ -92,5 +92,7 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
 
 ## Manual checks (not automated)
 - Elevation: "Перезапустить от имени администратора" (UAC prompt on the secure desktop; unavailable in sandbox mode).
-- Updater: needs two published releases; install the older one, publish the newer, check the banner and the update.
+- Updater: verified end to end on 2026-11-18 in Windows Sandbox with networking on: published 0.1.0 installed silently (`/S`),
+  the banner offered 0.1.1 about 6 s after start, the update button (pressed through UI Automation) downloaded, verified and
+  installed 0.1.1 in about 5 s. Repeat at a release that changes the updater config, the signing key or the NSIS install mode.
 - Running screen with a slow uninstaller and "Не ждать дальше".

@@ -108,7 +108,7 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
 - MSI with empty InstallLocation (`scan.rs`): little leftover coverage.
 - Icons (`ui/app.js`): letter tile instead of the program icon.
 - WOW64 redirection (tests): only plumbing is tested because HKCU is not redirected. The lab's `msi-bare-x86` covers HKLM 32-bit removal and restore.
-- Updater (`main.rs`, `release.yml`): verifiable only after two releases; no rollback.
+- Updater (`main.rs`, `release.yml`): no rollback; verified end to end 0.1.0 -> 0.1.1 only by hand (see `docs/development.md`).
 - Secrets at rest (`ops.rs`): manifests hold registry backups in clear text.
 - Signing key (docs): password next to the key; build scripts see both.
 - Over-the-shoulder elevation (`env.rs`): a different admin account changes `%LOCALAPPDATA%`, history looks empty.

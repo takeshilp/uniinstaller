@@ -156,8 +156,8 @@ async fn update_check(app: AppHandle) -> Res<Option<String>> {
 }
 
 /// On Windows the plugin launches the NSIS installer and exits the process itself.
-// shortcut: the updater is verifiable end to end only after two published releases and has no rollback,
-// do a manual check at the second release.
+// shortcut: the updater has no rollback and its end-to-end check (0.1.0 -> 0.1.1) is manual,
+// add a rollback path if a broken release ever ships.
 #[tauri::command]
 async fn update_install(app: AppHandle) -> Res<()> {
     use tauri_plugin_updater::UpdaterExt;
