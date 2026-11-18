@@ -20,6 +20,39 @@ fn real_system_list_and_preview() {
     }
 }
 
+/// Read-only: writes the dry run of every listed program to the file named by `UNI_PREVIEW_DUMP`, one line per candidate (tier, score,
+/// preselection, blocks) plus one for the install folder. Diff two dumps to see what a rule change does to real data:
+/// `UNI_PREVIEW_DUMP=<file> cargo test -p uni-core --test real_system real_system_preview_dump -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real registry and file system"]
+fn real_system_preview_dump() {
+    let Some(out) = std::env::var_os("UNI_PREVIEW_DUMP") else {
+        println!("UNI_PREVIEW_DUMP is not set: skipped");
+        return;
+    };
+    let env = Env::system().unwrap();
+    let t = std::time::Instant::now();
+    let apps = list_apps(&env).unwrap();
+    let mut lines = Vec::new();
+    for a in &apps {
+        match ops::preview(&env, &a.id) {
+            Err(e) => lines.push(format!("{}	ERROR	{e}", a.id)),
+            Ok(p) => {
+                lines.push(format!("{}	DIR	{:?}", a.id, p.install_dir_status));
+                for c in &p.candidates {
+                    let mut b: Vec<String> = c.blocks.iter().map(|b| format!("{:?}: {}", b.code, b.detail)).collect();
+                    b.sort();
+                    lines.push(format!("{}	{}	{:?}	{}	{}	{}", a.id, c.id, c.tier, c.score, c.selected, b.join(" | ")));
+                }
+            }
+        }
+    }
+    std::fs::write(&out, lines.join("
+") + "
+").unwrap();
+    println!("{} programs, {} lines, {} ms", apps.len(), lines.len(), t.elapsed().as_millis());
+}
+
 /// Read-only: two captures of the real machine (the second streamed through a `Differ`, as `trace::finish` does). Prints the
 /// object counts, the milliseconds and the peak working-set growth that the budget in `docs/architecture.md` is measured by.
 /// Run it alone: `cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture`.
