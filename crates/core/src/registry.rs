@@ -74,6 +74,16 @@ pub fn read_string(k: &RegKey, name: &str, expand: bool) -> Option<String> {
     }
 }
 
+/// Text of a captured REG_SZ / REG_EXPAND_SZ (expanded, like `read_string(.., true)`) or REG_MULTI_SZ (one item per line).
+pub fn val_text(v: &RegVal) -> Option<String> {
+    let s = decode_utf16(&v.data);
+    match to_regtype(v.kind)? {
+        RegType::REG_SZ | RegType::REG_EXPAND_SZ => Some(expand_env(&s)),
+        RegType::REG_MULTI_SZ => Some(s.replace('\0', "\n")),
+        _ => None,
+    }
+}
+
 pub fn read_dword(k: &RegKey, name: &str) -> Option<u32> {
     let v = k.get_raw_value(name).ok()?;
     match v.vtype {
@@ -232,6 +242,10 @@ mod tests {
         let (sub, _) = k.create_subkey("Sub\\Deeper").unwrap();
         set_string(&sub, "v", "1", false).unwrap();
         let before = capture(&p).unwrap();
+        let text = |n: &str| before.values.iter().find(|v| v.name == n).and_then(val_text);
+        assert_eq!(text("multi").as_deref(), Some("a\nb"));
+        assert_eq!(text("exp"), Some(expand_env(r"%SystemRoot%\x")));
+        assert_eq!(text("dw"), None);
         assert_eq!(before.values.len(), 7);
         assert_eq!(before.keys[0].keys[0].name, "Deeper");
         delete_key(&p).unwrap();

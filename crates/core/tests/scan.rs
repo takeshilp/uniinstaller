@@ -276,3 +276,92 @@ fn version_neutral_settings_are_shared() {
     assert_eq!(own.len(), 1);
     check(own[0], 95, Tier::Safe, false);
 }
+
+fn find_value<'a>(plan: &'a Plan, name: &str) -> &'a Candidate {
+    plan.candidates.iter().find(|c| matches!(&c.target, Target::RegValue { name: n, .. } if n == name)).unwrap_or_else(|| panic!("no value {name}"))
+}
+
+/// A program installed inside the target's folder owns the registry entries that point into its folder (lab `shared-suite`).
+#[test]
+fn nested_app_registry_is_shared() {
+    let f = Fixture::new();
+    let sd = suite_dir(&f.env);
+    let td = sd.join("Shared Tool");
+    let tool = td.join("tool.exe");
+    set(&f.env.run_roots[0], "SharedTool", &format!("\"{}\" /tray", tool.display()));
+    set(&f.env.app_paths_roots[0].child("tool.exe"), "", &tool.to_string_lossy());
+    set(&f.env.app_paths_roots[0].child("suite.exe"), "", &sd.join("suite.exe").to_string_lossy());
+    let sw = f.env.software_roots[0].child("Sandbox Soft").child("Sandbox Suite");
+    set(&sw, "InstallDir", &sd.to_string_lossy());
+    set(&sw.child("Shared Tool"), "InstallDir", &td.to_string_lossy());
+    let lnk = start_menu(&f.env).join(r"Sandbox Soft\Shared Tool.lnk");
+    uni_core::shortcuts::create(&lnk, &tool).unwrap();
+    // The target's own Uninstall entry may point into a nested app's folder (a launcher); that is not shared.
+    let own_entry = f.env.uninstall_roots[0].child("SandboxSuite");
+    set(&own_entry, "ModifyPath", &tool.to_string_lossy());
+
+    let plan = ops::preview(&f.env, "HKCU64:SandboxSuite").unwrap();
+    assert!(shared(find_value(&plan, "SharedTool")), "{:?}", find_value(&plan, "SharedTool").blocks);
+    check(find_value(&plan, "SandboxSuite"), 65, Tier::Review, false);
+    let tool_ap = find_key(&plan, |k| k.path.ends_with(r"AppPaths\tool.exe"));
+    assert_eq!(tool_ap.len(), 1);
+    assert!(shared(tool_ap[0]), "{:?}", tool_ap[0].blocks);
+    check(find_key(&plan, |k| k.path.ends_with(r"AppPaths\suite.exe"))[0], 65, Tier::Review, false);
+    let key = find_key(&plan, |k| k.path.ends_with(r"Sandbox Soft\Sandbox Suite"));
+    assert_eq!(key.len(), 1);
+    assert!(shared(key[0]), "{:?}", key[0].blocks);
+    assert!(shared(find_path(&plan, &lnk)), "the shortcut rule still applies after its move");
+    let own = find_key(&plan, |k| k.same(&own_entry));
+    assert_eq!(own.len(), 1);
+    assert!(own[0].blocks.iter().all(|b| b.code != BlockCode::SharedWithOtherApp), "own entry: {:?}", own[0].blocks);
+}
+
+/// A nested app without InstallLocation is still seen through its uninstaller and icon folder.
+#[test]
+fn nested_app_without_install_location_is_shared() {
+    let f = Fixture::new();
+    let sd = suite_dir(&f.env);
+    let bd = sd.join("Bare Tool");
+    let exe = bd.join("bare.exe");
+    fs::create_dir_all(&bd).unwrap();
+    fs::write(&exe, b"MZ fake").unwrap();
+    let entry = f.env.uninstall_roots[0].child("BareTool");
+    set(&entry, "DisplayName", "Bare Tool");
+    set(&entry, "DisplayIcon", &exe.to_string_lossy());
+    set(&entry, "UninstallString", &format!("\"{}\" /uninstall", exe.display()));
+    set(&f.env.run_roots[0], "BareTool", &format!("\"{}\" /tray", exe.display()));
+    set(&f.env.app_paths_roots[0].child("bare.exe"), "", &exe.to_string_lossy());
+    let sw = f.env.software_roots[0].child("Sandbox Soft").child("Sandbox Suite");
+    set(&sw.child("Bare Tool"), "InstallDir", &bd.to_string_lossy());
+
+    let plan = ops::preview(&f.env, "HKCU64:SandboxSuite").unwrap();
+    assert!(shared(find_value(&plan, "BareTool")), "{:?}", find_value(&plan, "BareTool").blocks);
+    let ap = find_key(&plan, |k| k.path.ends_with(r"AppPaths\bare.exe"));
+    assert_eq!(ap.len(), 1);
+    assert!(shared(ap[0]), "{:?}", ap[0].blocks);
+    let key = find_key(&plan, |k| k.path.ends_with(r"Sandbox Soft\Sandbox Suite"));
+    assert_eq!(key.len(), 1);
+    assert!(shared(key[0]), "{:?}", key[0].blocks);
+}
+
+/// Another app whose folder is a drive root or a protected root must not claim every value of a target without a confirmed dir.
+#[test]
+fn broad_install_location_does_not_claim_references() {
+    let f = Fixture::new();
+    let mut target = bogus_app(&documents(&f.env));
+    target.display_name = "Sandbox Notes".into();
+    target.publisher = Some("Sandbox Soft".into());
+    let drive: String = f.root.to_string_lossy().chars().take(2).collect();
+    let mut others = Vec::new();
+    for (i, dir) in [PathBuf::from(format!(r"{drive}\")), pf(&f.env)].into_iter().enumerate() {
+        let mut o = bogus_app(&dir);
+        o.id = format!("HKCU64:Broad{i}");
+        o.display_name = format!("Broad {i}");
+        others.push(o);
+    }
+    let plan = scan::scan(&f.env, &target, None, &others, true).unwrap();
+    assert!(matches!(plan.install_dir_status, DirStatus::Rejected { .. }), "{:?}", plan.install_dir_status);
+    let key = find_key(&plan, |k| k.path.ends_with(r"Sandbox Soft\Sandbox Notes"));
+    assert_eq!(key.len(), 1);
+    assert!(key[0].blocks.iter().all(|b| b.code != BlockCode::SharedWithOtherApp), "{:?}", key[0].blocks);
+}

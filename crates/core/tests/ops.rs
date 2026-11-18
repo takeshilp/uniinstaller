@@ -407,3 +407,33 @@ fn debug_guard_refuses_system_env() {
     assert!(e.0.contains("sandbox"), "{e}");
 }
 
+
+fn set(key: &RegPath, name: &str, value: &str) {
+    registry::set_string(&registry::create(key, winreg::enums::KEY_ALL_ACCESS).unwrap(), name, value, false).unwrap();
+}
+
+/// A block that only appears after the scan (another app is installed in between) is enforced at apply.
+#[test]
+fn apply_recomputes_shared_blocks() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let key_id = plan(&op).candidates.iter().find(|c| c.id.starts_with("key:") && c.id.ends_with(r"sandbox soft\sandbox notes")).expect("settings key offered").id.clone();
+    let lnk = desktop(&f.env).join("Sandbox Notes.lnk");
+    let lnk_id = id_ending(&op, r"desktop\sandbox notes.lnk");
+    let sw = f.env.software_roots[0].child("Sandbox Soft").child("Sandbox Notes");
+    // Two programs appear after the scan: one uses the link's target as its icon, one derives the offered Software key.
+    let helper = f.env.uninstall_roots[0].child("SandboxHelper");
+    set(&helper, "DisplayName", "Sandbox Helper");
+    set(&helper, "DisplayIcon", &notes_dir(&f.env).join("Sandbox Notes.exe").to_string_lossy());
+    let second = f.env.uninstall_roots[0].child("SandboxNotes2");
+    set(&second, "DisplayName", "Sandbox Notes 2");
+    set(&second, "Publisher", "Sandbox Soft");
+    let applied = ops::apply(&f.env, &op.id, &[key_id.clone(), lnk_id.clone()]).unwrap();
+    for id in [&key_id, &lnk_id] {
+        let it = applied.items.iter().find(|i| &i.candidate_id == id).unwrap();
+        assert_eq!(it.status, ItemStatus::Blocked, "{id}: {:?}", it.detail);
+        assert!(it.detail.as_deref().unwrap_or("").starts_with("SharedWithOtherApp"), "{id}: {:?}", it.detail);
+    }
+    assert!(registry::exists(&sw));
+    assert!(lnk.exists());
+}

@@ -125,6 +125,15 @@ pub fn anchors_of(env: &Env, others: &[InstalledApp]) -> Anchors {
         }
         if let Some(l) = o.uninstall_string.as_deref().and_then(|s| parse_uninstall(s, &env.folders.system_dir, o.product_code.as_deref()).ok()) {
             a.files.push(canon_if_exists(&l.exe));
+            // No InstallLocation: the uninstaller's folder when the icon sits beside it, as `find_anchor` does for the target.
+            if o.install_location.as_deref().is_none_or(|d| d.as_os_str().is_empty())
+                && let Some(p) = l.exe.parent()
+                && icon_path(o).as_deref().and_then(Path::parent).is_some_and(|ip| norm(ip) == norm(p))
+                && is_local_abs(p)
+                && !is_inside(p, &env.folders.windows_dir)
+            {
+                a.derived_dirs.push(canon_if_exists(p));
+            }
         }
         if let Some(i) = icon_path(o).filter(|i| is_local_abs(i)) {
             a.files.push(canon_if_exists(&i));
@@ -247,7 +256,15 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
                 blocks.push(block(BlockCode::SharedWithOtherApp, why));
             }
             match registry::capture(key) {
-                Ok(node) => Eval { blocks, ident: Ident::Key { node }, size: 0, user_data: false },
+                Ok(node) => {
+                    // The target's own Uninstall entry may name another app's folder (a launcher's uninstaller): not shared.
+                    if !ctx.app.sources.iter().any(|s| s.same(key))
+                        && let Some(why) = tree_refers(ctx, &node)
+                    {
+                        blocks.push(block(BlockCode::SharedWithOtherApp, why));
+                    }
+                    Eval { blocks, ident: Ident::Key { node }, size: 0, user_data: false }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
                     blocks.push(block(BlockCode::TooLarge, "more than 5000 values and subkeys"));
                     Eval { blocks, ident: Ident::None {}, size: 0, user_data: false }
@@ -256,9 +273,14 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
             }
         }
         Target::RegValue { key, name } => {
-            let blocks = registry_blocks(ctx.env, target);
+            let mut blocks = registry_blocks(ctx.env, target);
             match registry::read_value(key, name) {
-                Ok(val) => Eval { blocks, ident: Ident::Value { val }, size: 0, user_data: false },
+                Ok(val) => {
+                    if let Some(why) = value_refers(ctx, &val) {
+                        blocks.push(block(BlockCode::SharedWithOtherApp, why));
+                    }
+                    Eval { blocks, ident: Ident::Value { val }, size: 0, user_data: false }
+                }
                 Err(e) => unverifiable(blocks, e),
             }
         }
@@ -267,6 +289,17 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
 
 fn eval_path(ctx: &Ctx, group: Group, path: &Path) -> Eval {
     let mut blocks = path_blocks(ctx.env, path, group, ctx.install_dir, ctx.anchors);
+    // A shortcut whose target is another app's file or folder belongs to that app (recomputed at apply too).
+    if group == Group::Shortcuts {
+        match shortcuts::resolve(path) {
+            Some(t) => {
+                if let Some(why) = ctx.anchors.covering(&t, ctx.install_dir) {
+                    blocks.push(block(BlockCode::SharedWithOtherApp, why));
+                }
+            }
+            None => blocks.push(block(BlockCode::Unverifiable, "the shortcut's target cannot be read")),
+        }
+    }
     let md = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) => return unverifiable(blocks, e),
@@ -332,6 +365,18 @@ fn display_key(t: &Target) -> String {
         Target::RegKey { key } => key.display().to_lowercase(),
         Target::RegValue { key, name } => format!("{}\\{}", key.display(), name).to_lowercase(),
     }
+}
+
+/// Why a registry value's text points into another app's install dir, if it does.
+fn value_refers(ctx: &Ctx, v: &RegVal) -> Option<String> {
+    registry::val_text(v).and_then(|s| ctx.anchors.referenced_in(&ctx.env.folders, &s, ctx.install_dir)).map(|why| format!("value '{}' {why}", v.name))
+}
+
+/// The same for every value of a captured key tree.
+// shortcut: a key or settings folder shared with another app is blocked whole, so the target's own values and files inside it
+// are not offered; add per-value and per-file candidates if lab recall asks for them.
+fn tree_refers(ctx: &Ctx, n: &RegNode) -> Option<String> {
+    n.values.iter().find_map(|v| value_refers(ctx, v)).or_else(|| n.keys.iter().find_map(|k| tree_refers(ctx, k)))
 }
 
 fn value_points_inside(k: &winreg::RegKey, dir: &Path) -> bool {
@@ -527,20 +572,10 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
     let candidates = raw
         .into_iter()
         .map(|r| {
-            let mut e = evaluate(&ctx, r.group, &r.target);
+            let e = evaluate(&ctx, r.group, &r.target);
             let mut evidence = r.evidence;
             if e.user_data {
                 evidence.push(ev(EvidenceCode::UserDataLikely, W_USER_DATA, "looks like documents, saves or other user data"));
-            }
-            // A referenced target inside another program's folder is shared too.
-            let refd = match &r.target {
-                Target::Path { path, .. } if r.group == Group::Shortcuts => shortcuts::resolve(path),
-                _ => None,
-            };
-            if let Some(t) = refd
-                && let Some(why) = anchors.covering(&t, confirmed.as_deref())
-            {
-                e.blocks.push(block(BlockCode::SharedWithOtherApp, why));
             }
             let score: i32 = evidence.iter().map(|x| x.points).sum();
             let tier = tier(score, !e.blocks.is_empty());

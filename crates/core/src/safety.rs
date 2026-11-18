@@ -93,7 +93,7 @@ pub fn protected_reason(f: &Folders, path: &Path, group: Group) -> Option<String
 }
 
 /// What other installed apps own: install dirs, uninstaller exes and icons (canonical where they exist), plus their existing
-/// settings folders and Software keys named by the scan's own rule (`scan::name_pairs`).
+/// settings folders and Software keys named by the scan's own rule (`scan::name_pairs`), plus derived install dirs.
 #[derive(Debug, Default, Clone)]
 pub struct Anchors {
     pub dirs: Vec<PathBuf>,
@@ -102,6 +102,9 @@ pub struct Anchors {
     pub data_dirs: Vec<PathBuf>,
     /// Existing `<Software root>\[<publisher>\]<name>` keys of other apps, every name variant.
     pub keys: Vec<RegPath>,
+    /// Install dirs derived for other apps that have no InstallLocation (uninstaller and icon share a folder, as `find_anchor`
+    /// does for the target). Used only by `referenced_in`: as path anchors they would block the files of apps such as Steam.
+    pub derived_dirs: Vec<PathBuf>,
 }
 
 impl Anchors {
@@ -129,6 +132,32 @@ impl Anchors {
     // differ only in case are not seen as equal; compare lowercased paths if such a vendor name shows up.
     pub fn key_holding(&self, key: &RegPath) -> Option<String> {
         self.keys.iter().find(|k| k.same(key) || k.below(key).is_some()).map(|k| format!("holds another app's settings key {}", k.display()))
+    }
+
+    /// Why registry text (one path per line or `;` item) equals or points into another app's install dir, if it does.
+    /// A drive root or a protected root is never an app's own folder here (it would claim every value that names any path under it);
+    /// the path rule `covering` keeps blocking such folders.
+    // shortcut: references are matched as normalized text, so 8.3 and other alias spellings of another app's folder are missed,
+    // and so is a folder reached through a junction or SUBST (anchors are canonical, registry text is not); comma-separated lists,
+    // a folder followed by arguments without a trailing backslash (`C:\PF\Plugin /S`) and unexpanded REG_MULTI_SZ items are missed
+    // too; resolve each path-like token and keep the raw InstallLocation if a lab run or a user report shows one slipping through.
+    pub fn referenced_in(&self, f: &Folders, text: &str, own_dir: Option<&Path>) -> Option<String> {
+        // As in `covering`: an app whose dir holds ours (a host and its plugin) does not claim what we reference.
+        let theirs: Vec<(&PathBuf, String)> = self
+            .dirs
+            .iter()
+            .chain(&self.derived_dirs)
+            .filter(|d| !own_dir.is_some_and(|o| same_or_inside(o, d)) && !is_drive_root(d) && !f.protected_roots.iter().any(|r| same_or_inside(r, d)))
+            .map(|d| (d, format!("{}\\", norm(d).trim_end_matches('\\'))))
+            .collect();
+        let low = text.replace('/', "\\").to_lowercase();
+        low.split(['\n', ';']).find_map(|part| {
+            let bare = Path::new(part.trim().trim_matches('"'));
+            theirs
+                .iter()
+                .find(|(d, needle)| same_or_inside(bare, d) || part.contains(needle.as_str()))
+                .map(|(d, _)| format!("points into another app's install dir {}", d.display()))
+        })
     }
 }
 
@@ -254,6 +283,29 @@ mod tests {
         assert!(a.key_holding(&k(View::V64, r"SOFTWARE\Vendor\Editor 1")).is_none());
         assert!(a.key_holding(&k(View::V64, r"SOFTWARE\Vendor\Editor\Sub")).is_none());
         assert!(a.key_holding(&k(View::V32, r"SOFTWARE\Vendor\Editor")).is_none(), "the other view is another key");
+    }
+
+    #[test]
+    fn anchors_reference_rule() {
+        let p = PathBuf::from;
+        let f = fake();
+        let a = Anchors { dirs: vec![p(r"C:\PF\Suite\Plugin"), p(r"C:\PF\Host"), p(r"C:\")], derived_dirs: vec![p(r"C:\PF\Bare")], ..Default::default() };
+        let suite = Some(Path::new(r"C:\PF\Suite"));
+        let r = |t: &str, own: Option<&Path>| a.referenced_in(&f, t, own).is_some();
+        assert!(r(r#""C:\PF\Suite\Plugin\p.exe" /tray"#, suite), "command line into a nested app");
+        assert!(r("c:/pf/suite/PLUGIN", suite), "equal, slashes and case");
+        assert!(r("C:\\X\nC:\\PF\\Host\\h.dll", suite), "second line of a multi-string");
+        assert!(r(r"C:\X;C:\PF\Host", suite), "path list");
+        assert!(r(r"C:\PF\Bare\b.exe", suite), "a derived dir of an app without InstallLocation");
+        assert!(!r(r"C:\PF\Suite\suite.exe", suite), "our file; a drive root is never an app's folder");
+        assert!(!r(r"C:\X\y.exe", None), "a drive-root anchor claims nothing, even without a dir of our own");
+        assert!(!r(r"C:\PF\Suite", suite), "our dir, although it holds the plugin");
+        assert!(!r(r"C:\PF\Suite\Plugin2\x.exe", suite), "a name prefix is not containment");
+        assert!(!r(r"C:\PF\Host\Ext\e.exe", Some(Path::new(r"C:\PF\Host\Ext"))), "a host does not claim its plugin's files");
+        assert!(r(r"C:\PF\Suite\Plugin\p.exe", None), "no confirmed dir of our own: fail closed");
+        let broad = Anchors { dirs: vec![p(r"C:\Program Files"), p(r"C:\Users")], ..Default::default() };
+        assert!(broad.referenced_in(&f, r"C:\Program Files\V\x.exe", None).is_none(), "a protected root is never an app's folder");
+        assert!(broad.referenced_in(&f, r"C:\Users\me\x.exe", None).is_none(), "nor an ancestor of one");
     }
 
     #[test]
