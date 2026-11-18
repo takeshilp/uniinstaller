@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Operations and plans. Schema-1 (0.1.x) manifests still load; a newer one is refused (`ops::load`).
+// shortcut: there is no downgrade path: 0.1.x lists a schema-2 manifest that uses the new variants as Broken; keep new variants additive.
 pub const SCHEMA: u32 = 2;
 /// Trace journals (`trace::load` refuses a newer one).
 pub const TRACE_SCHEMA: u32 = 1;

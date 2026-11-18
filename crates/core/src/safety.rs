@@ -243,6 +243,8 @@ pub fn registry_blocks(env: &Env, target: &Target) -> Vec<Block> {
                 block(BlockCode::OutsideAllowedZone, "registry key outside the allowed shapes")
             }
         }
+        // shortcut: previous values are restored only in Run, App Paths and vendor keys; Classes (file associations), Services and Uninstall values
+        // are report-only, add per-adapter rules in stage 3.
         Target::RegRevert { key, name, previous } => {
             if registry::to_regtype(previous.kind).is_none() {
                 return block(BlockCode::Unverifiable, "the previous value has an unknown type");

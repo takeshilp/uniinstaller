@@ -403,6 +403,8 @@ fn near_dir(confirmed: Option<&Path>, p: &Path) -> bool {
     confirmed.is_some_and(|d| same_or_inside(p, d) || is_inside(d, p))
 }
 
+// shortcut: a trace-created folder or key that is blocked as a whole hides the heuristic children inside it (same class as the shared
+// containers above); add per-child candidates if lab recall asks for them.
 /// Section G: what a trusted trace journal says the install created.
 struct TraceScan<'a> {
     env: &'a Env,

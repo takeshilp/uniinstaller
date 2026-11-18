@@ -117,3 +117,23 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
   the same build started from the Start menu worked, and 0.1.0/0.1.1 rendered normally inside Windows Sandbox.
 - Fix: none in code. Start the installed app from the Start menu (or ask the owner to); for dev runs use `npm run tauri dev`.
 - Verified: 2026-11-18, the owner started 0.1.1 from the Start menu and the UI rendered; the elevation check ran in that instance.
+
+## Opening the traced program froze the GUI (install tracing screen)
+- Symptom: after "Журнал установки сохранён" the button "Открыть программу" did nothing and every later click was dead.
+- Cause: the handler cleared `state.trace` before switching the view; `render()` still ran the `trace` view with `state.trace === null` and threw.
+- Fix: the handler only calls `openCard` (which changes the view first) and leaves `state.trace` alone.
+- Verified: found by walking the sandbox GUI with UI Automation; after the fix the same walk opens the card with the journal strip.
+
+## PowerShell 5.1: `@($a, $b + 1)` is `@(($a, $b) + 1)`
+- The comma binds tighter than `+`: with `$a = 1; $b = 2` the expression yields `1, 2, 1`, not `1, 3`. Hit while measuring snapshot sizes with ad-hoc
+  PowerShell; write `@($a, ($b + 1))`. Verified in 5.1.26100.
+
+## Order of the "Applied items" table changed in two lab scenarios
+- Symptom: `nsis-user` and `two-versions` Applied items tables list one registry key at another position than in run `20261118-141622` (statuses and
+  Candidates tables are identical).
+- Cause: `ops::target_rank` now applies registry keys shallow first (a revert first, then values, then keys, then paths), so a nested key ends `notFound`
+  instead of depending on the order the ids were passed. Not a finding.
+
+## Scenario files and 5.1 scripts: PowerShell reads a script without a BOM as ANSI
+- Symptom: a helper script with Russian button names failed to parse (`Unexpected token`), the names showed up as mojibake.
+- Fix: save helper scripts with non-ASCII text as UTF-8 with a BOM (the lab scripts stay ASCII-only, so they do not need one).

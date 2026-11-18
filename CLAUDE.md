@@ -2,7 +2,7 @@
 
 Windows uninstaller in Rust: runs a program's own uninstaller, waits for its process tree, then lists evidence-scored leftovers
 (files, shortcuts, registry, settings) for review. Removals go to a quarantine with a registry backup and can be restored.
-Stage-1 safe MVP: core crate (`uni-core`), read-only CLI (`uni`), Tauri 2 GUI in plain HTML/CSS/JS (`ui/`).
+Stage 1 plus install tracing (stage 2): core crate (`uni-core`), read-only CLI (`uni`), Tauri 2 GUI in plain HTML/CSS/JS (`ui/`).
 
 ## Layout
 - `crates/core`: all logic, no UI. `crates/cli`: `uni list|show|plan|history|sandbox-seed|sandbox-clean`.
@@ -16,7 +16,7 @@ Stage-1 safe MVP: core crate (`uni-core`), read-only CLI (`uni`), Tauri 2 GUI in
 - Lab (real installs in Windows Sandbox, ~5 min per scenario): `powershell -NoProfile -ExecutionPolicy Bypass -File lab/lab.ps1 [-Scenario <name>]`
 
 ## Ground rules
-1. Never run uninstall, apply or restore against the real system. Destructive flows run only with `UNIINSTALLER_SANDBOX` set
+1. Never run uninstall, apply, restore or a traced install against the real system. Destructive flows run only with `UNIINSTALLER_SANDBOX` set
    (seed it with `uni sandbox-seed`), inside tests, or inside Windows Sandbox through the lab (`lab/lab.ps1`). Enforced in code by the debug
    guard in `ops.rs`, `Env::from_sandbox_var` and `uni-lab`'s guest check (token user `WDAGUtilityAccount` plus `UNIINSTALLER_LAB`):
    do not weaken any of them. Never run anything from `target/lab/build` or `lab/guest` on the host.

@@ -14,6 +14,7 @@ npm install                                   # only @tauri-apps/cli
 cargo test --workspace                        # fixtures only: temp dirs and HKCU\Software\uniinstaller-tests\<tag>
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p uni-core --test real_system -- --ignored --nocapture   # read-only, real machine
+cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture   # install-trace snapshot cost: objects, ms, memory
 npm run tauri dev                             # GUI; always through npm, plain `cargo run` gives a blank window
 cargo run -p uni-cli -- list                  # read-only CLI on the real machine
 ```
@@ -30,8 +31,13 @@ $env:UNIINSTALLER_SANDBOX = "$env:TEMP\uni-sandbox"; cargo run -p uni-cli -- san
 ```
 Seeded programs: Sandbox Notes (full flow), Sandbox Suite (shared and foreign-uninstaller blocks), Sandbox Shared Tool (stays
 installed), Sandbox Orphan (batch uninstaller leaves its key), Sandbox Broken (launch error).
+Demo installer for install tracing: `<root>\installers\sandbox-traced-setup.cmd` (and `sandbox-traced-uninstall.cmd`), written by `sandbox-seed`. It
+installs "Sandbox Traced" under `pf\Trace Soft`, adds settings (with a `Cache` folder), a hidden component (`SandboxTracedRuntime`), an App Paths key, a Run value and
+vendor values, overwrites four values that exist before it runs (Run `SandboxTraced`, App Paths `shared-tool.exe`, `Shared Soft\Common|Handler`, and Sandbox
+Notes' `InstallDir`), and stands in for a background writer (`pfx86\Other Updater`, `Other Soft\Updater|LastCheck`). In sandbox mode the GUI's "Отследить установку"
+dialog starts in `installers\` and offers only `.cmd` and `.bat`; `trace::installer_launch` refuses anything else, so a real installer can never run from a sandbox GUI.
 `sandbox-clean` refuses unless the folder carries the `.uniinstaller-sandbox` marker.
-Debug builds refuse `begin`, `run_native`, `apply` and `restore` for any non-sandbox environment, so `tauri dev` can never uninstall a real program.
+Debug builds refuse `begin`, `run_native`, `apply`, `restore` and `trace::install` for any non-sandbox environment, so `tauri dev` can never uninstall or install a real program.
 
 ## The lab (Windows Sandbox, real installers)
 Purpose: run real installers and the product's real uninstall, scan, apply and restore flow inside Windows Sandbox and measure the
@@ -60,15 +66,26 @@ result with an independent inventory (recall, false deletions, restore, resume a
   product offered without a block and the policy `unblocked` ticked), PASS. Recall and precision are reported, not gated. Known gaps
   (service, task, Classes, locked file, MSI with empty InstallLocation) are listed and never fail a scenario.
 - Adding a scenario: `lab/scenarios/<name>.json` with `install` (files in `target\lab\build`, built by `lab/build.ps1`), `after_install`
-  (`file`, `delete`, `regval` actions), `target` (the DisplayName), `select` (`default` or `unblocked`), optional `lock`, `crash`,
-  `expect_begin_error`, and the four manifest classes `owned`, `userdoc`, `control`, `gap`. Patterns start with `key:` or `value:` for
+  (`file`, `delete`, `regval` actions), `target` (the DisplayName), `select` (`default`, `default+reverts` or `unblocked`), optional `lock`, `crash`,
+  `expect_begin_error`, `trace` (the single installer runs under `uni-lab trace`, see below), `before_install` (actions run before the baseline `s0`, for state that
+  an install overwrites), and the manifest classes `owned`, `userdoc`, `control`, `gap` and `revert` (values the install overwrote and the product should write
+  back; the analyzer maps `revert:<id>` candidates onto their `value:<id>`). Patterns start with `key:` or `value:` for
   registry ids, anything else is a path. Tokens: `{PF} {PF86} {CF} {PD} {APPDATA} {LOCALAPPDATA} {DESKTOP} {PUBDESKTOP} {PROGRAMS}
   {COMMONPROGRAMS} {DOCS} {TASKS}`. Matching is case-insensitive, the longest pattern wins, a `key:` pattern covers its subkeys and values.
   Spell `software\\microsoft\\windows\\currentversion` out in full. A RISK or FAIL is a product finding: never edit the manifest or the
   policy to turn it green.
 
+- Trace scenarios (`trace-machine`): the app is installed by `uni-lab trace` between two product snapshots, so the journal and the inventory are compared
+  independently (rules 15a-15f and 17 in `docs/architecture.md`). Expected: PASS, 3 reverted values, 0 false deletions, `{PF86}\Other Updater` offered at
+  Review and not selected, no revert for the unrelated `LastCheck` value. A RISK or FAIL is a product finding, never fixed by editing the manifest.
+
 ## Screenshots
-Use a PowerShell `System.Drawing` `CopyFromScreen` script kept outside the repo (find the window by title, `SetProcessDPIAware`, capture its rect).
+Keep the script outside the repo. Capture only the app window: find it by title, `SetProcessDPIAware`, then `PrintWindow(hwnd, hdc, 2)` into a bitmap (it
+renders the window itself, so windows on top of it do not leak into the image; `CopyFromScreen` of the window rect does include them).
+Driving the sandbox GUI without touching the mouse: UI Automation (`System.Windows.Automation`) reaches the app window; buttons and checkboxes answer
+`InvokePattern` and `TogglePattern` by name; the native file dialog is a child `#32770` whose list items answer `InvokePattern` (the file-name field does
+not). The expandable group headers are plain `div`s without a pattern: post `WM_MOUSEMOVE`, `WM_LBUTTONDOWN` and `WM_LBUTTONUP` (or `WM_MOUSEWHEEL`) to
+the `Chrome_RenderWidgetHostHWND` child with `PostMessage` (client coordinates of the screenshot).
 Real-system screenshots: list, card, confirmation modal (opened and cancelled) and preview only.
 
 ## Release
@@ -98,4 +115,14 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
 - Updater: verified end to end on 2026-11-18 in Windows Sandbox with networking on: published 0.1.0 installed silently (`/S`),
   the banner offered 0.1.1 about 6 s after start, the update button (pressed through UI Automation) downloaded, verified and
   installed 0.1.1 in about 5 s. Repeat at a release that changes the updater config, the signing key or the NSIS install mode.
+- Install tracing in the GUI (sandbox only; the title bar must show the ПЕСОЧНИЦА pill): `sandbox-seed`, `npm run tauri dev` with `UNIINSTALLER_SANDBOX` set, then
+  "Отследить установку" -> choose `installers\sandbox-traced-setup.cmd` -> Начать -> Готово -> Открыть программу (card shows the journal strip) -> Предпросмотр
+  остатков (strip, the "Прежние значения" group, a blocked row for Sandbox Notes' `InstallDir`) -> Запустить деинсталлятор -> tick "Прежние значения" ->
+  Удалить выбранное (confirmation for 3 values) -> Восстановить всё. Verified on 2026-11-18: 26 created objects and 5 modified values, 3 values returned, the Run
+  value exactly as the installer left it after the restore. Never pick a real installer, even in sandbox mode (the core refuses anyway).
 - Running screen with a slow uninstaller and "Не ждать дальше".
+- Mark-of-the-Web on an installer (NOT run by the agent: it can pop a security dialog on the desktop). In the sandbox GUI: write
+  `Set-Content -LiteralPath "<sandbox>\installers\sandbox-traced-setup.cmd" -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"`, trace the
+  installer again and note whether a security prompt appears, whether the run fails or waits, and what the result screen shows; then
+  `Remove-Item -LiteralPath <that file> -Stream Zone.Identifier`. `ShellExecuteExW` runs with `SEE_MASK_FLAG_NO_UI`, so a prompt may be suppressed and
+  the run may end with a launch error; record the observed behaviour in `docs/bugs.md`.

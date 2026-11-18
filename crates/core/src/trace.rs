@@ -292,6 +292,8 @@ impl Differ {
 
     /// Adds the deletions, drops every change below a folder or key that could not be read (or whose type switched between a
     /// link and a folder), flags noise and sorts by id. Returns the changes and the union of both unreadable sets.
+    // shortcut: modified files and deleted objects are report-only (no content backup), and a deleted path is stored lowercase (only the
+    // id is kept for a file); add backups and original-case paths if "undo what the installer replaced" is ever wanted.
     pub fn finish(mut self, after_unreadable: &BTreeSet<String>, roots: &[PathBuf]) -> (Vec<TraceChange>, BTreeSet<String>) {
         for (id, print) in self.before.paths.drain() {
             let kind = match print {
@@ -476,6 +478,8 @@ pub(crate) fn one_below_uninstall(env: &Env, key: &RegPath) -> bool {
     env.uninstall_roots.iter().any(|r| key.below(r).is_some_and(|c| c.len() == 1))
 }
 
+// shortcut: a journal is linked only when exactly one new visible Uninstall entry appears; updates, reinstalls and bundles stay
+// unlinked and unused, add the update-merge rules when they are wanted.
 /// Exactly one new visible program makes the journal usable; none or several leave it unlinked.
 fn link(env: &Env, changes: &[TraceChange]) -> Result<TraceLink> {
     let new: Vec<&RegPath> = changes
@@ -593,6 +597,8 @@ fn trust(t: &InstalledApp, app: &InstalledApp) -> Option<Distrust> {
     }
 }
 
+// shortcut: hidden components make a journal untrusted only after the program's own uninstaller ran (`find_for(.., true)`); the card
+// and the preview do not check them, because that would flag a bundle while it is installed.
 /// A hidden component the install created (an Uninstall key other than the program's own) is still installed.
 fn components_left(env: &Env, j: &TraceJournal, t: &InstalledApp) -> bool {
     j.changes.iter().any(|c| {
