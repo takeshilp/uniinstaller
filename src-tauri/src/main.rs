@@ -61,9 +61,9 @@ fn app_info(env: State<Env>) -> AppInfo {
 }
 
 #[tauri::command]
-async fn list_apps(env: State<'_, Env>) -> Res<Vec<InstalledApp>> {
+async fn list_apps(env: State<'_, Env>, include_hidden: bool) -> Res<Vec<InstalledApp>> {
     let env = env.inner().clone();
-    blocking(move || s(inventory::list_apps(&env, false))).await
+    blocking(move || s(inventory::list_apps(&env, include_hidden))).await
 }
 
 #[tauri::command]
@@ -97,12 +97,12 @@ async fn export_report(env: State<'_, Env>, op_id: String) -> Res<PathBuf> {
 
 /// begin + run_native in one blocking call; progress goes out as `native-progress` events.
 #[tauri::command]
-async fn uninstall(app: AppHandle, env: State<'_, Env>, stop: State<'_, StopFlag>, id: String) -> Res<Operation> {
+async fn uninstall(app: AppHandle, env: State<'_, Env>, stop: State<'_, StopFlag>, id: String, hidden_ok: bool) -> Res<Operation> {
     let env = env.inner().clone();
     let flag = stop.0.clone();
     flag.store(false, Ordering::SeqCst);
     blocking(move || {
-        let op = s(ops::begin(&env, &id, false))?;
+        let op = s(ops::begin(&env, &id, hidden_ok))?;
         let opts = RunOptions {
             stop: flag,
             on_poll: Some(Box::new(move |p| {

@@ -34,6 +34,7 @@ const state = {
   outcome: null, modal: null, toast: null, popover: false, error: null,
   update: null, updating: false,
   trace: null,
+  showHidden: false, hiddenOk: false,
 };
 
 function set(patch) { Object.assign(state, patch); render(); }
@@ -79,7 +80,8 @@ views.list = () => (state.tab === 'history' ? viewHistory() : viewPrograms());
 function viewPrograms() {
   const tabs = tabsHtml();
   const traceBtn = `<button class="btn secondary" data-act="trace-open" ${dis()}>${ic('\uE896')} ${S.traceStart}</button>`;
-  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div><div style="display:flex;gap:12px;align-items:center">${traceBtn}${tabs}</div></div>`;
+  const hiddenToggle = `<label class="check"><input type="checkbox" data-act="show-hidden" ${state.showHidden ? 'checked' : ''} ${dis()}> ${S.showHidden}</label>`;
+  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div><div style="display:flex;gap:12px;align-items:center">${hiddenToggle}${traceBtn}${tabs}</div></div>`;
   let body;
   if (state.appsError) {
     body = `<div class="strip danger"><span>${S.loadError}: ${esc(state.appsError)}</span><button class="btn secondary" data-act="reload">${S.retry}</button></div>`;
@@ -132,13 +134,14 @@ function renderList() {
   const list = $('#list');
   if (!list) return;
   const apps = filtered();
-  $('#count').textContent = S.found(apps.length);
+  $('#count').textContent = S.found(apps.length) + (state.showHidden ? S.hiddenCount(apps.filter((a) => a.hidden).length) : '');
   list.innerHTML = apps.length ? apps.map((a) => `
     <button class="card row" data-act="open" data-id="${esc(a.id)}">
       <span class="tile letter sm">${letter(a.displayName)}</span>
       <span class="grow"><div class="name">${esc(a.displayName)}</div>
         <div class="muted">${esc([a.publisher, a.displayVersion].filter(Boolean).join(' · ') || '—')}</div></span>
       <span class="muted">${a.estimatedSizeKb != null ? fmtSize(a.estimatedSizeKb * 1024) : ''}</span>
+      ${a.hidden ? `<span class="pill warn" title="${esc(S.hiddenReason[a.hidden] || a.hidden)}">${S.hiddenPill}</span>` : ''}
       ${pill(['muted', a.perUser ? S.onlyMe : S.forAll])}${ic('')}
     </button>`).join('') : `<div class="card muted">${S.nothingFound}</div>`;
 }
@@ -158,11 +161,12 @@ views.card = () => {
   const tr = d.trace
     ? (d.trace.trusted ? `<div class="strip info"><span>${esc(S.traceOnCard(fmtDate(d.trace.createdMs)))}</span></div>`
       : `<div class="strip warn"><span>${esc(S.traceUntrusted(fmtDate(d.trace.createdMs), S.distrust[d.trace.distrust] || d.trace.distrust))}</span></div>`) : '';
+  const hid = a.hidden ? `<div class="strip warn"><span>${esc(S.hiddenCard(S.hiddenReason[a.hidden] || a.hidden))}</span></div>` : '';
   const html = `<div class="col">${back}
     <div class="head" style="justify-content:flex-start;align-items:center;gap:20px">
       <span class="tile letter lg">${letter(a.displayName)}</span>
       <div><h1 class="display" style="font-size:40px">${esc(a.displayName)}</h1><p class="subtitle" style="margin-top:6px">${sub || '—'}</p></div></div>
-    ${warn}${err}${tr}
+    ${hid}${warn}${err}${tr}
     <div class="card"><h3 style="margin-bottom:16px">${S.details}</h3><dl class="kv">
       ${row(S.kId, esc(a.id), true)}
       ${a.productCode ? row(S.kProduct, esc(a.productCode), true) : ''}
@@ -417,8 +421,9 @@ function renderModal() {
     <h2 id="mt">${esc(S.confirmTitle(d.app.displayName))}</h2>
     <div class="muted">${S.willRun}</div><div class="cmd">${esc(cmd)}</div>
     <div class="muted">${S.confirmNote}</div>
+    ${d.app.hidden ? `<label class="check"><input type="checkbox" data-act="hidden-ok" ${state.hiddenOk ? 'checked' : ''}> ${S.hiddenConfirm}</label>` : ''}
     <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
-    <button class="btn primary" data-act="modal-run">${S.run}</button></div></div></div>`;
+    <button class="btn primary" id="mrun" data-act="modal-run" ${d.app.hidden && !state.hiddenOk ? 'disabled' : ''}>${S.run}</button></div></div></div>`;
   $('#mcancel').focus();
 }
 
@@ -462,8 +467,12 @@ function render() {
 
 // ---------- actions ----------
 async function loadApps() {
+  const hidden = state.showHidden;
   set({ apps: null, appsError: null });
-  try { set({ apps: await invoke('list_apps') }); } catch (e) { set({ appsError: String(e) }); }
+  try {
+    const apps = await invoke('list_apps', { includeHidden: hidden });
+    if (hidden === state.showHidden) set({ apps }); // a later toggle wins over a slow answer
+  } catch (e) { if (hidden === state.showHidden) set({ appsError: String(e) }); }
 }
 
 async function loadHistory() {
@@ -489,7 +498,7 @@ async function startUninstall() {
   set({ modal: null, view: 'running', busy: true, elapsed: 0, procs: [] });
   timer = setInterval(() => { state.elapsed++; const el = $('#elapsed'); if (el) el.textContent = fmtElapsed(state.elapsed); }, 1000);
   let op;
-  try { op = await invoke('uninstall', { id: state.appId }); } catch (e) { clearInterval(timer); set({ view: 'card', busy: false, error: String(e) }); return; }
+  try { op = await invoke('uninstall', { id: state.appId, hiddenOk: state.hiddenOk }); } catch (e) { clearInterval(timer); set({ view: 'card', busy: false, error: String(e) }); return; }
   clearInterval(timer);
   state.busy = false;
   await afterNative(op);
@@ -600,7 +609,9 @@ const actions = {
   'trace-cancel': () => { invoke('trace_cancel').catch(() => {}); set({ view: 'list', tab: 'programs', trace: null }); },
   'trace-open-app': (el) => openCard(el.dataset.id),
   'back-card': () => set({ view: 'card', preview: false }),
-  confirm: () => set({ modal: 'uninstall' }),
+  confirm: () => set({ modal: 'uninstall', hiddenOk: false }),
+  'show-hidden': (el) => { state.showHidden = el.checked; loadApps(); },
+  'hidden-ok': (el) => { state.hiddenOk = el.checked; $('#mrun').disabled = !el.checked; },
   'modal-cancel': () => set({ modal: null }),
   'modal-cancel-overlay': (el, e) => { if (e.target === el) set({ modal: null }); },
   'modal-run': () => startUninstall(),
