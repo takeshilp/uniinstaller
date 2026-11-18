@@ -446,3 +446,59 @@ pub struct TraceChange {
     /// A browser cache, a GPU shader cache and the like: kept in the journal, never evidence.
     pub noise: bool,
 }
+
+/// Which program a trace journal belongs to. Only `Linked` journals are ever used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum TraceLink {
+    /// Exactly one new visible Uninstall entry appeared: a copy of the program as it was listed right after the install.
+    Linked { app: Box<InstalledApp> },
+    /// No new visible entry (an update, a reinstall, a hidden component).
+    NoProgram {},
+    /// Several new visible entries: a bundle; we cannot tell what belongs to whom.
+    SeveralPrograms { names: Vec<String> },
+}
+
+/// One traced install: the delta between two snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceJournal {
+    pub schema: u32,
+    /// `tr-<ms>`
+    pub id: String,
+    pub created_ms: u64,
+    pub finished_ms: u64,
+    pub installer: Launch,
+    pub native: Option<NativeRun>,
+    pub link: TraceLink,
+    /// Objects in the "after" snapshot.
+    pub objects: u64,
+    pub before_ms: u64,
+    pub after_ms: u64,
+    /// Folders and keys that could not be read in either snapshot; nothing below them is in `changes`.
+    pub unreadable: Vec<String>,
+    pub changes: Vec<TraceChange>,
+}
+
+/// What the GUI shows after a trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceSummary {
+    pub id: String,
+    pub created_ms: u64,
+    pub link: TraceLink,
+    pub native: Option<NativeRun>,
+    pub objects: u64,
+    pub before_ms: u64,
+    pub after_ms: u64,
+    /// Non-noise Created objects.
+    pub created: usize,
+    /// Display strings of non-noise Modified registry values.
+    pub modified_values: Vec<String>,
+    /// How many of them carry their previous data (a revert could use it).
+    pub restorable_values: usize,
+    pub modified_files: Vec<String>,
+    pub deleted: Vec<String>,
+    pub noise: usize,
+    pub unreadable: usize,
+}

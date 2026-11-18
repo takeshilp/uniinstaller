@@ -19,7 +19,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 // instance or a CLI apply exists.
 static OP_LOCK: Mutex<()> = Mutex::new(());
 
-fn lock() -> MutexGuard<'static, ()> {
+pub(crate) fn lock() -> MutexGuard<'static, ()> {
     OP_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -30,7 +30,7 @@ pub fn is_busy() -> bool {
 
 // shortcut: destructive operations refuse any non-sandbox Env in debug builds, so `tauri dev` and `cargo run` never
 // uninstall real programs; this is intended, keep it.
-fn guard(env: &Env) -> Result<()> {
+pub(crate) fn guard(env: &Env) -> Result<()> {
     if cfg!(debug_assertions) && !env.sandbox {
         return Err(Error("debug build: destructive operations run only in sandbox mode".into()));
     }

@@ -156,7 +156,84 @@ pub fn seed(root: &Path, tag: &str) -> Result<Env> {
     register(&env, &Entry { key: "SandboxPatchKB1", name: Some("Sandbox Patch KB1"), version: "1", publisher: "x", location: None, icon: None, uninstall: None }, false)?;
     set_string(&registry::create(&env.uninstall_roots[0].child("SandboxPatchKB1"), KEY_ALL_ACCESS)?, "ParentKeyName", "Sandbox Notes", false)?;
     register(&env, &Entry { key: "SandboxNameless", name: None, version: "1", publisher: "x", location: None, icon: None, uninstall: None }, false)?;
+
+    // 7. Sandbox Traced: a demo installer for install tracing. The values it overwrites exist before it runs; the two scripts in
+    // `installers\` install and uninstall it. Nothing runs until the GUI or a test runs the setup script.
+    let soft = &env.software_roots[0];
+    set_string(&registry::create(&soft.child("Shared Soft").child("Common"), KEY_ALL_ACCESS)?, "Handler", r"C:\old\handler.exe", false)?;
+    set_string(&registry::create(&soft.child("Other Soft").child("Updater"), KEY_ALL_ACCESS)?, "LastCheck", "old", false)?;
+    set_string(&run, "SandboxTraced", r#""C:\old\traced-helper.exe""#, false)?;
+    set_string(&registry::create(&env.app_paths_roots[0].child("shared-tool.exe"), KEY_ALL_ACCESS)?, "", r"C:\old\shared-tool.exe", false)?;
+    write_traced_scripts(&env)?;
     Ok(env)
+}
+
+fn installers(env: &Env) -> PathBuf {
+    env.data_dir.parent().expect("sandbox root").join("installers")
+}
+
+/// The demo installer's uninstall script.
+pub fn traced_uninstall(env: &Env) -> PathBuf {
+    installers(env).join("sandbox-traced-uninstall.cmd")
+}
+
+/// The demo installer: what the GUI's "trace an install" picks in sandbox mode, and what the trace tests run.
+pub fn traced_setup(env: &Env) -> PathBuf {
+    installers(env).join("sandbox-traced-setup.cmd")
+}
+
+/// Batch files with CRLF. cmd toggles its quote state on every `"`, and a path never holds `&`, so nothing special sits outside
+/// quotes; reg.exe reads `\"` as a literal quote.
+fn write_traced_scripts(env: &Env) -> Result<()> {
+    let dir = pf(env).join(r"Trace Soft\Sandbox Traced");
+    let exe = dir.join(r"bin\traced.exe");
+    let un = format!(r"HKCU\{}", env.uninstall_roots[0].path);
+    let (run, ap, sw) = (format!(r"HKCU\{}", env.run_roots[0].path), format!(r"HKCU\{}", env.app_paths_roots[0].path), format!(r"HKCU\{}", env.software_roots[0].path));
+    let (own, runtime) = (format!(r"{un}\SandboxTraced"), format!(r"{un}\SandboxTracedRuntime"));
+    let settings = roaming(env).join(r"Trace Soft\Sandbox Traced");
+    let other = env.folders.program_files[1].join("Other Updater");
+    let (dir, exe) = (dir.display(), exe.display());
+    let uninstall = [
+        "@echo off".to_string(),
+        format!("del /q \"{exe}\""),
+        format!("reg delete \"{own}\" /f >nul"),
+        format!("reg delete \"{runtime}\" /f >nul"),
+    ];
+    write(&traced_uninstall(env), format!("{}\r\n", uninstall.join("\r\n")).as_bytes())?;
+    let reg = |key: &str, args: &str| format!("reg add \"{key}\" {args} /f >nul");
+    let setup = [
+        "@echo off".to_string(),
+        format!("mkdir \"{dir}\\bin\""),
+        format!("echo MZ> \"{exe}\""),
+        format!("echo x> \"{dir}\\data.bin\""),
+        format!("copy /y \"{}\" \"{dir}\\uninstall.cmd\" >nul", traced_uninstall(env).display()),
+        format!("mkdir \"{}\\Cache\"", settings.display()),
+        format!("echo {{}}> \"{}\\settings.json\"", settings.display()),
+        format!("echo x> \"{}\\Cache\\blob.bin\"", settings.display()),
+        reg(&own, "/v DisplayName /d \"Sandbox Traced\""),
+        reg(&own, "/v DisplayVersion /d 1.0"),
+        reg(&own, "/v Publisher /d \"Trace Soft\""),
+        reg(&own, &format!("/v InstallLocation /d \"{dir}\"")),
+        reg(&own, &format!("/v DisplayIcon /d \"{exe}\"")),
+        reg(&own, &format!("/v UninstallString /d \"\\\"{dir}\\uninstall.cmd\\\"\"")),
+        // A hidden component: SystemComponent keeps it out of the program list.
+        reg(&runtime, "/v DisplayName /d \"Sandbox Traced Runtime\""),
+        reg(&runtime, "/v SystemComponent /t REG_DWORD /d 1"),
+        // Overwrites a pre-existing value and points it at this program: offered as a revert.
+        reg(&run, &format!("/v SandboxTraced /d \"\\\"{exe}\\\" /tray\"")),
+        reg(&format!(r"{ap}\traced.exe"), &format!("/ve /d \"{exe}\"")),
+        // Overwrites a pre-existing App Paths default: a revert, and the key itself must not be offered for deletion.
+        reg(&format!(r"{ap}\shared-tool.exe"), &format!("/ve /d \"{exe}\"")),
+        reg(&format!(r"{sw}\Trace Soft\Sandbox Traced"), &format!("/v InstallDir /d \"{dir}\"")),
+        reg(&format!(r"{sw}\Shared Soft\Common"), &format!("/v Handler /d \"{exe}\"")),
+        // Overwrites a value of another installed app (Sandbox Notes): blocked as SharedWithOtherApp.
+        reg(&format!(r"{sw}\Sandbox Soft\Sandbox Notes"), &format!("/v InstallDir /d \"{dir}\"")),
+        // Stands in for a background writer: unrelated to this program, so neither preselected nor reverted.
+        format!("mkdir \"{}\"", other.display()),
+        format!("echo x> \"{}\\update.dat\"", other.display()),
+        reg(&format!(r"{sw}\Other Soft\Updater"), "/v LastCheck /d new"),
+    ];
+    write(&traced_setup(env), format!("{}\r\n", setup.join("\r\n")).as_bytes())
 }
 
 /// Removes the sandbox registry subtree and the root folder. Refuses unless the root carries the marker.

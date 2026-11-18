@@ -174,6 +174,12 @@ impl Anchors {
     }
 }
 
+/// Whether registry text (one path per line or `;` item) equals or points into `dir`. Used to attribute a changed value to a program.
+pub fn text_refers_to(text: &str, dir: &Path) -> bool {
+    let needle = format!("{}\\", norm(dir).trim_end_matches('\\'));
+    text.replace('/', "\\").to_lowercase().split(['\n', ';']).any(|part| same_or_inside(Path::new(part.trim().trim_matches('"')), dir) || part.contains(&needle))
+}
+
 /// Hard blocks that depend only on the path itself and the environment.
 pub fn path_blocks(env: &Env, path: &Path, group: Group, install_dir: Option<&Path>, anchors: &Anchors) -> Vec<Block> {
     let mut out = Vec::new();
@@ -355,6 +361,21 @@ mod tests {
         assert!(!default_selected(Tier::Safe, Group::ProgramFiles, true));
         assert!(!default_selected(Tier::Safe, Group::Shortcuts, true));
         assert!(!default_selected(Tier::Safe, Group::Revert, false));
+    }
+
+    #[test]
+    fn text_refers_to_rule() {
+        let d = Path::new(r"C:\PF\Lab Trace");
+        let r = |t: &str| text_refers_to(t, d);
+        assert!(r(r#""C:\PF\Lab Trace\app.exe" /tray"#), "a command line");
+        assert!(r(r"C:\PF\Lab Trace\app.exe /tray"), "an unquoted command line");
+        assert!(r(r"C:\X;C:\PF\Lab Trace\bin"), "a list");
+        assert!(r("C:\\X\nC:\\PF\\Lab Trace"), "a multi-line string, a bare folder");
+        assert!(r("c:/pf/LAB TRACE/app.exe"), "slashes and case");
+        assert!(!r(r"C:\PF\Lab Trace2\app.exe"), "a lookalike name prefix");
+        assert!(!r(r"C:\PF\Lab Tracer"), "a lookalike bare name");
+        assert!(!r(r"C:\old\app.exe"));
+        assert!(!r(""));
     }
 
     #[test]

@@ -12,15 +12,19 @@
 // shortcut: not captured: Classes, Services, scheduled tasks, HKCU\Environment, SOFTWARE\Microsoft (except Uninstall, Run, RunOnce
 // and App Paths), desktop subfolders, protected trees, temp, other users and install folders outside the zones; add stage-3 adapters.
 // shortcut: noise rules are folder names below the capture root; there are none for the registry.
+use crate::command::parse_uninstall;
 use crate::env::Env;
+use crate::inventory::{icon_path, list_apps};
 use crate::model::*;
-use crate::ops::target_key;
-use crate::paths::{canonical, is_inside, mtime_ms, norm, REPARSE_ATTR};
+use crate::native::{self, RunOptions};
+use crate::ops::{self, target_key};
+use crate::paths::{REPARSE_ATTR, canonical, is_drive_root, is_inside, is_local_abs, mtime_ms, norm};
 use crate::registry;
-use crate::safety::RESERVED_SOFTWARE;
-use crate::{Error, Result};
+use crate::safety::{RESERVED_SOFTWARE, protected_reason, registry_blocks, text_refers_to};
+use crate::{Error, Result, now_ms};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -160,13 +164,7 @@ impl Walker<'_, '_> {
                         continue;
                     };
                     let path = dir.join(n);
-                    let (kind, print) = if md.file_attributes() & REPARSE_ATTR != 0 {
-                        (PathKind::Link, Print::Link {})
-                    } else if md.is_dir() {
-                        (PathKind::Dir, Print::Dir {})
-                    } else {
-                        (PathKind::File, Print::File { size: md.len(), mtime: mtime_ms(&md) })
-                    };
+                    let (kind, print) = print_of(&md);
                     self.emit(format!("path:{child}"), Target::Path { path: path.clone(), kind }, print, None)?;
                     if kind == PathKind::Dir && max_depth.is_none_or(|m| depth < m) {
                         stack.push((path, child, depth + 1));
@@ -226,6 +224,17 @@ impl Walker<'_, '_> {
             }
         }
         Ok(())
+    }
+}
+
+/// The kind and fingerprint of one file system object; a link is never followed.
+fn print_of(md: &fs::Metadata) -> (PathKind, Print) {
+    if md.file_attributes() & REPARSE_ATTR != 0 {
+        (PathKind::Link, Print::Link {})
+    } else if md.is_dir() {
+        (PathKind::Dir, Print::Dir {})
+    } else {
+        (PathKind::File, Print::File { size: md.len(), mtime: mtime_ms(md) })
     }
 }
 
@@ -367,9 +376,357 @@ pub fn value_print(v: &RegVal) -> Result<Print> {
     Ok(Print::Value { kind: v.kind, sha256: sha256_hex(&b)? })
 }
 
+// ---- sessions ----
+
+/// A trace in progress: the installer to run and the "before" snapshot. Lives in memory only.
+pub struct Session {
+    pub launch: Launch,
+    pub before: Snapshot,
+    pub started_ms: u64,
+    pub native: Option<NativeRun>,
+}
+
+/// The command that runs the installer at `path`. Trust boundary: the path comes from a file dialog.
+/// Real environment: an `.exe` itself, an `.msi` through `msiexec /i` (the Windows folder's copy, so an association cannot
+/// interfere). Sandbox: only `.cmd` and `.bat` files inside the sandbox folder, so the sandbox GUI can never run a real installer.
+pub fn installer_launch(env: &Env, path: &Path) -> Result<Launch> {
+    let bad = |why: &str| Err(Error(format!("cannot trace this file: {why}")));
+    if !is_local_abs(path) {
+        return bad("not a local absolute path");
+    }
+    if !path.is_file() {
+        return bad("not a file");
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).unwrap_or_default();
+    let raw = path.to_string_lossy().to_string();
+    let launch = |exe: PathBuf, args: String| Launch { raw: raw.clone(), exe, args, argv: vec![], msi_product: None };
+    if env.sandbox {
+        let in_sandbox = env.data_dir.parent().is_some_and(|root| is_inside(path, root)) && crate::paths::is_canonical(path);
+        return match ext.as_str() {
+            "cmd" | "bat" if in_sandbox => Ok(launch(path.to_path_buf(), String::new())),
+            _ => bad("in sandbox mode only .cmd and .bat files inside the sandbox folder can be traced"),
+        };
+    }
+    match ext.as_str() {
+        "exe" => Ok(launch(path.to_path_buf(), String::new())),
+        "msi" if !raw.contains('"') => Ok(launch(env.folders.system_dir.join("msiexec.exe"), format!("/i \"{raw}\""))),
+        _ => bad("only .exe and .msi files can be traced"),
+    }
+}
+
+/// Takes the "before" snapshot. Read-only: allowed on the real system.
+pub fn begin(env: &Env, launch: Launch) -> Result<Session> {
+    let started_ms = now_ms();
+    Ok(Session { launch, before: capture(env)?, started_ms, native: None })
+}
+
+/// Runs the installer and waits for its whole process tree. Destructive in effect (it installs), so the debug guard applies:
+/// a debug build runs it only in the sandbox.
+pub fn install(env: &Env, s: &mut Session, opts: &RunOptions) -> Result<()> {
+    ops::guard(env)?;
+    if s.native.is_some() {
+        return Err(Error("the installer was already run".into()));
+    }
+    let _g = ops::lock();
+    s.native = Some(native::run_uninstaller(&s.launch, opts));
+    Ok(())
+}
+
+/// Takes the "after" snapshot (streamed through the differ), links the journal to a program and saves it. Only writes the journal.
+pub fn finish(env: &Env, s: Session) -> Result<TraceJournal> {
+    let before_ms = s.before.ms;
+    let mut d = Differ::new(s.before);
+    let cap = capture_with(env, &mut |id, t, p, _| d.visit(id, t, p))?;
+    let roots: Vec<PathBuf> = file_roots(env).into_iter().map(|r| r.0).collect();
+    let (mut changes, unreadable) = d.finish(&cap.unreadable, &roots);
+    let link = link(env, &changes)?;
+    let dirs = match &link {
+        TraceLink::Linked { app } => app_dirs(env, app),
+        _ => vec![],
+    };
+    for c in changes.iter_mut().filter(|c| c.previous.is_some()) {
+        if !keep_previous(env, &dirs, c) {
+            c.previous = None;
+        }
+    }
+    let mut ms = now_ms();
+    while traces_dir(env).join(format!("tr-{ms}.json")).exists() {
+        ms += 1;
+    }
+    let j = TraceJournal {
+        schema: TRACE_SCHEMA,
+        id: format!("tr-{ms}"),
+        created_ms: s.started_ms,
+        finished_ms: now_ms(),
+        installer: s.launch,
+        native: s.native,
+        link,
+        objects: cap.objects,
+        before_ms,
+        after_ms: cap.ms,
+        unreadable: unreadable.into_iter().collect(),
+        changes,
+    };
+    save(env, &j)?;
+    Ok(j)
+}
+
+// ---- linking ----
+
+fn one_below_uninstall(env: &Env, key: &RegPath) -> bool {
+    env.uninstall_roots.iter().any(|r| key.below(r).is_some_and(|c| c.len() == 1))
+}
+
+/// Exactly one new visible program makes the journal usable; none or several leave it unlinked.
+fn link(env: &Env, changes: &[TraceChange]) -> Result<TraceLink> {
+    let new: Vec<&RegPath> = changes
+        .iter()
+        .filter(|c| c.change == Change::Created && !c.noise)
+        .filter_map(|c| match &c.target {
+            Target::RegKey { key } if one_below_uninstall(env, key) => Some(key),
+            _ => None,
+        })
+        .collect();
+    let mut apps: Vec<InstalledApp> = list_apps(env)?.into_iter().filter(|a| a.sources.iter().any(|s| new.iter().any(|k| k.same(s)))).collect();
+    Ok(match apps.len() {
+        1 => TraceLink::Linked { app: Box::new(apps.remove(0)) },
+        0 => TraceLink::NoProgram {},
+        _ => TraceLink::SeveralPrograms { names: apps.into_iter().map(|a| a.display_name).collect() },
+    })
+}
+
+/// The folders a program claims for itself: InstallLocation, the uninstaller's folder, the icon's folder.
+/// A superset of what `scan` can confirm as the install folder, so a value that passes the scan check always carries `previous`.
+fn app_dirs(env: &Env, app: &InstalledApp) -> Vec<PathBuf> {
+    let un = app.uninstall_string.as_deref().and_then(|s| parse_uninstall(s, &env.folders.system_dir, app.product_code.as_deref()).ok());
+    [app.install_location.clone(), un.and_then(|l| l.exe.parent().map(Path::to_path_buf)), icon_path(app).and_then(|i| i.parent().map(Path::to_path_buf))]
+        .into_iter()
+        .flatten()
+        .filter(|d| is_local_abs(d) && !is_drive_root(d) && !is_inside(d, &env.folders.windows_dir) && protected_reason(&env.folders, d, Group::ProgramFiles).is_none())
+        .collect()
+}
+
+/// Previous data is kept only where a revert could use it: an allowed shape whose new text points into the program's folders.
+fn keep_previous(env: &Env, dirs: &[PathBuf], c: &TraceChange) -> bool {
+    let (Change::Modified, Target::RegValue { key, name }, Some(prev)) = (c.change, &c.target, &c.previous) else { return false };
+    registry_blocks(env, &Target::RegRevert { key: key.clone(), name: name.clone(), previous: prev.clone() }).is_empty()
+        && registry::read_value(key, name).ok().and_then(|v| registry::val_text(&v)).is_some_and(|t| dirs.iter().any(|d| text_refers_to(&t, d)))
+}
+
+// ---- store ----
+
+const HEADER: &str = "uniinstaller-trace";
+
+/// `^tr-[0-9]{1,20}$` without a regex crate.
+pub fn valid_trace_id(id: &str) -> Result<()> {
+    match id.strip_prefix("tr-") {
+        Some(n) if (1..=20).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()) => Ok(()),
+        _ => Err(Error("invalid trace id".into())),
+    }
+}
+
+fn traces_dir(env: &Env) -> PathBuf {
+    env.data_dir.join("traces")
+}
+
+// shortcut: journals are user-writable and hold the previous data of attributable values in clear text; the checksum catches
+// corruption, not tampering. Protected store and DPAPI in stage 2, together with the manifests.
+/// Line 1: `uniinstaller-trace <version> sha256:<hex>`, then compact JSON; the hash covers exactly the JSON bytes. Written to
+/// `.tmp`, synced, renamed.
+pub fn save(env: &Env, j: &TraceJournal) -> Result<PathBuf> {
+    valid_trace_id(&j.id)?;
+    let body = serde_json::to_vec(j)?;
+    let header = format!("{HEADER} {TRACE_SCHEMA} sha256:{}\n", sha256_hex(&body)?);
+    let dir = traces_dir(env);
+    fs::create_dir_all(&dir)?;
+    let (path, tmp) = (dir.join(format!("{}.json", j.id)), dir.join(format!("{}.json.tmp", j.id)));
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(header.as_bytes())?;
+    f.write_all(&body)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Rejects a bad or newer header, a checksum mismatch, invalid JSON and an id that does not match the file name.
+pub fn load(env: &Env, id: &str) -> Result<TraceJournal> {
+    valid_trace_id(id)?;
+    let bytes = fs::read(traces_dir(env).join(format!("{id}.json")))?;
+    let bad = || Error("not a trace journal (bad header)".into());
+    let nl = bytes.iter().position(|&b| b == b'\n').ok_or_else(bad)?;
+    let head = std::str::from_utf8(&bytes[..nl]).map_err(|_| bad())?;
+    let mut parts = head.split(' ');
+    let (Some(HEADER), Some(ver), Some(hash), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return Err(bad()) };
+    let ver: u32 = ver.parse().map_err(|_| bad())?;
+    let hash = hash.strip_prefix("sha256:").ok_or_else(bad)?;
+    if ver > TRACE_SCHEMA {
+        return Err(Error("written by a newer version of Uniinstaller".into()));
+    }
+    let body = &bytes[nl + 1..];
+    if sha256_hex(body)? != hash {
+        return Err(Error("checksum mismatch: the journal is damaged".into()));
+    }
+    let j: TraceJournal = serde_json::from_slice(body)?;
+    if j.schema > TRACE_SCHEMA {
+        return Err(Error("written by a newer version of Uniinstaller".into()));
+    }
+    if j.id != id {
+        return Err(Error("journal id does not match its file name".into()));
+    }
+    Ok(j)
+}
+
+// ---- use ----
+
+/// Why the journal `t` was recorded for a program that no longer looks the same, if it does not: version, folder, uninstall command.
+fn trust(t: &InstalledApp, app: &InstalledApp) -> Option<Distrust> {
+    let folder = |a: &InstalledApp| a.install_location.as_deref().map(norm);
+    let command = |a: &InstalledApp| a.uninstall_string.as_deref().map(|s| s.trim().to_lowercase());
+    if t.display_version != app.display_version {
+        Some(Distrust::VersionChanged)
+    } else if folder(t) != folder(app) {
+        Some(Distrust::FolderChanged)
+    } else if command(t) != command(app) {
+        Some(Distrust::UninstallerChanged)
+    } else {
+        None
+    }
+}
+
+/// A hidden component the install created (an Uninstall key other than the program's own) is still installed.
+fn components_left(env: &Env, j: &TraceJournal, t: &InstalledApp) -> bool {
+    j.changes.iter().any(|c| {
+        c.change == Change::Created
+            && matches!(&c.target, Target::RegKey { key } if one_below_uninstall(env, key) && !t.sources.iter().any(|s| s.same(key)) && registry::exists(key))
+    })
+}
+
+// shortcut: `find_for` parses every journal, newest first; add an index if users keep hundreds.
+/// The newest loadable journal linked to `app` (same hive, view and key), whether it is still trusted and what it only reports.
+/// `uninstalled`: the program's own uninstaller has run, so a hidden component that is still installed makes the journal untrusted.
+pub fn find_for(env: &Env, app: &InstalledApp, uninstalled: bool) -> Option<(TraceJournal, TraceUse)> {
+    let mut ids: Vec<(u64, String)> = fs::read_dir(traces_dir(env))
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let id = name.strip_suffix(".json")?.to_string();
+            valid_trace_id(&id).ok()?;
+            Some((id[3..].parse().ok()?, id))
+        })
+        .collect();
+    ids.sort_by_key(|x| std::cmp::Reverse(x.0));
+    for (_, id) in ids {
+        let Ok(j) = load(env, &id) else { continue };
+        let distrust = {
+            let TraceLink::Linked { app: t } = &j.link else { continue };
+            if !t.sources.iter().any(|s| app.sources.iter().any(|x| x.same(s))) {
+                continue;
+            }
+            trust(t, app).or_else(|| (uninstalled && components_left(env, &j, t)).then_some(Distrust::ComponentStillInstalled))
+        };
+        let reported = j.changes.iter().filter(|c| !c.noise && (c.change == Change::Deleted || (c.change == Change::Modified && matches!(c.target, Target::Path { .. })))).count();
+        let u = TraceUse { id: j.id.clone(), created_ms: j.created_ms, trusted: distrust.is_none(), distrust, reported };
+        return Some((j, u));
+    }
+    None
+}
+
+fn display(t: &Target) -> String {
+    match t {
+        Target::Path { path, .. } => path.display().to_string(),
+        Target::RegKey { key } => key.display(),
+        Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => format!("{}\\{}", key.display(), if name.is_empty() { "@" } else { name }),
+    }
+}
+
+pub fn summary(j: &TraceJournal) -> TraceSummary {
+    let live = || j.changes.iter().filter(|c| !c.noise);
+    let values: Vec<&TraceChange> = live().filter(|c| c.change == Change::Modified && matches!(c.target, Target::RegValue { .. })).collect();
+    TraceSummary {
+        id: j.id.clone(),
+        created_ms: j.created_ms,
+        link: j.link.clone(),
+        native: j.native.clone(),
+        objects: j.objects,
+        before_ms: j.before_ms,
+        after_ms: j.after_ms,
+        created: live().filter(|c| c.change == Change::Created).count(),
+        modified_values: values.iter().map(|c| display(&c.target)).collect(),
+        restorable_values: values.iter().filter(|c| c.previous.is_some()).count(),
+        modified_files: live().filter(|c| c.change == Change::Modified && matches!(c.target, Target::Path { .. })).map(|c| display(&c.target)).collect(),
+        deleted: live().filter(|c| c.change == Change::Deleted).map(|c| display(&c.target)).collect(),
+        noise: j.changes.iter().filter(|c| c.noise).count(),
+        unreadable: j.unreadable.len(),
+    }
+}
+
+/// Every Created change, noise included: a folder holding a browser cache is still "unchanged".
+#[allow(dead_code)] // used by the scan in step 4
+pub(crate) type Created<'a> = HashMap<&'a str, &'a TraceChange>;
+
+#[allow(dead_code)] // used by the scan in step 4
+pub(crate) fn created(j: &TraceJournal) -> Created<'_> {
+    j.changes.iter().filter(|c| c.change == Change::Created).map(|c| (c.id.as_str(), c)).collect()
+}
+
+/// The path is exactly what the install created: same fingerprint, and (for a folder) every current child too. Entries that were
+/// deleted since are fine; anything new or changed breaks the match. Fails closed on any read error and on unreadable ids.
+#[allow(dead_code)] // used by the scan in step 4
+pub(crate) fn unchanged_path(p: &Path, c: &Created, blind: &HashSet<&str>) -> bool {
+    let id = format!("path:{}", norm(p));
+    let Some(ch) = c.get(id.as_str()) else { return false };
+    if blind.contains(id.as_str()) {
+        return false;
+    }
+    let Ok(md) = fs::symlink_metadata(p) else { return false };
+    let (kind, live) = print_of(&md);
+    if Some(&live) != ch.after.as_ref() {
+        return false;
+    }
+    if kind == PathKind::Dir {
+        let Ok(rd) = fs::read_dir(p) else { return false };
+        for e in rd {
+            let Ok(e) = e else { return false };
+            if !unchanged_path(&e.path(), c, blind) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The same for a key: every current value was created with the same data, every current subkey is unchanged too.
+#[allow(dead_code)] // used by the scan in step 4
+pub(crate) fn unchanged_key(k: &RegPath, c: &Created, blind: &HashSet<&str>) -> bool {
+    let id = target_key(&Target::RegKey { key: k.clone() });
+    if !c.contains_key(id.as_str()) || blind.contains(id.as_str()) {
+        return false;
+    }
+    let Ok(key) = registry::open(k, KEY_READ) else { return false };
+    for item in key.enum_values() {
+        let Ok((name, v)) = item else { return false };
+        let val = registry::to_val(name.clone(), v);
+        let vid = target_key(&Target::RegValue { key: k.clone(), name });
+        let (Some(ch), Ok(print)) = (c.get(vid.as_str()), value_print(&val)) else { return false };
+        if ch.after.as_ref() != Some(&print) {
+            return false;
+        }
+    }
+    for n in key.enum_keys() {
+        let Ok(n) = n else { return false };
+        if !unchanged_key(&k.child(&n), c, blind) {
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winreg::enums::KEY_ALL_ACCESS;
 
     fn p(path: &str, kind: PathKind) -> (String, Target) {
         let t = Target::Path { path: PathBuf::from(path), kind };
@@ -578,5 +935,267 @@ mod tests {
         assert_ne!(a, value_print(&val("n", 1, b"y\0")).unwrap(), "a data change");
         let Print::Value { kind, sha256 } = a else { panic!() };
         assert_eq!((kind, sha256.len()), (1, 64));
+    }
+
+    fn listed(key: &str, name: &str, version: &str) -> InstalledApp {
+        InstalledApp {
+            id: format!("HKCU64:{key}"),
+            key_name: key.into(),
+            sources: vec![key_path(key)],
+            display_name: name.into(),
+            display_version: Some(version.into()),
+            publisher: None,
+            install_location: Some(PathBuf::from(r"C:\PF\Lab Trace")),
+            display_icon: None,
+            uninstall_string: Some(r#""C:\PF\Lab Trace\unins.exe" /S"#.into()),
+            quiet_uninstall_string: None,
+            modify_path: None,
+            install_date: None,
+            estimated_size_kb: None,
+            windows_installer: false,
+            product_code: None,
+            per_user: true,
+        }
+    }
+    fn key_path(key: &str) -> RegPath {
+        RegPath::new(Hive::Hkcu, View::V64, format!(r"Software\Lab\Uninstall\{key}"))
+    }
+    fn journal(id: &str, link: TraceLink) -> TraceJournal {
+        TraceJournal {
+            schema: TRACE_SCHEMA,
+            id: id.into(),
+            created_ms: 5,
+            finished_ms: 9,
+            installer: Launch { raw: r"C:\x\setup.exe".into(), exe: PathBuf::from(r"C:\x\setup.exe"), args: String::new(), argv: vec![], msi_product: None },
+            native: Some(NativeRun { exit_code: Some(0), ..Default::default() }),
+            link,
+            objects: 3,
+            before_ms: 1,
+            after_ms: 2,
+            unreadable: vec![r"path:c:\locked".into()],
+            changes: vec![TraceChange { id: "key:hkcu64:software\\v".into(), change: Change::Created, target: Target::RegKey { key: key("Software\\V") }, before: None, after: Some(Print::Key {}), previous: None, noise: false }],
+        }
+    }
+
+    /// A sandbox environment under a temp dir whose test registry subtree is removed on drop.
+    struct Sb {
+        env: Env,
+        _dir: tempfile::TempDir,
+    }
+    impl Sb {
+        fn new(tag: &str) -> Sb {
+            let dir = tempfile::tempdir().unwrap();
+            Sb { env: Env::sandbox(dir.path(), &format!("trace_unit_{tag}_{}", std::process::id())), _dir: dir }
+        }
+    }
+    impl Drop for Sb {
+        fn drop(&mut self) {
+            let root = self.env.software_roots[0].path.rsplit_once('\\').unwrap().0.to_string();
+            let _ = registry::delete_key(&RegPath::new(Hive::Hkcu, View::V64, root));
+        }
+    }
+
+    #[test]
+    fn journal_integrity() {
+        let sb = Sb::new("integrity");
+        let env = &sb.env;
+        let j = journal("tr-100", TraceLink::NoProgram {});
+        let path = save(env, &j).unwrap();
+        assert_eq!(serde_json::to_value(load(env, "tr-100").unwrap()).unwrap(), serde_json::to_value(&j).unwrap(), "roundtrip");
+        let good = fs::read(&path).unwrap();
+        let head_end = good.iter().position(|&b| b == b'\n').unwrap();
+        assert!(good.starts_with(b"uniinstaller-trace 1 sha256:"));
+        assert_eq!(head_end, "uniinstaller-trace 1 sha256:".len() + 64);
+        let err = |env: &Env, id: &str| load(env, id).unwrap_err().0;
+        // one flipped byte of the body
+        let mut bad = good.clone();
+        bad[head_end + 20] ^= 1;
+        fs::write(&path, &bad).unwrap();
+        assert!(err(env, "tr-100").contains("checksum"), "{}", err(env, "tr-100"));
+        // a newer header version, even with a matching checksum
+        let newer = [b"uniinstaller-trace 2".as_slice(), &good[b"uniinstaller-trace 1".len()..]].concat();
+        fs::write(&path, &newer).unwrap();
+        assert!(err(env, "tr-100").contains("newer"), "{}", err(env, "tr-100"));
+        // a newer schema inside the body, with a matching checksum
+        let mut jn = j.clone();
+        jn.schema = TRACE_SCHEMA + 1;
+        let body = serde_json::to_vec(&jn).unwrap();
+        fs::write(&path, [format!("uniinstaller-trace 1 sha256:{}\n", sha256_hex(&body).unwrap()).as_bytes(), &body].concat()).unwrap();
+        assert!(err(env, "tr-100").contains("newer"), "{}", err(env, "tr-100"));
+        // not a journal at all
+        fs::write(&path, b"{\"schema\":1}").unwrap();
+        assert!(err(env, "tr-100").contains("bad header"));
+        fs::write(&path, b"uniinstaller-trace 1 md5:00\n{}").unwrap();
+        assert!(err(env, "tr-100").contains("bad header"));
+        // valid JSON of the wrong shape, with a matching checksum
+        fs::write(&path, [format!("uniinstaller-trace 1 sha256:{}\n", sha256_hex(b"{}").unwrap()).as_bytes(), b"{}"].concat()).unwrap();
+        assert!(load(env, "tr-100").is_err());
+        // a journal copied under another name
+        fs::write(&path, &good).unwrap();
+        fs::copy(&path, path.with_file_name("tr-101.json")).unwrap();
+        assert!(err(env, "tr-101").contains("does not match"), "{}", err(env, "tr-101"));
+        // ids
+        for ok in ["tr-1", "tr-1731800000000"] {
+            assert!(valid_trace_id(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "tr-", "tr-1a", r"..\x", "TR-1", "op-1", "tr-123456789012345678901", "tr--1", r"tr-1\..\x"] {
+            assert!(valid_trace_id(bad).is_err(), "{bad}");
+            assert!(load(env, bad).is_err());
+        }
+        assert!(!path.with_file_name("tr-100.json.tmp").exists(), "no temp file is left behind");
+    }
+
+    #[test]
+    fn trust_rules() {
+        let t = listed("A", "Lab Trace", "1.0");
+        assert_eq!(trust(&t, &t), None);
+        let mut a = t.clone();
+        a.display_version = Some("1.1".into());
+        assert_eq!(trust(&t, &a), Some(Distrust::VersionChanged));
+        let mut a = t.clone();
+        a.install_location = Some(PathBuf::from(r"c:\pf\lab trace\"));
+        assert_eq!(trust(&t, &a), None, "the folder is compared normalised");
+        a.install_location = Some(PathBuf::from(r"C:\PF\Other"));
+        assert_eq!(trust(&t, &a), Some(Distrust::FolderChanged));
+        a.install_location = None;
+        assert_eq!(trust(&t, &a), Some(Distrust::FolderChanged));
+        let mut a = t.clone();
+        a.uninstall_string = Some(format!("  {}  ", t.uninstall_string.as_deref().unwrap().to_uppercase()));
+        assert_eq!(trust(&t, &a), None, "trimmed and case-insensitive");
+        a.uninstall_string = Some(r"C:\PF\Lab Trace\other.exe".into());
+        assert_eq!(trust(&t, &a), Some(Distrust::UninstallerChanged));
+        // the order: version, then folder, then the command
+        a.display_version = Some("2".into());
+        a.install_location = None;
+        assert_eq!(trust(&t, &a), Some(Distrust::VersionChanged));
+    }
+
+    fn set(k: &RegPath, name: &str, text: &str) {
+        registry::set_string(&registry::create(k, KEY_ALL_ACCESS).unwrap(), name, text, false).unwrap();
+    }
+
+    fn modified(k: &RegPath, name: &str, prev: RegVal) -> TraceChange {
+        let t = Target::RegValue { key: k.clone(), name: name.into() };
+        TraceChange { id: target_key(&t), change: Change::Modified, target: t, before: None, after: None, previous: Some(prev), noise: false }
+    }
+
+    #[test]
+    fn previous_kept_only_when_attributable() {
+        let sb = Sb::new("previous");
+        let env = &sb.env;
+        let dirs = [PathBuf::from(r"C:\PF\Lab Trace")];
+        let prev = val("x", 1, b"o\0");
+        let keep = |c: &TraceChange| keep_previous(env, &dirs, c);
+        let run = &env.run_roots[0];
+        set(run, "Tool", r#""C:\PF\Lab Trace\t.exe" /tray"#);
+        assert!(keep(&modified(run, "Tool", prev.clone())), "a Run value that now points into the program's folder");
+        set(run, "Other", r"C:\Elsewhere\o.exe");
+        assert!(!keep(&modified(run, "Other", prev.clone())), "a Run value that points elsewhere");
+        let vendor = env.software_roots[0].child("Vendor");
+        set(&vendor, "Handler", r"C:\PF\Lab Trace\h.exe");
+        set(&vendor, "Mode", "traced");
+        assert!(keep(&modified(&vendor, "Handler", prev.clone())), "a vendor value that points into the folder");
+        assert!(!keep(&modified(&vendor, "Mode", prev.clone())), "a vendor value with unrelated text");
+        let entry = env.uninstall_roots[0].child("Foreign");
+        set(&entry, "DisplayIcon", r"C:\PF\Lab Trace\i.ico");
+        assert!(!keep(&modified(&entry, "DisplayIcon", prev.clone())), "an Uninstall entry is outside the allowed shapes");
+        let mut c = modified(run, "Tool", prev.clone());
+        c.change = Change::Created;
+        assert!(!keep(&c), "only a Modified change");
+        c.change = Change::Modified;
+        c.previous = None;
+        assert!(!keep(&c), "nothing to keep");
+        assert!(!keep(&modified(run, "Gone", prev.clone())), "a value that cannot be read");
+        assert!(!keep_previous(env, &[], &modified(run, "Tool", prev.clone())), "no folder, no attribution");
+        assert!(!keep(&modified(run, "Tool", val("x", 99, b""))), "an unknown type");
+    }
+
+    #[test]
+    fn app_dirs_are_the_programs_own_folders() {
+        let sb = Sb::new("dirs");
+        let env = &sb.env;
+        let pf = env.folders.program_files[0].clone();
+        let mut a = listed("A", "Lab Trace", "1");
+        fs::create_dir_all(pf.join("Vendor").join("Lab Trace")).unwrap();
+        fs::write(pf.join("Vendor").join("Lab Trace").join("unins.exe"), b"MZ").unwrap();
+        a.install_location = Some(pf.join("Vendor").join("Lab Trace"));
+        a.uninstall_string = Some(format!("\"{}\" /S", pf.join("Vendor").join("Lab Trace").join("unins.exe").display()));
+        a.display_icon = Some(format!("{},0", pf.join("Vendor").join("Lab Trace").join("bin").join("t.exe").display()));
+        let mut d = app_dirs(env, &a);
+        d.sort();
+        assert_eq!(d, [pf.join("Vendor").join("Lab Trace"), pf.join("Vendor").join("Lab Trace"), pf.join("Vendor").join("Lab Trace").join("bin")]);
+        // a folder the program must not claim: a protected root, the Windows folder, a drive root, a relative path
+        for bad in [pf.clone(), env.folders.windows_dir.join("System32"), PathBuf::from(r"C:\"), PathBuf::from(r"rel\dir")] {
+            a.install_location = Some(bad.clone());
+            a.uninstall_string = None;
+            a.display_icon = None;
+            assert!(app_dirs(env, &a).is_empty(), "{}", bad.display());
+        }
+    }
+
+    #[test]
+    fn unchanged_checks_fail_closed() {
+        let t = tempfile::tempdir().unwrap();
+        let root = canonical(t.path()).unwrap();
+        let (dir, f1) = (root.join("app"), root.join("app").join("a.txt"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&f1, b"x").unwrap();
+        let mk = |p: &Path| {
+            let (kind, print) = print_of(&fs::symlink_metadata(p).unwrap());
+            let target = Target::Path { path: p.to_path_buf(), kind };
+            TraceChange { id: target_key(&target), change: Change::Created, target, before: None, after: Some(print), previous: None, noise: false }
+        };
+        let mut j = journal("tr-1", TraceLink::NoProgram {});
+        j.changes = vec![mk(&dir), mk(&f1)];
+        let c = created(&j);
+        let none = HashSet::new();
+        assert!(unchanged_path(&dir, &c, &none), "exactly what was created");
+        assert!(unchanged_path(&f1, &c, &none));
+        // blind: the folder id is unreadable in the journal
+        let id = format!("path:{}", norm(&dir));
+        let blind: HashSet<&str> = HashSet::from([id.as_str()]);
+        assert!(!unchanged_path(&dir, &c, &blind));
+        assert!(unchanged_path(&f1, &c, &blind), "a file below it is judged on its own id (the scan never emits it separately)");
+        // a child that the install did not create
+        fs::write(dir.join("new.txt"), b"y").unwrap();
+        assert!(!unchanged_path(&dir, &c, &none), "a new child");
+        fs::remove_file(dir.join("new.txt")).unwrap();
+        assert!(unchanged_path(&dir, &c, &none));
+        // a changed child, and a deleted one (subset semantics)
+        fs::write(&f1, b"xx").unwrap();
+        assert!(!unchanged_path(&dir, &c, &none), "a changed child");
+        fs::remove_file(&f1).unwrap();
+        assert!(unchanged_path(&dir, &c, &none), "entries deleted since are fine");
+        assert!(!unchanged_path(&f1, &c, &none), "a missing path is not unchanged");
+        assert!(!unchanged_path(&root.join("elsewhere"), &c, &none), "never created");
+
+        // keys: every value and subkey must have been created
+        let sb = Sb::new("unchanged");
+        let k = sb.env.software_roots[0].child("Created");
+        set(&k, "a", "1");
+        set(&k.child("Sub"), "b", "2");
+        let kt = |k: &RegPath| Target::RegKey { key: k.clone() };
+        let ch = |t: Target, print: Print| TraceChange { id: target_key(&t), change: Change::Created, target: t, before: None, after: Some(print), previous: None, noise: false };
+        let vt = |k: &RegPath, n: &str| (Target::RegValue { key: k.clone(), name: n.into() }, value_print(&registry::read_value(k, n).unwrap()).unwrap());
+        let (va, pa) = vt(&k, "a");
+        let (vb, pb) = vt(&k.child("Sub"), "b");
+        let mut j = journal("tr-2", TraceLink::NoProgram {});
+        j.changes = vec![ch(kt(&k), Print::Key {}), ch(kt(&k.child("Sub")), Print::Key {}), ch(va, pa), ch(vb, pb)];
+        let c = created(&j);
+        assert!(unchanged_key(&k, &c, &none));
+        set(&k, "extra", "x");
+        assert!(!unchanged_key(&k, &c, &none), "a value the install did not create");
+        registry::delete_value(&k, "extra").unwrap();
+        set(&k, "a", "changed");
+        assert!(!unchanged_key(&k, &c, &none), "a value with other data");
+        set(&k, "a", "1");
+        assert!(unchanged_key(&k, &c, &none));
+        set(&k.child("Sub").child("Deeper"), "z", "1");
+        assert!(!unchanged_key(&k, &c, &none), "a subkey the install did not create");
+        let sub_id = target_key(&kt(&k.child("Sub")));
+        let blind: HashSet<&str> = HashSet::from([sub_id.as_str()]);
+        registry::delete_key(&k.child("Sub").child("Deeper")).unwrap();
+        assert!(!unchanged_key(&k, &c, &blind), "a blind subkey");
+        assert!(!unchanged_key(&k.child("Missing"), &c, &none), "an unopenable key");
     }
 }
