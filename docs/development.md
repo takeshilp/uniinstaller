@@ -91,7 +91,10 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
   the old key cannot auto-update and must be reinstalled manually.
 
 ## Manual checks (not automated)
-- Elevation: "Перезапустить от имени администратора" (UAC prompt on the secure desktop; unavailable in sandbox mode).
+- Elevation: "Перезапустить от имени администратора" (UAC prompt on the secure desktop; unavailable in sandbox mode). Verified on
+  2026-11-18 with release 0.1.1 on the owner's machine: from the 7-Zip card the app restarted elevated (title pill, warning strip gone,
+  token elevated). The owner has to click and confirm UAC; Windows Sandbox runs with UAC off and cannot test it.
+- Launch the installed app from the Start menu, never from an agent shell (see `docs/bugs.md`, black window).
 - Updater: verified end to end on 2026-11-18 in Windows Sandbox with networking on: published 0.1.0 installed silently (`/S`),
   the banner offered 0.1.1 about 6 s after start, the update button (pressed through UI Automation) downloaded, verified and
   installed 0.1.1 in about 5 s. Repeat at a release that changes the updater config, the signing key or the NSIS install mode.

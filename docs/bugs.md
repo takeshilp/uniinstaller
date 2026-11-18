@@ -108,3 +108,12 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 - Verified: tests `version_neutral_settings_are_shared` (`tests/scan.rs`, failed at `shared(neutral)` with `[]` before the fix), `anchors_settings_rules`
   (`safety.rs`) and the key part of `apply_recomputes_shared_blocks`; no real candidate changed (see above); lab run `20261118-141622`:
   `two-versions` PASS, 0 false deletions, 5 found, 2 missed (files and a value inside the now-blocked shared folder and key), 5 removed.
+
+## Black window when the app is started from an agent shell
+- Symptom: release 0.1.1 started with `Start-Process` from the Claude Code PowerShell tool showed an all-black window with no title bar or
+  buttons; no `msedgewebview2.exe` child stayed alive.
+- Cause: the WebView2 browser process crashed about 3 s after start (dump in `%LOCALAPPDATA%io.github.takeshilp.uniinstallerEBWebViewCrashpadeports`);
+  the dump carries the agent session's environment (`CLAUDE_CODE_SESSION_ATTENDED=1`), so it inherited the restricted agent shell. Not an app defect:
+  the same build started from the Start menu worked, and 0.1.0/0.1.1 rendered normally inside Windows Sandbox.
+- Fix: none in code. Start the installed app from the Start menu (or ask the owner to); for dev runs use `npm run tauri dev`.
+- Verified: 2026-11-18, the owner started 0.1.1 from the Start menu and the UI rendered; the elevation check ran in that instance.
