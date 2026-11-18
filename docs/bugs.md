@@ -112,7 +112,7 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 ## Black window when the app is started from an agent shell
 - Symptom: release 0.1.1 started with `Start-Process` from the Claude Code PowerShell tool showed an all-black window with no title bar or
   buttons; no `msedgewebview2.exe` child stayed alive.
-- Cause: the WebView2 browser process crashed about 3 s after start (dump in `%LOCALAPPDATA%io.github.takeshilp.uniinstallerEBWebViewCrashpadeports`);
+- Cause: the WebView2 browser process crashed about 3 s after start (dump in `%LOCALAPPDATA%\io.github.takeshilp.uniinstaller\EBWebView\Crashpad\reports`);
   the dump carries the agent session's environment (`CLAUDE_CODE_SESSION_ATTENDED=1`), so it inherited the restricted agent shell. Not an app defect:
   the same build started from the Start menu worked, and 0.1.0/0.1.1 rendered normally inside Windows Sandbox.
 - Fix: none in code. Start the installed app from the Start menu (or ask the owner to); for dev runs use `npm run tauri dev`.
