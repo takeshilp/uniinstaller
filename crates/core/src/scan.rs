@@ -126,6 +126,8 @@ pub fn anchors_of(env: &Env, others: &[InstalledApp]) -> Anchors {
         if let Some(l) = o.uninstall_string.as_deref().and_then(|s| parse_uninstall(s, &env.folders.system_dir, o.product_code.as_deref()).ok()) {
             a.files.push(canon_if_exists(&l.exe));
             // No InstallLocation: the uninstaller's folder when the icon sits beside it, as `find_anchor` does for the target.
+            // shortcut: an app with neither InstallLocation nor such a folder is not seen by the reference rule; widen the
+            // derivation (icon folder, Run or App Paths entries) if a lab run or a user report shows one slipping through.
             if o.install_location.as_deref().is_none_or(|d| d.as_os_str().is_empty())
                 && let Some(p) = l.exe.parent()
                 && icon_path(o).as_deref().and_then(Path::parent).is_some_and(|ip| norm(ip) == norm(p))

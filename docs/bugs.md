@@ -75,3 +75,36 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 
 ## `lab.ps1 -File ... -Scenario a,b` arrives as one string
 - `powershell -File` does not split the comma list; `lab.ps1` now splits it itself.
+
+## Registry of a nested app offered with the suite (lab `shared-suite`)
+- Symptom: lab run `20261118-021251` ended RISK with 5 false deletions: the host suite's scan offered `HKLM\SOFTWARE\Lab Vendor\Lab Suite`
+  (its tree holds a `Plugin` subkey with `InstallDir`), `App Paths\labplugin.exe` and the `Run|LabSuitePlugin` value without a block, and the
+  `unblocked` policy removed the plugin's registry entries while the plugin was still installed.
+- Cause: `scan::evaluate` checked registry targets only by shape (`registry_blocks`) plus `AppStillInstalled`. Nothing looked at what a key tree or
+  a Run value points to, so entries that reference another installed app's folder passed. The shortcut-target check lived only in `scan()`
+  (not in `evaluate`), so apply never recomputed it.
+- Fix: `Anchors::referenced_in` (`safety.rs`) checks every REG_SZ, REG_EXPAND_SZ and REG_MULTI_SZ text of a key tree and of a Run value against other
+  apps' install dirs, in `scan::evaluate`, so scan and apply share it. Exemptions: the target's own Uninstall entry (a launcher's uninstaller
+  may live in another app's folder; the real-machine check showed Visual Studio Build Tools hit this), an app whose folder holds ours, and drive
+  or protected roots. Other apps without InstallLocation are seen through a derived folder (uninstaller's folder when the icon sits beside it); using
+  their file anchors instead would block Steam's own key. The shortcut-target check moved into `eval_path` and fails closed (`Unverifiable`)
+  when the link cannot be read.
+- Verified: tests `nested_app_registry_is_shared`, `nested_app_without_install_location_is_shared` and `broad_install_location_does_not_claim_references`
+  (`tests/scan.rs`) and `apply_recomputes_shared_blocks` (`tests/ops.rs`: two apps registered between scan and apply, the offered key and link
+  ended `Removed` before the fix and `Blocked` after). Before the fix the first two failed at their first assert with `[]` (no blocks) and the ops
+  test with `left: Removed, right: Blocked`; the third guards the root exemption (it fails when the exemption is removed). Read-only run of every real
+  app's preview before and after (92 apps, about 2250 candidates): no candidate changed. Lab runs `20261118-141244` (`shared-suite,two-versions`)
+  and `20261118-141622` (all eight): `shared-suite` PASS, 0 false deletions, 4 found, 1 missed (the key's own `InstallDir` value, inside a key that is
+  now blocked as a whole), 4 removed; the other six rows and their Candidates tables equal run `20261118-021251`.
+
+## Version-neutral settings offered while another version is installed (lab `two-versions`)
+- Symptom: lab run `20261118-021251` ended RISK with 4 false deletions: for "Lab Editor 1" the scan offered `%APPDATA%\Lab Vendor\Lab Editor` and
+  `HKCU\Software\Lab Vendor\Lab Editor`, which "Lab Editor 2" uses, and the `unblocked` policy removed them.
+- Cause: `scan::name_variants` strips the version, so "Lab Editor 1" and "Lab Editor 2" both derive the name `Lab Editor`, and sections E/F turn it into
+  a settings folder and key. `anchors_of` only knew other apps' install folders, uninstaller exes and icons, so nothing said that another installed app
+  derives the same location.
+- Fix: `anchors_of` adds every other app's existing settings folders and Software keys, derived with the target's own rule (`scan::name_pairs`,
+  shared by sections E/F). `covering` blocks a path that equals or holds such a folder, `Anchors::key_holding` a key that equals or holds such a key.
+- Verified: tests `version_neutral_settings_are_shared` (`tests/scan.rs`, failed at `shared(neutral)` with `[]` before the fix), `anchors_settings_rules`
+  (`safety.rs`) and the key part of `apply_recomputes_shared_blocks`; no real candidate changed (see above); lab run `20261118-141622`:
+  `two-versions` PASS, 0 false deletions, 5 found, 2 missed (files and a value inside the now-blocked shared folder and key), 5 removed.

@@ -40,6 +40,22 @@ Hard blocks (never overridable, recomputed at apply): ProtectedPath, OutsideAllo
 8.3 names, trailing dot or space, junctions, SUBST), SharedWithOtherApp, AppStillInstalled, ProtectedRegistry, TooLarge (over 200000 files or
 5000 registry nodes), Unverifiable (any failure while computing identity: fail closed), OtherVolume (backups live on the data dir's volume).
 
+SharedWithOtherApp (`safety::Anchors`, applied in `scan::evaluate`, so a scan and an apply use the same rule):
+- Who counts as another app: every `list_apps` entry except the target's own (`ops::others`), read live at scan and again at apply.
+  Entries `list_apps` hides (`SystemComponent`, updates) are not seen.
+- Their anchors: install folder, uninstaller exe and icon, plus their existing settings folders (`<AppData>\[<publisher>\]<name>`) and
+  Software keys, named by the same rule as the target's own settings candidates (`scan::name_pairs`, every name variant including the
+  version-free one). An app without InstallLocation also gets a derived folder (its uninstaller's folder when the icon sits beside it,
+  outside the Windows folder, as `find_anchor` does for the target); that folder is used only by the reference rule below.
+- A path is blocked when it equals or contains an anchor or settings folder, or lies inside another app's install folder that does not
+  contain ours; an install-folder child holding an uninstaller other than ours is blocked; a shortcut whose target meets the path
+  rule is blocked, and a shortcut whose target cannot be read is `Unverifiable`.
+- A registry key is blocked when it equals or contains another app's settings key (same hive and view).
+- A registry key or Run value is blocked when any REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ text in it (the whole captured tree for a key)
+  equals or points into another app's install or derived folder. An app whose folder contains ours (a host and its plugin) claims
+  nothing, a drive root or protected root is never counted as an app's folder here, and the target's own Uninstall entry is exempt
+  (a launcher's uninstaller may live in another app's folder).
+
 ## Scoring (calibrations, not measured)
 InInstallDir +45, InstallDirCorroborated +35 (reference candidates only, never install-dir children), RefersToInstallDir +30,
 TargetMissing +15, OwnUninstallEntry +60, ExactAnchor +60, ExactName +20, PublisherMatch +10, UserDataLikely -50, OutsideKnownZones -20.
@@ -79,6 +95,10 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
 - Registry backup (`registry.rs`): values, types, subkeys and view only; no ACLs.
 - Other volumes (`scan.rs`, `paths.rs`): leftovers on another drive than the data dir are shown as Blocked.
 - Aliased install dirs (`scan.rs`): 8.3, trailing-dot, junction or SUBST install paths are rejected.
+- Shared references (`safety.rs`): registry text is matched as normalized text, so 8.3 and other alias spellings, folders reached through a junction or SUBST (anchors are canonical), comma-separated lists, a folder followed by arguments without a trailing backslash and unexpanded REG_MULTI_SZ items are missed; resolve each path-like token if a lab run or user report shows one slipping through.
+- Shared containers (`scan.rs`): a key or settings folder shared with another app is blocked whole, so the target's own values and files inside it are not offered; add per-value and per-file candidates if lab recall asks for them.
+- Shared apps without a folder (`scan.rs`): an app with no InstallLocation whose uninstaller and icon do not share a folder is not seen by the reference rule; a stale entry of an older version of the same product blocks the target's version-free settings (fail closed).
+- Settings key case (`safety.rs`): `key_holding` compares with `RegPath::same` (ASCII case) and `below` (Unicode case), so non-ASCII names that differ only in case are not seen as equal; compare lowercased paths if one shows up.
 - Install-dir leftovers are never preselected (`safety.rs`) until trace logs give stronger evidence.
 - Retention (`ops.rs`): quarantine, manifests, plans and reports are never purged.
 - Locked files (`ops.rs`): reported as Locked, retry by hand; no Restart Manager.
