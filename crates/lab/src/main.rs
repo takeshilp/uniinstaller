@@ -208,6 +208,7 @@ mod tests {
             install_dir_status: DirStatus::NotSet {},
             corroborated: false,
             still_running: vec![],
+            trace: None,
             candidates: vec![
                 cand("safe", true, vec![], vec![]),
                 cand("review", false, vec![], vec![]),

@@ -2,7 +2,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SCHEMA: u32 = 1;
+/// Operations and plans. Schema-1 (0.1.x) manifests still load; a newer one is refused (`ops::load`).
+pub const SCHEMA: u32 = 2;
+/// Trace journals (`trace::load` refuses a newer one).
+pub const TRACE_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +103,8 @@ pub struct AppDetails {
     pub app: InstalledApp,
     pub launch: Option<Launch>,
     pub launch_error: Option<String>,
+    #[serde(default)]
+    pub trace: Option<TraceUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +144,8 @@ pub enum Group {
     Shortcuts,
     Registry,
     Data,
+    /// Previous values of registry values an install changed (trace only), never preselected.
+    Revert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +171,8 @@ pub enum Target {
     Path { path: PathBuf, kind: PathKind },
     RegKey { key: RegPath },
     RegValue { key: RegPath, name: String },
+    /// Write `previous` back into an existing value that a traced install changed.
+    RegRevert { key: RegPath, name: String, previous: RegVal },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +231,8 @@ pub enum EvidenceCode {
     PublisherMatch,
     UserDataLikely,
     OutsideKnownZones,
+    TraceCreated,
+    TraceModified,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -288,6 +299,9 @@ pub struct Plan {
     pub corroborated: bool,
     pub still_running: Vec<String>,
     pub candidates: Vec<Candidate>,
+    /// The trace journal the plan used or skipped, if the program has one.
+    #[serde(default)]
+    pub trace: Option<TraceUse>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +315,7 @@ pub enum ItemStatus {
     AccessDenied,
     Locked,
     Failed,
+    Reverted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,4 +386,26 @@ pub struct Operation {
 pub enum HistoryEntry {
     Ok { op: Box<Operation> },
     Broken { id: String, path: PathBuf, error: String },
+}
+
+/// Why a trace journal was found but not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Distrust {
+    VersionChanged,
+    FolderChanged,
+    UninstallerChanged,
+    ComponentStillInstalled,
+}
+
+/// What a plan or a card says about the trace journal of a program.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceUse {
+    pub id: String,
+    pub created_ms: u64,
+    pub trusted: bool,
+    pub distrust: Option<Distrust>,
+    /// Non-noise Modified files and Deleted objects: shown in the journal, never acted on.
+    pub reported: usize,
 }

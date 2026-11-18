@@ -3,6 +3,7 @@
 use crate::env::{Env, Folders};
 use crate::model::*;
 use crate::paths::{canonical, is_canonical, is_drive_root, is_inside, is_local_abs, norm, same_or_inside};
+use crate::registry;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -12,7 +13,7 @@ pub const DOC_EXT: &[&str] = &[
     "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "odt", "ods", "odp", "rtf", "psd", "kra", "blend", "sav", "mp4", "mkv", "mov", "mp3",
     "flac", "wav",
 ];
-// shortcut: user-data heuristic is extension and folder-name lists, replace with trace-log evidence in stage 2.
+// shortcut: user-data heuristic is extension and folder-name lists; a trace cannot tell user data from program data, add stage-3 adapters.
 pub const DATA_DIR_NAMES: &[&str] = &[
     "saves", "savegames", "save", "projects", "documents", "backups", "backup", "profiles", "user data", "userdata", "screenshots", "mods",
     "worlds", "recordings",
@@ -30,6 +31,12 @@ pub const W_EXACT_NAME: i32 = 20;
 pub const W_PUBLISHER: i32 = 10;
 pub const W_USER_DATA: i32 = -50;
 pub const W_OUTSIDE_ZONES: i32 = -20;
+/// Created by a traced install, near the program's folder or backed by other evidence (calibration, not measured).
+pub const W_TRACE_CREATED: i32 = 100;
+/// Created by a traced install, away from the program's folder: Review, never preselected.
+pub const W_TRACE_FAR: i32 = 50;
+/// A revert candidate: the trace recorded the value before the install.
+pub const W_TRACE_MODIFIED: i32 = 50;
 pub const SAFE_AT: i32 = 80;
 pub const REVIEW_AT: i32 = 40;
 
@@ -45,11 +52,11 @@ pub fn tier(score: i32, has_blocks: bool) -> Tier {
     }
 }
 
-/// The settings and user-data group is never preselected.
-// shortcut: install-dir leftovers are never preselected (they score at most Review), the user ticks them;
-// revisit once trace logs (stage 2) give +100 evidence.
-pub fn default_selected(tier: Tier, group: Group) -> bool {
-    tier == Tier::Safe && group != Group::Data
+/// The settings and user-data group, previous-value reverts and anything that looks like user data are never preselected.
+// shortcut: install-dir leftovers are never preselected unless a trace journal confirms them (they score at most Review otherwise),
+// the user ticks them.
+pub fn default_selected(tier: Tier, group: Group, user_data: bool) -> bool {
+    tier == Tier::Safe && !matches!(group, Group::Data | Group::Revert) && !user_data
 }
 
 /// Folders of the real system, canonicalized, computed once. An `Err` makes every path `Unverifiable`.
@@ -100,7 +107,8 @@ pub struct Anchors {
     pub files: Vec<PathBuf>,
     /// Existing `<AppData root>\[<publisher>\]<name>` folders of other apps, every name variant.
     pub data_dirs: Vec<PathBuf>,
-    /// Existing `<Software root>\[<publisher>\]<name>` keys of other apps, every name variant.
+    /// Existing `<Software root>\[<publisher>\]<name>` keys of other apps, every name variant, plus the Uninstall entries
+    /// (`sources`) of every other listed app.
     pub keys: Vec<RegPath>,
     /// Install dirs derived for other apps that have no InstallLocation (uninstaller and icon share a folder, as `find_anchor`
     /// does for the target). Used only by `referenced_in`: as path anchors they would block the files of apps such as Steam.
@@ -132,6 +140,11 @@ impl Anchors {
     // differ only in case are not seen as equal; compare lowercased paths if such a vendor name shows up.
     pub fn key_holding(&self, key: &RegPath) -> Option<String> {
         self.keys.iter().find(|k| k.same(key) || k.below(key).is_some()).map(|k| format!("holds another app's settings key {}", k.display()))
+    }
+
+    /// Why a registry key is, or lies inside, another app's key (settings key or Uninstall entry), if it does (same hive and view).
+    pub fn key_inside(&self, key: &RegPath) -> Option<String> {
+        self.keys.iter().find(|k| k.same(key) || key.below(k).is_some()).map(|k| format!("inside another app's key {}", k.display()))
     }
 
     /// Why registry text (one path per line or `;` item) equals or points into another app's install dir, if it does.
@@ -222,6 +235,19 @@ pub fn registry_blocks(env: &Env, target: &Target) -> Vec<Block> {
                 block(BlockCode::ProtectedRegistry, "a whole root key is never touched")
             } else {
                 block(BlockCode::OutsideAllowedZone, "registry key outside the allowed shapes")
+            }
+        }
+        Target::RegRevert { key, name, previous } => {
+            if registry::to_regtype(previous.kind).is_none() {
+                return block(BlockCode::Unverifiable, "the previous value has an unknown type");
+            }
+            let run = !name.is_empty() && env.run_roots.iter().any(|r| key.same(r));
+            let app_paths = name.is_empty() && env.app_paths_roots.iter().any(|r| key.below(r).is_some_and(|c| c.len() == 1));
+            let vendor = env.software_roots.iter().any(|r| key.below(r).is_some_and(|c| !RESERVED_SOFTWARE.contains(&c[0].as_str())));
+            if run || app_paths || vendor {
+                vec![]
+            } else {
+                block(BlockCode::ProtectedRegistry, "previous values are restored only in Run, App Paths and vendor keys")
             }
         }
         Target::RegValue { key, name } => {
@@ -320,11 +346,28 @@ mod tests {
 
     #[test]
     fn data_group_never_preselected() {
-        assert!(default_selected(Tier::Safe, Group::Shortcuts));
-        assert!(default_selected(Tier::Safe, Group::Registry));
-        assert!(!default_selected(Tier::Safe, Group::Data));
-        assert!(!default_selected(Tier::Review, Group::Shortcuts));
-        assert!(!default_selected(Tier::Blocked, Group::Registry));
+        assert!(default_selected(Tier::Safe, Group::Shortcuts, false));
+        assert!(default_selected(Tier::Safe, Group::Registry, false));
+        assert!(!default_selected(Tier::Safe, Group::Data, false));
+        assert!(!default_selected(Tier::Review, Group::Shortcuts, false));
+        assert!(!default_selected(Tier::Blocked, Group::Registry, false));
+        // Anything that looks like user data is never preselected, whatever its score, and a revert never is.
+        assert!(!default_selected(Tier::Safe, Group::ProgramFiles, true));
+        assert!(!default_selected(Tier::Safe, Group::Shortcuts, true));
+        assert!(!default_selected(Tier::Safe, Group::Revert, false));
+    }
+
+    #[test]
+    fn key_inside_rule() {
+        let k = |v: View, s: &str| RegPath::new(Hive::Hklm, v, s);
+        let a = Anchors { keys: vec![k(View::V64, r"SOFTWARE\Vendor\Editor"), k(View::V64, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Other")], ..Default::default() };
+        let inside = |x: RegPath| a.key_inside(&x).is_some();
+        assert!(inside(k(View::V64, r"software\vendor\editor")), "equal, any case");
+        assert!(inside(k(View::V64, r"SOFTWARE\Vendor\Editor\Sub\Deep")), "inside");
+        assert!(inside(k(View::V64, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Other")), "another app's Uninstall entry");
+        assert!(!inside(k(View::V64, r"SOFTWARE\Vendor")), "the parent is not inside (key_holding covers it)");
+        assert!(!inside(k(View::V64, r"SOFTWARE\Vendor\Editor 2")), "a sibling");
+        assert!(!inside(k(View::V32, r"SOFTWARE\Vendor\Editor")), "the other view is another key");
     }
 
     #[test]
@@ -356,6 +399,37 @@ mod tests {
         assert!(r(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\V\App.lnk", Group::Shortcuts).is_none());
         // a drive-root install dir is protected
         assert!(r(r"D:\", Group::ProgramFiles).is_some());
+    }
+
+    #[test]
+    fn revert_shapes() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::sandbox(t.path(), "shape2");
+        let sz = |name: &str, kind: u32| RegVal { name: name.into(), kind, data: vec![] };
+        let rev = |k: RegPath, name: &str| Target::RegRevert { key: k, name: name.into(), previous: sz(name, 1) };
+        let ok = |t: Target| registry_blocks(&env, &t).is_empty();
+        let code = |t: Target| registry_blocks(&env, &t)[0].code;
+        let run = &env.run_roots[0];
+        assert!(ok(rev(run.clone(), "App")), "a named Run value");
+        assert_eq!(code(rev(run.clone(), "")), BlockCode::ProtectedRegistry, "the default value of Run");
+        assert_eq!(code(rev(run.child("Sub"), "App")), BlockCode::ProtectedRegistry, "a value in a key below Run");
+        let ap = &env.app_paths_roots[0];
+        assert!(ok(rev(ap.child("tool.exe"), "")), "the default value of an App Paths child");
+        assert_eq!(code(rev(ap.child("tool.exe"), "Path")), BlockCode::ProtectedRegistry, "a named value there");
+        assert_eq!(code(rev(ap.child("a").child("b"), "")), BlockCode::ProtectedRegistry, "two levels below App Paths");
+        assert_eq!(code(rev(ap.clone(), "")), BlockCode::ProtectedRegistry, "the App Paths root itself");
+        let sw = &env.software_roots[0];
+        assert!(ok(rev(sw.child("Vendor"), "Mode")), "a value in a vendor key");
+        assert!(ok(rev(sw.child("A").child("B").child("C").child("D"), "Mode")), "any depth below a vendor key");
+        assert_eq!(code(rev(sw.clone(), "Mode")), BlockCode::ProtectedRegistry, "the Software root itself");
+        for reserved in ["Microsoft", "Classes", "Policies", "Wow6432Node", "Clients", "RegisteredApplications"] {
+            assert_eq!(code(rev(sw.child(reserved).child("X"), "Mode")), BlockCode::ProtectedRegistry, "{reserved}");
+        }
+        assert_eq!(code(rev(env.uninstall_roots[0].child("App"), "DisplayName")), BlockCode::ProtectedRegistry, "an Uninstall entry");
+        let outside = RegPath::new(Hive::Hkcu, View::V64, format!(r"{}\shape2\Outside\X", crate::env::TEST_KEY_PREFIX));
+        assert_eq!(code(rev(outside, "Mode")), BlockCode::ProtectedRegistry, "outside every root");
+        let weird = Target::RegRevert { key: run.clone(), name: "App".into(), previous: sz("App", 99) };
+        assert_eq!(code(weird), BlockCode::Unverifiable, "an unknown value type");
     }
 
     #[test]

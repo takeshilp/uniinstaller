@@ -81,6 +81,9 @@ pub fn load(env: &Env, op_id: &str) -> Result<Operation> {
     if op.id != op_id {
         return Err(Error("manifest id does not match its folder".into()));
     }
+    if op.schema > SCHEMA {
+        return Err(Error("written by a newer version of Uniinstaller".into()));
+    }
     Ok(op)
 }
 
@@ -93,7 +96,7 @@ pub fn describe(env: &Env, app_id: &str) -> Result<AppDetails> {
             Err(e) => (None, Some(e)),
         },
     };
-    Ok(AppDetails { app, launch, launch_error })
+    Ok(AppDetails { app, launch, launch_error, trace: None })
 }
 
 /// Every other listed program: the app itself (same id or an intersecting source) is removed.
@@ -119,6 +122,7 @@ pub fn target_key(t: &Target) -> String {
         Target::Path { path, .. } => format!("path:{}", norm(path)),
         Target::RegKey { key } => format!("key:{}", rp(key)),
         Target::RegValue { key, name } => format!("value:{}|{}", rp(key), name.to_lowercase()),
+        Target::RegRevert { key, name, .. } => format!("revert:{}|{}", rp(key), name.to_lowercase()),
     }
 }
 
@@ -130,6 +134,13 @@ fn strip_payloads(i: &Ident) -> Ident {
     match i {
         Ident::Key { .. } | Ident::Value { .. } => Ident::None {},
         other => other.clone(),
+    }
+}
+
+/// Exports never carry registry data: a revert's previous value is cleared like the identity payloads.
+fn strip_target(t: &mut Target) {
+    if let Target::RegRevert { previous, .. } = t {
+        previous.data.clear();
     }
 }
 
@@ -146,6 +157,7 @@ pub fn export_plan(env: &Env, plan: &Plan) -> Result<PathBuf> {
     let mut p = plan.clone();
     for c in &mut p.candidates {
         c.ident = strip_payloads(&c.ident);
+        strip_target(&mut c.target);
     }
     let path = env.data_dir.join("plans").join(format!("{}-{}.json", safe_file_name(&plan.app_id), now_ms()));
     write_json(&path, &p).map_err(|e| Error(format!("cannot write the plan: {e}")))?;
@@ -157,10 +169,12 @@ pub fn export_report(env: &Env, op_id: &str) -> Result<PathBuf> {
     let mut op = load(env, op_id)?;
     for i in &mut op.items {
         i.reg_backup = None;
+        strip_target(&mut i.target);
     }
     if let Some(p) = &mut op.plan {
         for c in &mut p.candidates {
             c.ident = strip_payloads(&c.ident);
+            strip_target(&mut c.target);
         }
     }
     let path = env.data_dir.join("reports").join(format!("{}.json", safe_file_name(op_id)));
@@ -251,21 +265,23 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
 
 // shortcut: a locked file is reported as Locked and retried by hand, there is no Restart Manager; add it in stage 2.
 fn is_final(s: ItemStatus) -> bool {
-    matches!(s, ItemStatus::Removed | ItemStatus::NotFound)
+    matches!(s, ItemStatus::Removed | ItemStatus::NotFound | ItemStatus::Reverted)
 }
 
 fn target_exists(t: &Target) -> bool {
     match t {
         Target::Path { path, .. } => fs::symlink_metadata(path).is_ok(),
         Target::RegKey { key } => registry::exists(key),
-        Target::RegValue { key, name } => registry::read_value(key, name).is_ok(),
+        Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => registry::read_value(key, name).is_ok(),
     }
 }
 
+/// Reverts first (a revert and a delete of the same value cannot both apply), then values, then keys shallow first, then paths deep first.
 fn target_rank(t: &Target) -> (u8, usize) {
     match t {
-        Target::RegValue { .. } => (0, 0),
-        Target::RegKey { .. } => (1, 0),
+        Target::RegRevert { .. } => (0, 0),
+        Target::RegValue { .. } => (0, 1),
+        Target::RegKey { key } => (1, key.path.matches('\\').count()),
         Target::Path { path, .. } => (2, usize::MAX - norm(path).matches('\\').count()),
     }
 }
@@ -275,10 +291,11 @@ fn recover_in_progress(op: &mut Operation) {
     for i in op.items.iter_mut().filter(|i| i.status == ItemStatus::InProgress) {
         let done = match &i.target {
             Target::Path { .. } => i.quarantine.as_deref().is_some_and(Path::exists),
+            Target::RegRevert { key, name, previous } => registry::read_value(key, name).is_ok_and(|v| registry::same_data(&v, previous)),
             t => !target_exists(t),
         };
         if done {
-            i.status = ItemStatus::Removed;
+            i.status = if matches!(i.target, Target::RegRevert { .. }) { ItemStatus::Reverted } else { ItemStatus::Removed };
             i.detail = Some("recovered after an interruption".into());
         }
     }
@@ -335,6 +352,9 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
         };
         if c.ident == (Ident::None {}) {
             refuse(&mut rec, ItemStatus::Blocked, "identity could not be verified".into());
+        } else if matches!(c.target, Target::RegRevert { .. }) && !target_exists(&c.target) {
+            // A vanished value is a change, not "already gone": the previous value is never written into a missing value.
+            refuse(&mut rec, ItemStatus::Changed, "the value no longer exists; the previous value was not written".into());
         } else if !target_exists(&c.target) {
             refuse(&mut rec, ItemStatus::NotFound, "already gone".into());
         } else {
@@ -371,7 +391,7 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
                 }
                 rec.quarantine = Some(dst);
             }
-            Target::RegKey { .. } | Target::RegValue { .. } => rec.reg_backup = Some(c.ident.clone()),
+            Target::RegKey { .. } | Target::RegValue { .. } | Target::RegRevert { .. } => rec.reg_backup = Some(c.ident.clone()),
         }
         op.items[idx] = rec.clone();
         save(env, &op)?;
@@ -379,10 +399,11 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
             Target::Path { path, .. } => paths::move_path(path, rec.quarantine.as_ref().expect("set above")),
             Target::RegKey { key } => registry::delete_key(key),
             Target::RegValue { key, name } => registry::delete_value(key, name),
+            Target::RegRevert { key, name, previous } => registry::write_value(key, &RegVal { name: name.clone(), ..previous.clone() }),
         };
         match result {
             Ok(()) => {
-                rec.status = ItemStatus::Removed;
+                rec.status = if matches!(c.target, Target::RegRevert { .. }) { ItemStatus::Reverted } else { ItemStatus::Removed };
                 if let Target::Path { path, .. } = &c.target {
                     moved.push(path.clone());
                 }
@@ -525,6 +546,16 @@ fn restore_registry(t: &Target, backup: &Ident) -> (RestoreStatus, Option<String
             Ok(s) => (s, None),
             Err(e) => fail(e),
         },
+        (Target::RegRevert { key, name, previous }, Ident::Value { val }) => match registry::read_value(key, name) {
+            Ok(cur) if registry::same_data(&cur, val) => (RestoreStatus::Restored, None),
+            Ok(cur) if registry::same_data(&cur, previous) => match registry::write_value(key, val) {
+                Ok(()) => (RestoreStatus::Restored, None),
+                Err(e) => fail(e),
+            },
+            Ok(_) => (RestoreStatus::Conflict, Some("the value was changed after the previous value was restored; kept".into())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (RestoreStatus::Conflict, Some("the value or its key no longer exists; not recreated".into())),
+            Err(e) => fail(e),
+        },
         _ => (RestoreStatus::Failed, Some("backup does not match the target".into())),
     }
 }
@@ -559,7 +590,7 @@ pub fn overall_status(op: &Operation) -> (OpStatus, Option<String>) {
     use ItemStatus::*;
     // InProgress is included on purpose: a record that never finished is a problem, not a success.
     if op.items.iter().any(|i| matches!(i.status, Changed | Blocked | AccessDenied | Locked | Failed | InProgress)) {
-        return if op.items.iter().any(|i| i.status == Removed) {
+        return if op.items.iter().any(|i| matches!(i.status, Removed | Reverted)) {
             (OpStatus::PartiallyCompleted, Some("some items were not removed".into()))
         } else {
             (OpStatus::Failed, Some("nothing could be removed".into()))

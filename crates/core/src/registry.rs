@@ -121,7 +121,7 @@ pub fn to_regtype(k: u32) -> Option<RegType> {
     })
 }
 
-fn to_val(name: String, v: RegValue<'_>) -> RegVal {
+pub(crate) fn to_val(name: String, v: RegValue<'_>) -> RegVal {
     RegVal { name, kind: v.vtype as u32, data: v.bytes.to_vec() }
 }
 
@@ -202,6 +202,17 @@ pub fn delete_value(p: &RegPath, name: &str) -> io::Result<()> {
     open(p, KEY_ALL_ACCESS)?.delete_value(name)
 }
 
+/// Overwrites a value in an existing key; never creates the key.
+pub fn write_value(p: &RegPath, val: &RegVal) -> io::Result<()> {
+    let Some(t) = to_regtype(val.kind) else { return Err(io::Error::other("unknown value type")) };
+    open(p, KEY_SET_VALUE)?.set_raw_value(&val.name, &RegValue { bytes: Cow::Borrowed(&val.data), vtype: t })
+}
+
+/// Kind and data only (the name is the lookup key).
+pub fn same_data(a: &RegVal, b: &RegVal) -> bool {
+    a.kind == b.kind && a.data == b.data
+}
+
 /// Sets the value only if absent; if present, equal -> Restored, different -> Conflict.
 pub fn restore_value(p: &RegPath, val: &RegVal) -> io::Result<RestoreStatus> {
     let Some(t) = to_regtype(val.kind) else { return Err(io::Error::other("unknown value type in backup")) };
@@ -264,6 +275,26 @@ mod tests {
         let mut other = v.clone();
         other.data = vec![9, 0, 0, 0];
         assert_eq!(restore_value(&p, &other).unwrap(), RestoreStatus::Conflict);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn write_value_never_creates_keys() {
+        let p = test_key(&format!("reg_wv_{}", std::process::id()));
+        let val = |data: &str| RegVal { name: "v".into(), kind: 1, data: data.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect() };
+        assert_eq!(write_value(&p, &val("x")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(!exists(&p), "a missing key is not created");
+        let k = create(&p, KEY_ALL_ACCESS).unwrap();
+        set_string(&k, "v", "old", false).unwrap();
+        write_value(&p, &val("new")).unwrap();
+        assert!(same_data(&read_value(&p, "v").unwrap(), &val("new")));
+        assert!(!same_data(&read_value(&p, "v").unwrap(), &val("old")));
+        write_value(&p, &RegVal { name: "fresh".into(), ..val("n") }).unwrap();
+        assert!(read_value(&p, "fresh").is_ok(), "a missing value in an existing key is created");
+        assert!(write_value(&p, &RegVal { kind: 99, ..val("n") }).is_err(), "an unknown type is refused");
+        let mut other = val("new");
+        other.kind = 2;
+        assert!(!same_data(&other, &val("new")), "the kind counts");
         cleanup(&p);
     }
 

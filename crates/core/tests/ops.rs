@@ -437,3 +437,179 @@ fn apply_recomputes_shared_blocks() {
     assert!(registry::exists(&sw));
     assert!(lnk.exists());
 }
+
+/// Another program's Uninstall entry is never offered, even when a plan names it and the identity matches.
+#[test]
+fn other_apps_uninstall_entry_is_shared() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let key = f.env.uninstall_roots[0].child("SandboxBroken");
+    assert!(registry::exists(&key));
+    let mut o = ops::load(&f.env, &op.id).unwrap();
+    let p = o.plan.as_mut().unwrap();
+    let k = p.candidates.iter().position(|c| c.group == Group::Registry).unwrap();
+    p.candidates[k].target = Target::RegKey { key: key.clone() };
+    p.candidates[k].id = ops::target_key(&p.candidates[k].target);
+    p.candidates[k].ident = Ident::Key { node: registry::capture(&key).unwrap() };
+    let id = p.candidates[k].id.clone();
+    ops::save(&f.env, &o).unwrap();
+    let applied = ops::apply(&f.env, &op.id, &[id]).unwrap();
+    let it = &applied.items[0];
+    assert_eq!(it.status, ItemStatus::Blocked, "{:?}", it.detail);
+    assert!(it.detail.as_deref().unwrap_or("").starts_with("SharedWithOtherApp"), "{:?}", it.detail);
+    assert!(registry::exists(&key));
+}
+
+fn sz(name: &str, text: &str) -> RegVal {
+    RegVal { name: name.into(), kind: 1, data: text.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect() }
+}
+
+/// Adds a revert candidate to the stored plan, as a trace would offer it; returns its id.
+fn add_revert(f: &Fixture, op: &Operation, key: &RegPath, name: &str, previous: RegVal) -> String {
+    let live = registry::read_value(key, name).unwrap();
+    let target = Target::RegRevert { key: key.clone(), name: name.into(), previous };
+    let id = ops::target_key(&target);
+    let mut o = ops::load(&f.env, &op.id).unwrap();
+    let c = Candidate { id: id.clone(), group: Group::Revert, target, size: 0, evidence: vec![], blocks: vec![], score: 50, tier: Tier::Review, selected: false, ident: Ident::Value { val: live } };
+    o.plan.as_mut().unwrap().candidates.push(c);
+    ops::save(&f.env, &o).unwrap();
+    id
+}
+
+fn record<'a>(op: &'a Operation, id: &str) -> &'a ItemRecord {
+    op.items.iter().find(|i| i.candidate_id == id).unwrap_or_else(|| panic!("no item {id}"))
+}
+
+#[test]
+fn revert_item_apply_and_undo() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let run = f.env.run_roots[0].clone();
+    let original = registry::read_value(&run, "SandboxNotes").unwrap();
+    let id = add_revert(&f, &op, &run, "SandboxNotes", sz("SandboxNotes", "old"));
+    // A shape the product never reverts: another app's Uninstall entry.
+    let un = f.env.uninstall_roots[0].child("SandboxSuite");
+    let suite_name = registry::read_value(&un, "DisplayName").unwrap();
+    let blocked = add_revert(&f, &op, &un, "DisplayName", sz("DisplayName", "x"));
+
+    let applied = ops::apply(&f.env, &op.id, &[blocked.clone(), id.clone()]).unwrap();
+    assert_eq!(record(&applied, &id).status, ItemStatus::Reverted, "{:?}", record(&applied, &id).detail);
+    assert_eq!(record(&applied, &blocked).status, ItemStatus::Blocked);
+    assert!(record(&applied, &blocked).detail.as_deref().unwrap_or("").starts_with("ProtectedRegistry"), "{:?}", record(&applied, &blocked).detail);
+    assert_eq!(registry::read_value(&run, "SandboxNotes").unwrap(), sz("SandboxNotes", "old"));
+    assert_eq!(registry::read_value(&un, "DisplayName").unwrap(), suite_name, "the blocked value is untouched");
+    assert_eq!(applied.status, OpStatus::PartiallyCompleted, "{:?}", applied.status_detail);
+    assert_eq!(record(&applied, &id).reg_backup, Some(Ident::Value { val: original.clone() }), "the current value is backed up first");
+
+    // Exports never carry the previous value.
+    let report = fs::read_to_string(ops::export_report(&f.env, &op.id).unwrap()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let items = v["items"].as_array().unwrap().iter().map(|i| &i["target"]);
+    let cands = v["plan"]["candidates"].as_array().unwrap().iter().map(|c| &c["target"]);
+    let reverts: Vec<&serde_json::Value> = items.chain(cands).filter(|t| t["type"] == "regRevert").collect();
+    assert_eq!(reverts.len(), 4, "two items and two candidates");
+    assert!(reverts.iter().all(|t| t["previous"]["data"].as_array().unwrap().is_empty()), "{reverts:?}");
+    let plan_json = fs::read_to_string(ops::export_plan(&f.env, applied.plan.as_ref().unwrap()).unwrap()).unwrap();
+    let pv: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
+    let pc: Vec<_> = pv["candidates"].as_array().unwrap().iter().filter(|c| c["target"]["type"] == "regRevert").collect();
+    assert_eq!(pc.len(), 2);
+    assert!(pc.iter().all(|c| c["target"]["previous"]["data"].as_array().unwrap().is_empty()));
+
+    let restored = ops::restore(&f.env, &op.id).unwrap();
+    assert_eq!(record(&restored, &id).restore, Some(RestoreStatus::Restored), "{:?}", record(&restored, &id).restore_detail);
+    assert_eq!(registry::read_value(&run, "SandboxNotes").unwrap(), original, "exactly the original value");
+    assert_eq!(restored.status, OpStatus::Restored);
+}
+
+#[test]
+fn revert_of_a_vanished_value_is_changed_not_written() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let run = f.env.run_roots[0].clone();
+    let id = add_revert(&f, &op, &run, "SandboxNotes", sz("SandboxNotes", "old"));
+    registry::delete_value(&run, "SandboxNotes").unwrap();
+    let applied = ops::apply(&f.env, &op.id, std::slice::from_ref(&id)).unwrap();
+    let it = record(&applied, &id);
+    assert_eq!(it.status, ItemStatus::Changed);
+    assert!(it.detail.as_deref().unwrap().contains("no longer exists"), "{:?}", it.detail);
+    assert!(registry::read_value(&run, "SandboxNotes").is_err(), "the previous value was not written into a missing value");
+    assert_eq!(applied.status, OpStatus::Failed);
+}
+
+/// A reverted value, then `disturb`, then restore: the restore must refuse and keep what it finds.
+fn reverted_then(disturb: impl Fn(&RegPath)) -> (Fixture, Operation, String) {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let run = f.env.run_roots[0].clone();
+    let id = add_revert(&f, &op, &run, "SandboxNotes", sz("SandboxNotes", "old"));
+    let applied = ops::apply(&f.env, &op.id, std::slice::from_ref(&id)).unwrap();
+    assert_eq!(record(&applied, &id).status, ItemStatus::Reverted);
+    disturb(&run);
+    let restored = ops::restore(&f.env, &op.id).unwrap();
+    (f, restored, id)
+}
+
+#[test]
+fn revert_undo_conflicts() {
+    let (f, restored, id) = reverted_then(|run| set(run, "SandboxNotes", "later"));
+    assert_eq!(record(&restored, &id).restore, Some(RestoreStatus::Conflict));
+    assert_eq!(registry::read_value(&f.env.run_roots[0], "SandboxNotes").unwrap(), sz("SandboxNotes", "later"), "a later change is kept");
+    assert_eq!(restored.status, OpStatus::PartiallyRestored);
+
+    let (f, restored, id) = reverted_then(|run| registry::delete_value(run, "SandboxNotes").unwrap());
+    assert_eq!(record(&restored, &id).restore, Some(RestoreStatus::Conflict));
+    assert!(record(&restored, &id).restore_detail.as_deref().unwrap().contains("not recreated"));
+    assert!(registry::read_value(&f.env.run_roots[0], "SandboxNotes").is_err(), "a deleted value is not recreated");
+    assert_eq!(restored.status, OpStatus::PartiallyRestored);
+
+    let (f, restored, id) = reverted_then(|run| registry::delete_key(run).unwrap());
+    assert_eq!(record(&restored, &id).restore, Some(RestoreStatus::Conflict));
+    assert!(!registry::exists(&f.env.run_roots[0]), "a deleted key is not recreated");
+    assert_eq!(restored.status, OpStatus::PartiallyRestored);
+}
+
+/// A manifest written by 0.1.1 (schema 1, no `trace` anywhere), kept as a template: the old format keeps loading and restoring.
+#[test]
+fn stage1_manifest_loads_and_restores() {
+    let f = Fixture::new();
+    let esc = |s: &str| s.replace('\\', "\\\\");
+    let root = f.root.to_string_lossy().to_string();
+    let text = include_str!("fixtures/manifest-0.1.1.json").replace("{ROOT_LC}", &esc(&root.to_lowercase())).replace("{ROOT}", &esc(&root)).replace("{TAG}", &f.tag);
+    let dir = ops_dir(&f).join("op-1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("manifest.json"), &text).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["schema"], 1);
+    assert!(!text.contains("\"trace\""), "no trace field in the old format");
+    let items = v["items"].as_array().unwrap();
+    let cfg = items.iter().find(|i| i["candidateId"].as_str().unwrap().ends_with("config.ini")).unwrap();
+    let run_item = items.iter().find(|i| i["candidateId"].as_str().unwrap().contains("run|sandboxnotes")).unwrap();
+    // The state after that apply: config.ini in quarantine, the Run value gone.
+    let q = PathBuf::from(cfg["quarantine"].as_str().unwrap());
+    fs::create_dir_all(q.parent().unwrap()).unwrap();
+    fs::rename(notes_dir(&f.env).join("config.ini"), &q).unwrap();
+    let run = f.env.run_roots[0].clone();
+    registry::delete_value(&run, "SandboxNotes").unwrap();
+
+    let op = ops::load(&f.env, "op-1").unwrap();
+    assert_eq!(op.schema, 1);
+    assert!(op.plan.as_ref().unwrap().trace.is_none());
+    assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Ok { op } if op.id == "op-1"));
+    let restored = ops::restore(&f.env, "op-1").unwrap();
+    assert_eq!(restored.status, OpStatus::Restored, "{:#?}", restored.items.iter().map(|i| (&i.candidate_id, i.restore, &i.restore_detail)).collect::<Vec<_>>());
+    assert_eq!(fs::read(notes_dir(&f.env).join("config.ini")).unwrap(), b"[x]\n");
+    let bytes: Vec<u8> = run_item["regBackup"]["val"]["data"].as_array().unwrap().iter().map(|b| b.as_u64().unwrap() as u8).collect();
+    assert_eq!(registry::read_value(&run, "SandboxNotes").unwrap().data, bytes, "the Run value is exactly the backed-up one");
+}
+
+#[test]
+fn newer_manifest_schema_is_refused() {
+    let f = Fixture::new();
+    let op = ops::begin(&f.env, NOTES).unwrap();
+    let mut o = ops::load(&f.env, &op.id).unwrap();
+    o.schema = SCHEMA + 1;
+    ops::save(&f.env, &o).unwrap();
+    let e = ops::load(&f.env, &op.id).unwrap_err();
+    assert!(e.0.contains("newer version"), "{e}");
+    assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Broken { .. }), "listed as Broken, not hidden");
+}

@@ -140,6 +140,8 @@ pub fn anchors_of(env: &Env, others: &[InstalledApp]) -> Anchors {
         if let Some(i) = icon_path(o).filter(|i| is_local_abs(i)) {
             a.files.push(canon_if_exists(&i));
         }
+        // Another app's Uninstall entry is its key too: a trace could otherwise propose it.
+        a.keys.extend(o.sources.iter().cloned());
         for (p, n) in name_pairs(o) {
             a.data_dirs.extend(env.folders.app_data.iter().map(|r| data_dir(r, p.as_deref(), &n)).filter(|d| d.is_dir()));
             a.keys.extend(env.software_roots.iter().filter_map(|r| data_key(r, p.as_deref(), &n)).filter(registry::exists));
@@ -274,8 +276,11 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
                 Err(e) => unverifiable(blocks, e),
             }
         }
-        Target::RegValue { key, name } => {
+        Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => {
             let mut blocks = registry_blocks(ctx.env, target);
+            if let Some(why) = ctx.anchors.key_inside(key) {
+                blocks.push(block(BlockCode::SharedWithOtherApp, why));
+            }
             match registry::read_value(key, name) {
                 Ok(val) => {
                     if let Some(why) = value_refers(ctx, &val) {
@@ -365,7 +370,7 @@ fn display_key(t: &Target) -> String {
     match t {
         Target::Path { path, .. } => path.to_string_lossy().to_lowercase(),
         Target::RegKey { key } => key.display().to_lowercase(),
-        Target::RegValue { key, name } => format!("{}\\{}", key.display(), name).to_lowercase(),
+        Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => format!("{}\\{}", key.display(), name).to_lowercase(),
     }
 }
 
@@ -590,7 +595,7 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
                 blocks: e.blocks,
                 score,
                 tier,
-                selected: default_selected(tier, r.group),
+                selected: default_selected(tier, r.group, e.user_data),
                 ident: e.ident,
             }
         })
@@ -606,6 +611,7 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
         corroborated,
         still_running: vec![],
         candidates,
+        trace: None,
     })
 }
 
