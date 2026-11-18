@@ -345,7 +345,6 @@ fn parent_target(t: &Target) -> Option<Target> {
 }
 
 /// The `target_key` of the parent target.
-#[allow(dead_code)] // used by the scan in step 4
 pub(crate) fn parent_id(t: &Target) -> Option<String> {
     parent_target(t).map(|p| target_key(&p))
 }
@@ -473,7 +472,7 @@ pub fn finish(env: &Env, s: Session) -> Result<TraceJournal> {
 
 // ---- linking ----
 
-fn one_below_uninstall(env: &Env, key: &RegPath) -> bool {
+pub(crate) fn one_below_uninstall(env: &Env, key: &RegPath) -> bool {
     env.uninstall_roots.iter().any(|r| key.below(r).is_some_and(|c| c.len() == 1))
 }
 
@@ -663,17 +662,14 @@ pub fn summary(j: &TraceJournal) -> TraceSummary {
 }
 
 /// Every Created change, noise included: a folder holding a browser cache is still "unchanged".
-#[allow(dead_code)] // used by the scan in step 4
 pub(crate) type Created<'a> = HashMap<&'a str, &'a TraceChange>;
 
-#[allow(dead_code)] // used by the scan in step 4
 pub(crate) fn created(j: &TraceJournal) -> Created<'_> {
     j.changes.iter().filter(|c| c.change == Change::Created).map(|c| (c.id.as_str(), c)).collect()
 }
 
 /// The path is exactly what the install created: same fingerprint, and (for a folder) every current child too. Entries that were
 /// deleted since are fine; anything new or changed breaks the match. Fails closed on any read error and on unreadable ids.
-#[allow(dead_code)] // used by the scan in step 4
 pub(crate) fn unchanged_path(p: &Path, c: &Created, blind: &HashSet<&str>) -> bool {
     let id = format!("path:{}", norm(p));
     let Some(ch) = c.get(id.as_str()) else { return false };
@@ -698,7 +694,6 @@ pub(crate) fn unchanged_path(p: &Path, c: &Created, blind: &HashSet<&str>) -> bo
 }
 
 /// The same for a key: every current value was created with the same data, every current subkey is unchanged too.
-#[allow(dead_code)] // used by the scan in step 4
 pub(crate) fn unchanged_key(k: &RegPath, c: &Created, blind: &HashSet<&str>) -> bool {
     let id = target_key(&Target::RegKey { key: k.clone() });
     if !c.contains_key(id.as_str()) || blind.contains(id.as_str()) {

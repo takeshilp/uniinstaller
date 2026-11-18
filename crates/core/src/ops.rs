@@ -9,6 +9,7 @@ use crate::paths::{self, io_status, is_canonical, is_inside, norm, restore_path}
 use crate::registry;
 use crate::safety::{Anchors, path_blocks, real_folders, registry_blocks, zone_root_of};
 use crate::scan::{Ctx, anchors_of, data_volume, evaluate};
+use crate::trace;
 use crate::{Error, Result, now_ms};
 use std::fs;
 use std::io::Write;
@@ -96,7 +97,8 @@ pub fn describe(env: &Env, app_id: &str) -> Result<AppDetails> {
             Err(e) => (None, Some(e)),
         },
     };
-    Ok(AppDetails { app, launch, launch_error, trace: None })
+    let trace = trace::find_for(env, &app, false).map(|x| x.1);
+    Ok(AppDetails { app, launch, launch_error, trace })
 }
 
 /// Every other listed program: the app itself (same id or an intersecting source) is removed.
@@ -108,7 +110,10 @@ fn others(env: &Env, app: &InstalledApp) -> Result<Vec<InstalledApp>> {
 pub fn preview(env: &Env, app_id: &str) -> Result<Plan> {
     let d = describe(env, app_id)?;
     let others = others(env, &d.app)?;
-    crate::scan::scan(env, &d.app, d.launch.as_ref(), &others, true)
+    let tr = trace::find_for(env, &d.app, false);
+    let mut plan = crate::scan::scan(env, &d.app, d.launch.as_ref(), &others, true, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j))?;
+    plan.trace = tr.map(|(_, u)| u);
+    Ok(plan)
 }
 
 /// Stable id of a target; the same across rescans.
@@ -255,7 +260,10 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     }
     op.entry_after = Some(live);
     let others = others(env, &op.app)?;
-    let mut plan = crate::scan::scan(env, &op.app, Some(&op.launch), &others, false)?;
+    // The program's own uninstaller has run: a hidden component it left installed makes the journal untrusted.
+    let tr = trace::find_for(env, &op.app, true);
+    let mut plan = crate::scan::scan(env, &op.app, Some(&op.launch), &others, false, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j))?;
+    plan.trace = tr.map(|(_, u)| u);
     plan.still_running = native.processes.iter().filter(|p| alive(p)).map(|p| p.image.clone()).collect();
     op.plan = Some(plan);
     (op.status, op.status_detail) = overall_status(&op);

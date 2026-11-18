@@ -2,6 +2,7 @@ mod common;
 use common::Fixture;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uni_core::env::APP_IDENTIFIER;
@@ -33,6 +34,9 @@ fn tree(f: &Fixture) -> (BTreeMap<String, Node>, RegNode) {
         for e in fs::read_dir(&d).unwrap().flatten() {
             let p = e.path();
             let key = paths::norm(&p);
+            if key == paths::norm(&f.env.data_dir) {
+                continue;
+            }
             if paths::is_reparse(&p).unwrap() {
                 out.insert(key, Node::Link);
             } else if p.is_dir() {
@@ -364,4 +368,189 @@ fn trust_follows_the_program_and_its_components() {
     let mut v = notes.clone();
     v.uninstall_string = Some("cmd /c exit 1".into());
     assert_eq!(u(&v, false).distrust, Some(Distrust::UninstallerChanged));
+}
+
+/// begin + the program's own uninstaller + leftover scan.
+fn uninstalled(f: &Fixture, id: &str) -> Operation {
+    let op = ops::begin(&f.env, id).unwrap();
+    let op = ops::run_native(&f.env, &op.id, &opts()).unwrap();
+    assert!(op.native.as_ref().unwrap().launch_error.is_none(), "{:?}", op.native);
+    ops::scan_leftovers(&f.env, &op.id).unwrap()
+}
+
+const TRACED: &str = "HKCU64:SandboxTraced";
+
+fn cand<'a>(plan: &'a Plan, suffix: &str) -> &'a Candidate {
+    let s = suffix.to_lowercase();
+    plan.candidates.iter().find(|c| c.id.ends_with(&s)).unwrap_or_else(|| panic!("no candidate ending with {suffix}: {:#?}", plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>()))
+}
+
+fn has_cand(plan: &Plan, suffix: &str) -> bool {
+    let s = suffix.to_lowercase();
+    plan.candidates.iter().any(|c| c.id.ends_with(&s))
+}
+
+fn trace_points(c: &Candidate) -> Option<i32> {
+    c.evidence.iter().find(|e| e.code == EvidenceCode::TraceCreated).map(|e| e.points)
+}
+
+fn sz(name: &str, text: &str) -> RegVal {
+    RegVal { name: name.into(), kind: 1, data: text.encode_utf16().chain(std::iter::once(0)).flat_map(|c| c.to_le_bytes()).collect() }
+}
+
+#[test]
+fn trace_install_uninstall_apply_restore() {
+    let f = Fixture::new();
+    let j = traced(&f);
+    let d = ops::describe(&f.env, TRACED).unwrap();
+    let u = d.trace.expect("the card knows the journal");
+    assert_eq!((u.id.as_str(), u.trusted, u.distrust), (j.id.as_str(), true, None));
+    assert_eq!(ops::preview(&f.env, TRACED).unwrap().trace.as_ref().map(|t| t.trusted), Some(true));
+
+    let op = uninstalled(&f, TRACED);
+    assert_eq!(op.entry_after, Some(EntryState::Gone));
+    let plan = op.plan.as_ref().unwrap();
+    assert!(plan.trace.as_ref().unwrap().trusted);
+    let state = |c: &Candidate| (c.score, c.tier, c.selected);
+
+    // Created and unchanged, near the program: Safe and preselected.
+    let c = cand(plan, r"pf\trace soft");
+    assert_eq!(state(c), (100, Tier::Safe, true), "{:?}", c.evidence);
+    assert_eq!(c.group, Group::ProgramFiles);
+    assert!(!has_cand(plan, r"sandbox traced\bin"), "the outer folder replaces its children");
+    // Created and unchanged, but not near the program (a background writer looks the same): Review, not preselected.
+    let c = cand(plan, r"pfx86\other updater");
+    assert_eq!((state(c), trace_points(c)), ((50, Tier::Review, false), Some(50)), "{:?}", c.evidence);
+    let c = cand(plan, r"roaming\trace soft");
+    assert_eq!((state(c), trace_points(c), c.group), ((50, Tier::Review, false), Some(50), Group::Data), "despite its Cache child: {:?}", c.evidence);
+    // App Paths: heuristic evidence plus the trace.
+    let c = cand(plan, r"apppaths\traced.exe");
+    assert_eq!((c.tier, c.selected, trace_points(c)), (Tier::Safe, true, Some(100)), "{:?}", c.evidence);
+    // Settings keys the install created (Data group): offered, never preselected.
+    for suffix in [r"\software\trace soft", r"\software\trace soft\sandbox traced"] {
+        let c = cand(plan, suffix);
+        assert!(c.blocks.is_empty() && !c.selected && c.group == Group::Data, "{suffix}: {c:?}");
+    }
+    // Values that existed before: no deletion of their key, a revert instead.
+    assert!(!has_cand(plan, r"apppaths\shared-tool.exe"), "the key of an attributable value is never offered for deletion");
+    assert!(!plan.candidates.iter().any(|c| c.id.starts_with("value:") && c.id.ends_with("run|sandboxtraced")), "the revert replaces the deletion of the Run value");
+    let reverts: Vec<&Candidate> = plan.candidates.iter().filter(|c| c.group == Group::Revert).collect();
+    assert_eq!(reverts.len(), 4, "{:#?}", reverts.iter().map(|c| &c.id).collect::<Vec<_>>());
+    assert!(reverts.iter().all(|c| !c.selected && c.id.starts_with("revert:")));
+    for r in &reverts {
+        let blocked = r.id.ends_with(r"sandbox soft\sandbox notes|installdir");
+        assert_eq!(!r.blocks.is_empty(), blocked, "{}: {:?}", r.id, r.blocks);
+        if blocked {
+            assert_eq!(r.blocks[0].code, BlockCode::SharedWithOtherApp, "{:?}", r.blocks);
+            assert_eq!(r.tier, Tier::Blocked);
+        } else {
+            assert_eq!((r.score, r.tier), (50, Tier::Review), "{:?}", r.evidence);
+        }
+    }
+    // Unattributed or foreign: nothing.
+    assert!(!has_cand(plan, r"updater|lastcheck"));
+    assert!(!has_cand(plan, r"sandboxtracedruntime"));
+
+    let before = tree(&f);
+    let ids: Vec<String> = plan.candidates.iter().filter(|c| c.blocks.is_empty()).map(|c| c.id.clone()).collect();
+    let applied = ops::apply(&f.env, &op.id, &ids).unwrap();
+    for i in &applied.items {
+        assert!(matches!(i.status, ItemStatus::Removed | ItemStatus::NotFound | ItemStatus::Reverted), "{}: {:?} {:?}", i.candidate_id, i.status, i.detail);
+    }
+    assert_eq!(applied.items.iter().filter(|i| i.status == ItemStatus::Reverted).count(), 3);
+    let nf: Vec<&str> = applied.items.iter().filter(|i| i.status == ItemStatus::NotFound).map(|i| i.candidate_id.as_str()).collect();
+    assert_eq!(nf.len(), 1, "only the inner settings key is already gone with its parent: {nf:?}");
+    assert!(nf[0].ends_with(r"software\trace soft\sandbox traced"));
+    assert_eq!(applied.status, OpStatus::Completed, "{:?}", applied.status_detail);
+    let un = |suffix: &str| registry::read_value(&f.env.run_roots[0], suffix).unwrap();
+    assert_eq!(un("SandboxTraced"), sz("SandboxTraced", r#""C:\old\traced-helper.exe""#), "the old Run value is back");
+    let sw = &f.env.software_roots[0];
+    assert_eq!(registry::read_value(&sw.child("Shared Soft").child("Common"), "Handler").unwrap(), sz("Handler", r"C:\old\handler.exe"));
+    assert_eq!(registry::read_value(&f.env.app_paths_roots[0].child("shared-tool.exe"), "").unwrap(), sz("", r"C:\old\shared-tool.exe"));
+    assert!(registry::read_value(&sw.child("Other Soft").child("Updater"), "LastCheck").unwrap().data != sz("LastCheck", "old").data, "unattributed: left as it is");
+    assert!(!pf(&f.env).join("Trace Soft").exists() && !roaming(&f.env).join("Trace Soft").exists());
+    assert!(!f.env.folders.program_files[1].join("Other Updater").exists(), "offered at Review and ticked here, like a user who ticks everything unblocked");
+
+    let restored = ops::restore(&f.env, &op.id).unwrap();
+    assert_eq!(restored.status, OpStatus::Restored, "{:#?}", restored.items.iter().map(|i| (&i.candidate_id, i.restore, &i.restore_detail)).collect::<Vec<_>>());
+    assert_eq!(before, tree(&f), "the file tree and the registry capture are back exactly as before the apply");
+}
+
+#[test]
+fn changed_objects_lose_trace_evidence() {
+    let f = Fixture::new();
+    traced(&f);
+    let dir = pf(&f.env).join(r"Trace Soft\Sandbox Traced");
+    fs::OpenOptions::new().append(true).open(dir.join("data.bin")).unwrap().write_all(b"more").unwrap();
+    fs::write(dir.join("user.txt"), b"mine").unwrap();
+    let other = f.env.folders.program_files[1].join("Other Updater");
+    fs::write(other.join("late.dat"), b"y").unwrap();
+    let op = uninstalled(&f, TRACED);
+    let plan = op.plan.as_ref().unwrap();
+    assert!(plan.trace.as_ref().unwrap().trusted);
+    assert!(!has_cand(plan, r"pf\trace soft") && !has_cand(plan, r"pf\trace soft\sandbox traced"), "a changed folder is not offered whole");
+    for name in ["bin", "uninstall.cmd"] {
+        let c = cand(plan, &format!(r"sandbox traced\{name}"));
+        assert!(trace_points(c) == Some(100) && c.tier == Tier::Safe && c.selected, "{name}: {:?}", c.evidence);
+    }
+    for name in ["data.bin", "user.txt"] {
+        let c = cand(plan, &format!(r"sandbox traced\{name}"));
+        assert_eq!((trace_points(c), c.score, c.tier, c.selected), (None, 45, Tier::Review, false), "{name}: {:?}", c.evidence);
+    }
+    assert!(!has_cand(plan, r"pfx86\other updater") && !plan.candidates.iter().any(|c| c.id.contains("other updater")), "a changed folder away from the program is never entered");
+}
+
+#[test]
+fn untrusted_trace_is_reported_not_used() {
+    let f = Fixture::new();
+    traced(&f);
+    let key = f.env.uninstall_roots[0].child("SandboxTraced");
+    let set = |name: &str, v: &str| registry::set_string(&registry::open(&key, winreg::enums::KEY_ALL_ACCESS).unwrap(), name, v, false).unwrap();
+    set("DisplayVersion", "2.0");
+    let plan = ops::preview(&f.env, TRACED).unwrap();
+    let t = plan.trace.as_ref().unwrap();
+    assert_eq!((t.trusted, t.distrust), (false, Some(Distrust::VersionChanged)));
+    assert!(plan.candidates.iter().all(|c| trace_points(c).is_none() && c.group != Group::Revert && !c.evidence.iter().any(|e| e.code == EvidenceCode::TraceModified)), "no evidence and no reverts");
+    assert_eq!(ops::describe(&f.env, TRACED).unwrap().trace.unwrap().distrust, Some(Distrust::VersionChanged));
+    set("DisplayVersion", "1.0");
+    assert!(ops::preview(&f.env, TRACED).unwrap().trace.unwrap().trusted);
+
+    // A hidden component that is still installed after the program's own uninstaller ran.
+    let op = ops::begin(&f.env, TRACED).unwrap();
+    ops::run_native(&f.env, &op.id, &opts()).unwrap();
+    let runtime = f.env.uninstall_roots[0].child("SandboxTracedRuntime");
+    assert!(!registry::exists(&runtime), "the uninstall script removed it");
+    registry::set_string(&registry::create(&runtime, winreg::enums::KEY_ALL_ACCESS).unwrap(), "DisplayName", "Sandbox Traced Runtime", false).unwrap();
+    let op = ops::scan_leftovers(&f.env, &op.id).unwrap();
+    let plan = op.plan.as_ref().unwrap();
+    let t = plan.trace.as_ref().unwrap();
+    assert_eq!((t.trusted, t.distrust), (false, Some(Distrust::ComponentStillInstalled)));
+    assert!(plan.candidates.iter().all(|c| trace_points(c).is_none() && c.group != Group::Revert), "no evidence and no reverts");
+    assert!(plan.candidates.iter().all(|c| !c.id.ends_with("sandboxtracedruntime")), "and the other program's entry is never offered");
+}
+
+#[test]
+fn revert_respects_changes() {
+    let f = Fixture::new();
+    traced(&f);
+    let common = f.env.software_roots[0].child("Shared Soft").child("Common");
+    registry::set_string(&registry::open(&common, winreg::enums::KEY_ALL_ACCESS).unwrap(), "Handler", "changed after the install", false).unwrap();
+    let op = uninstalled(&f, TRACED);
+    let plan = op.plan.as_ref().unwrap();
+    assert!(!has_cand(plan, r"common|handler"), "changed since the trace: no revert");
+    let run_id = cand(plan, r"run|sandboxtraced").id.clone();
+    assert!(run_id.starts_with("revert:"));
+    // changed between the scan and the apply
+    let run = f.env.run_roots[0].clone();
+    registry::set_string(&registry::open(&run, winreg::enums::KEY_ALL_ACCESS).unwrap(), "SandboxTraced", "edited meanwhile", false).unwrap();
+    let applied = ops::apply(&f.env, &op.id, std::slice::from_ref(&run_id)).unwrap();
+    assert_eq!(applied.items[0].status, ItemStatus::Changed, "{:?}", applied.items[0].detail);
+    assert_eq!(registry::read_value(&run, "SandboxTraced").unwrap(), sz("SandboxTraced", "edited meanwhile"), "untouched");
+    // deleted between the scan and the apply
+    registry::delete_value(&run, "SandboxTraced").unwrap();
+    let applied = ops::apply(&f.env, &op.id, std::slice::from_ref(&run_id)).unwrap();
+    let it = applied.items.iter().find(|i| i.candidate_id == run_id).unwrap();
+    assert_eq!(it.status, ItemStatus::Changed);
+    assert!(it.detail.as_deref().unwrap().contains("no longer exists"), "{:?}", it.detail);
+    assert!(registry::read_value(&run, "SandboxTraced").is_err(), "not recreated");
 }

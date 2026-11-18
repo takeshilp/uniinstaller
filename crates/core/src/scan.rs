@@ -8,7 +8,9 @@ use crate::ops::target_key;
 use crate::paths::{self, file_id, has_doc_ext, is_canonical, is_drive_root, is_inside, is_local_abs, is_reparse, norm, same_or_inside};
 use crate::registry::{self, read_string};
 use crate::safety::*;
+use crate::trace::{self, value_print};
 use crate::{Result, now_ms, shortcuts};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use winreg::enums::*;
@@ -396,7 +398,118 @@ fn value_points_inside(k: &winreg::RegKey, dir: &Path) -> bool {
     })
 }
 
-pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[InstalledApp], dry_run: bool) -> Result<Plan> {
+/// Whether `p` is, holds or lies inside the confirmed install folder.
+fn near_dir(confirmed: Option<&Path>, p: &Path) -> bool {
+    confirmed.is_some_and(|d| same_or_inside(p, d) || is_inside(d, p))
+}
+
+/// Section G: what a trusted trace journal says the install created.
+struct TraceScan<'a> {
+    env: &'a Env,
+    j: &'a TraceJournal,
+    created: trace::Created<'a>,
+    blind: HashSet<&'a str>,
+    /// The Uninstall keys of the program the journal is linked to.
+    linked: Vec<&'a RegPath>,
+    confirmed: Option<&'a Path>,
+    out: Vec<Raw>,
+}
+
+impl TraceScan<'_> {
+    fn evidence(&self) -> Vec<Evidence> {
+        vec![ev(EvidenceCode::TraceCreated, W_TRACE_CREATED, format!("created by the traced install {}", self.j.id))]
+    }
+
+    fn path_group(&self, p: &Path) -> Group {
+        let f = &self.env.folders;
+        let is_lnk = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+        if is_lnk && (f.start_menu.iter().any(|s| is_inside(p, s)) || p.parent().is_some_and(|d| f.desktops.iter().any(|x| norm(x) == norm(d)))) {
+            Group::Shortcuts
+        } else if f.program_files.iter().any(|z| is_inside(p, z)) || self.confirmed.is_some_and(|d| same_or_inside(p, d)) {
+            Group::ProgramFiles
+        } else {
+            Group::Data
+        }
+    }
+
+    fn reg_group(&self, k: &RegPath) -> Group {
+        let env = self.env;
+        let under = |r: &RegPath| k.same(r) || k.below(r).is_some();
+        if env.uninstall_roots.iter().chain(&env.app_paths_roots).chain(&env.run_roots).any(under) {
+            Group::Registry
+        } else if env.software_roots.iter().any(|r| k.below(r).is_some()) {
+            Group::Data
+        } else {
+            Group::Registry
+        }
+    }
+
+    /// A created file or folder: offered whole when it is exactly what the install made, otherwise (only near the install folder, or
+    /// inside a protected folder such as a Start Menu) its created children are considered one by one.
+    fn emit_path(&mut self, p: &Path) {
+        let Some(kind) = path_kind(p) else { return };
+        let group = self.path_group(p);
+        let protected = protected_reason(&self.env.folders, p, group).is_some();
+        if !protected && trace::unchanged_path(p, &self.created, &self.blind) {
+            let evidence = self.evidence();
+            self.out.push(Raw { group, target: Target::Path { path: p.to_path_buf(), kind }, evidence });
+        } else if kind == PathKind::Dir && (protected || near_dir(self.confirmed, p)) {
+            let Ok(rd) = fs::read_dir(p) else { return };
+            for e in rd {
+                let Ok(e) = e else { return };
+                let child = e.path();
+                if self.created.get(format!("path:{}", norm(&child)).as_str()).is_some_and(|c| !c.noise) {
+                    self.emit_path(&child);
+                }
+            }
+        }
+    }
+
+    fn emit_key(&mut self, k: &RegPath) {
+        // Another program's Uninstall entry is never ours.
+        if trace::one_below_uninstall(self.env, k) && !self.linked.iter().any(|s| s.same(k)) {
+            return;
+        }
+        if !registry::exists(k) {
+            return;
+        }
+        if trace::unchanged_key(k, &self.created, &self.blind) {
+            let (group, evidence) = (self.reg_group(k), self.evidence());
+            self.out.push(Raw { group, target: Target::RegKey { key: k.clone() }, evidence });
+        } else if let Ok(rk) = registry::open(k, KEY_READ) {
+            // A changed key's own values are never offered; its created subkeys are looked at one by one.
+            let mut subs = Vec::new();
+            for n in rk.enum_keys() {
+                let Ok(n) = n else { return };
+                subs.push(k.child(&n));
+            }
+            for s in subs {
+                let id = target_key(&Target::RegKey { key: s.clone() });
+                if self.created.get(id.as_str()).is_some_and(|c| !c.noise) {
+                    self.emit_key(&s);
+                }
+            }
+        }
+    }
+
+    fn emit(&mut self, c: &TraceChange) {
+        match &c.target {
+            Target::Path { path, .. } => self.emit_path(path),
+            Target::RegKey { key } => self.emit_key(key),
+            Target::RegValue { key, name } => {
+                if let Ok(live) = registry::read_value(key, name)
+                    && value_print(&live).ok() == c.after
+                {
+                    let (group, evidence) = (self.reg_group(key), self.evidence());
+                    self.out.push(Raw { group, target: c.target.clone(), evidence });
+                }
+            }
+            Target::RegRevert { .. } => {}
+        }
+    }
+}
+
+pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[InstalledApp], dry_run: bool, trace: Option<&TraceJournal>) -> Result<Plan> {
     let anchors = anchors_of(env, others);
     let anchor = find_anchor(env, app, launch, &anchors);
     let confirmed: Option<PathBuf> = matches!(anchor.status, DirStatus::Confirmed {}).then(|| anchor.dir.clone()).flatten();
@@ -566,6 +679,58 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
         }
     }
 
+    // G. A trusted trace journal: objects the traced install created and left unchanged (+100 near the install folder or with other
+    // evidence, +50 elsewhere), and previous values it overwrote with a reference to this program (never preselected).
+    if let Some(j) = trace {
+        let created = trace::created(j);
+        let mut topmost: Vec<&TraceChange> = created.values().copied().filter(|c| !c.noise && trace::parent_id(&c.target).is_none_or(|p| !created.contains_key(p.as_str()))).collect();
+        topmost.sort_by(|a, b| a.id.cmp(&b.id));
+        let linked: Vec<&RegPath> = match &j.link {
+            TraceLink::Linked { app } => app.sources.iter().collect(),
+            _ => vec![],
+        };
+        let mut g = TraceScan { env, j, created, blind: j.unreadable.iter().map(String::as_str).collect(), linked, confirmed: confirmed.as_deref(), out: vec![] };
+        for c in topmost {
+            g.emit(c);
+        }
+        for t in g.out {
+            match raw.iter_mut().find(|r| target_key(&r.target) == target_key(&t.target)) {
+                Some(r) => r.evidence.extend(t.evidence),
+                None => raw.push(t),
+            }
+        }
+        // Values the install overwrote: offered only while the live value is still the one the trace saw, and only when its text
+        // points into this program's folder (anything else could be another program's write during the trace window).
+        let mut protect: Vec<RegPath> = vec![];
+        for m in j.changes.iter().filter(|m| m.change == Change::Modified && !m.noise) {
+            let (Target::RegValue { key, name }, Some(prev)) = (&m.target, &m.previous) else { continue };
+            let Ok(live) = registry::read_value(key, name) else { continue };
+            if value_print(&live).ok() != m.after {
+                continue; // changed since the trace
+            }
+            let Some(d) = confirmed.as_deref() else { continue };
+            if !registry::val_text(&live).is_some_and(|t| text_refers_to(&t, d)) {
+                continue; // not attributable: report only
+            }
+            protect.push(key.clone());
+            // Windows shares App Paths between views (docs/bugs.md): the 64-bit copy is the same value.
+            if key.view == View::V32
+                && env.app_paths_roots.iter().any(|r| r.view == View::V32 && key.below(r).is_some())
+                && env.app_paths_roots.iter().any(|r| r.hive == key.hive && r.view == View::V64)
+            {
+                continue;
+            }
+            raw.retain(|r| !matches!(&r.target, Target::RegValue { key: k, name: n } if k.same(key) && n.eq_ignore_ascii_case(name)));
+            raw.push(Raw {
+                group: Group::Revert,
+                target: Target::RegRevert { key: key.clone(), name: name.clone(), previous: prev.clone() },
+                evidence: vec![ev(EvidenceCode::TraceModified, W_TRACE_MODIFIED, "the trace recorded the value before the install")],
+            });
+        }
+        // A key that held a value from before the install is not the program's: never offer to delete it.
+        raw.retain(|r| !matches!(&r.target, Target::RegKey { key } if protect.iter().any(|p| p.same(key) || p.below(key).is_some())));
+    }
+
     // Finish: drop nested path candidates (keep the outer one) and duplicates.
     let all_paths: Vec<PathBuf> = raw.iter().filter_map(|r| if let Target::Path { path, .. } = &r.target { Some(path.clone()) } else { None }).collect();
     raw.retain(|r| match &r.target {
@@ -583,6 +748,15 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
             let mut evidence = r.evidence;
             if e.user_data {
                 evidence.push(ev(EvidenceCode::UserDataLikely, W_USER_DATA, "looks like documents, saves or other user data"));
+            }
+            // Trace-only evidence away from the program's folder is Review, never preselected (a background writer looks the same).
+            let heuristic = evidence.iter().any(|x| x.points > 0 && x.code != EvidenceCode::TraceCreated);
+            let is_near = matches!(&r.target, Target::Path { path, .. } if near_dir(confirmed.as_deref(), path));
+            if !heuristic && !is_near {
+                for x in evidence.iter_mut().filter(|x| x.code == EvidenceCode::TraceCreated) {
+                    x.points = W_TRACE_FAR;
+                    x.detail.push_str(" (away from the program's folder)");
+                }
             }
             let score: i32 = evidence.iter().map(|x| x.points).sum();
             let tier = tier(score, !e.blocks.is_empty());

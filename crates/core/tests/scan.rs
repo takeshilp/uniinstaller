@@ -123,7 +123,7 @@ fn outside_zone_children_are_weak() {
     fs::create_dir_all(&tool).unwrap();
     fs::write(tool.join("a.dll"), b"x").unwrap();
     fs::write(tool.join("Tool.exe"), b"x").unwrap();
-    let plan = scan::scan(&f.env, &bogus_app(&tool), None, &[], true).unwrap();
+    let plan = scan::scan(&f.env, &bogus_app(&tool), None, &[], true, None).unwrap();
     assert!(matches!(plan.install_dir_status, DirStatus::Confirmed {}), "{:?}", plan.install_dir_status);
     for n in ["a.dll", "Tool.exe"] {
         check(find_path(&plan, &tool.join(n)), 25, Tier::Weak, false);
@@ -155,7 +155,7 @@ fn rejects_bogus_install_dirs() {
         _ => println!("skipped 8.3 case: no short name"),
     }
     for (what, dir) in cases {
-        let plan = scan::scan(&f.env, &bogus_app(&dir), None, &[], true).unwrap();
+        let plan = scan::scan(&f.env, &bogus_app(&dir), None, &[], true, None).unwrap();
         assert!(matches!(plan.install_dir_status, DirStatus::Rejected { .. }), "{what}: {:?}", plan.install_dir_status);
         assert!(plan.candidates.iter().all(|c| !matches!(c.group, Group::ProgramFiles | Group::Shortcuts)), "{what}: no file candidates from a rejected dir");
     }
@@ -359,7 +359,7 @@ fn broad_install_location_does_not_claim_references() {
         o.display_name = format!("Broad {i}");
         others.push(o);
     }
-    let plan = scan::scan(&f.env, &target, None, &others, true).unwrap();
+    let plan = scan::scan(&f.env, &target, None, &others, true, None).unwrap();
     assert!(matches!(plan.install_dir_status, DirStatus::Rejected { .. }), "{:?}", plan.install_dir_status);
     let key = find_key(&plan, |k| k.path.ends_with(r"Sandbox Soft\Sandbox Notes"));
     assert_eq!(key.len(), 1);
