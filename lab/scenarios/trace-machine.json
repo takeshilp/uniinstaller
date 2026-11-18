@@ -1,0 +1,16 @@
+{ "about": "Per-machine NSIS app installed under tracing. It points two pre-existing vendor values and a pre-existing Run value at itself (offered as reverts) and, standing in for a background writer, creates {PF86}\\Other Updater and changes an unrelated pre-existing value (must be neither preselected nor reverted).",
+  "trace": true,
+  "before_install": [
+    { "regval": "hkcu64:Software\\Lab Shared|Handler", "data": "C:\\LabOutside\\old-handler.exe" },
+    { "regval": "hklm64:SOFTWARE\\Lab Shared|Handler", "data": "C:\\LabOutside\\old-handler.exe" },
+    { "regval": "hklm64:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run|LabTrace", "data": "C:\\LabOutside\\old-tool.exe /tray" },
+    { "regval": "hklm32:SOFTWARE\\Other Vendor\\Updater|LastCheck", "data": "old" } ],
+  "install": ["labtrace.exe"],
+  "after_install": [ { "file": "{APPDATA}\\Lab Vendor\\Lab Trace\\cache.dat" } ],
+  "target": "Lab Trace", "select": "default+reverts",
+  "owned": ["{PF}\\Lab Vendor", "{PUBDESKTOP}\\Lab Trace.lnk", "{COMMONPROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hklm64:software\\lab vendor", "key:hklm64:software\\microsoft\\windows\\currentversion\\app paths\\labtrace.exe", "key:hklm64:software\\microsoft\\windows\\currentversion\\uninstall\\labtrace"],
+  "revert": ["value:hkcu64:software\\lab shared|handler", "value:hklm64:software\\lab shared|handler", "value:hklm64:software\\microsoft\\windows\\currentversion\\run|labtrace"],
+  "userdoc": [],
+  "control": ["key:hkcu64:software\\lab shared", "key:hklm64:software\\lab shared", "key:hklm32:software\\other vendor", "{PF86}\\Other Updater"],
+  "gap": [] }

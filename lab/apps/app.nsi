@@ -125,6 +125,21 @@ Section
   !insertmacro Text "$APPDATA\Lab Vendor\Lab Editor\settings-${KEY}.ini" "[${KEY}]"
   WriteRegStr HKCU "Software\Lab Vendor\Lab Editor" "${KEY}" "1"
 !endif
+!ifdef MODIFY
+  ; Points values that exist before the install (scenario before_install) at this program: the trace records them as Modified.
+  WriteRegStr HKCU "Software\Lab Shared" "Handler" "$INSTDIR\${EXE}"
+  WriteRegStr HKLM "SOFTWARE\Lab Shared" "Handler" "$INSTDIR\${EXE}"
+!endif
+!ifdef BACKGROUND
+  ; Stands in for a background writer during the trace (the trace cannot tell writers apart): unrelated to this program,
+  ; so the product must neither preselect it nor offer a revert.
+  SetOutPath "$PROGRAMFILES32\Other Updater"
+  File "/oname=update.dat" "${PAYLOAD}"
+  SetOutPath "$INSTDIR"
+  SetRegView 32
+  WriteRegStr HKLM "SOFTWARE\Other Vendor\Updater" "LastCheck" "2026-11-18"
+  SetRegView 64
+!endif
 SectionEnd
 
 Section "Uninstall"

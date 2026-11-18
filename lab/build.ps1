@@ -27,7 +27,8 @@ $nsis = @(
     @{ Out = 'labplugin.exe';  D = @('NAME=Lab Suite Plugin', 'KEY=LabSuitePlugin', 'EXE=labplugin.exe', 'SHARED_DLL',
                                      'DIR=$PROGRAMFILES64\Lab Vendor\Lab Suite\Plugin', 'REGKEY=SOFTWARE\Lab Vendor\Lab Suite\Plugin') },
     @{ Out = 'labeditor1.exe'; D = @('NAME=Lab Editor 1', 'KEY=LabEditor1', 'EXE=labeditor1.exe', 'EDITOR', 'VERSION=1.0') },
-    @{ Out = 'labeditor2.exe'; D = @('NAME=Lab Editor 2', 'KEY=LabEditor2', 'EXE=labeditor2.exe', 'EDITOR', 'VERSION=2.0') }
+    @{ Out = 'labeditor2.exe'; D = @('NAME=Lab Editor 2', 'KEY=LabEditor2', 'EXE=labeditor2.exe', 'EDITOR', 'VERSION=2.0') },
+    @{ Out = 'labtrace.exe';   D = @('NAME=Lab Trace', 'KEY=LabTrace', 'EXE=labtrace.exe', 'MODIFY', 'BACKGROUND') }
 )
 foreach ($app in $nsis) {
     $defs = @($app.D | ForEach-Object { "/D$_" }) + @("/DOUT=$build\$($app.Out)", "/DPAYLOAD=$payload", '/V2', "$PSScriptRoot\apps\app.nsi")

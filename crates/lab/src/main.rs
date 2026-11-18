@@ -4,9 +4,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 use uni_core::env::{Env, SANDBOX_VAR};
-use uni_core::model::{EvidenceCode, Plan};
+use uni_core::model::{EvidenceCode, Group, Plan};
 use uni_core::native::RunOptions;
-use uni_core::{elevation, inventory, ops, paths};
+use uni_core::{elevation, inventory, ops, paths, trace};
 use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows::Win32::System::WindowsProgramming::GetUserNameW;
 use windows::core::PWSTR;
@@ -16,7 +16,7 @@ const LAB_VAR: &str = "UNIINSTALLER_LAB";
 const LAB_MARKER: &str = ".uniinstaller-lab";
 const REFUSED: i32 = 2;
 const CRASH_CODE: u32 = 99;
-const USAGE: &str = "usage: uni-lab check | list | begin <app-id> | native <op> | scan <op> | apply <op> default|unblocked [--crash-after-first-move] | restore <op> | show <op>";
+const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | native <op> | scan <op> | apply <op> default|default+reverts|unblocked [--crash-after-first-move] | restore <op> | show <op>";
 
 /// Pure. The token user must be the Windows Sandbox account (it exists disabled on a normal host) and
 /// UNIINSTALLER_LAB must name a local folder with the lab marker (explicit intent, not a location proof).
@@ -52,18 +52,41 @@ fn lab_env() -> Result<Env, String> {
     Env::system().map_err(|e| e.0)
 }
 
-/// `default`: the product's preselection. `unblocked`: every candidate without a hard block and without a
-/// user-data warning, i.e. a user who ticks everything the product does not warn about.
+/// `default`: the product's preselection. `default+reverts`: the preselection plus every unblocked revert, like a user who also
+/// confirms the "previous values" group. `unblocked`: every candidate without a hard block and without a user-data warning, i.e. a
+/// user who ticks everything the product does not warn about.
 fn select(plan: &Plan, policy: &str) -> Result<Vec<String>, String> {
-    if !matches!(policy, "default" | "unblocked") {
+    if !matches!(policy, "default" | "default+reverts" | "unblocked") {
         return Err(format!("unknown policy '{policy}'"));
     }
     Ok(plan
         .candidates
         .iter()
-        .filter(|c| if policy == "default" { c.selected } else { c.blocks.is_empty() && !c.evidence.iter().any(|e| e.code == EvidenceCode::UserDataLikely) })
+        .filter(|c| match policy {
+            "default" => c.selected,
+            "default+reverts" => c.selected || (c.group == Group::Revert && c.blocks.is_empty()),
+            _ => c.blocks.is_empty() && !c.evidence.iter().any(|e| e.code == EvidenceCode::UserDataLikely),
+        })
         .map(|c| c.id.clone())
         .collect())
+}
+
+/// Traces one installer: snapshot, install (waits for the whole process tree), snapshot, journal. Fails when the installer did not
+/// start, timed out or exited with an error, because nothing can be measured from such a run.
+fn trace_install(env: &Env, installer: &str) -> Result<String, String> {
+    let core = |e: uni_core::Error| e.0;
+    let launch = trace::installer_launch(env, std::path::Path::new(installer)).map_err(core)?;
+    let mut session = trace::begin(env, launch).map_err(core)?;
+    let opts = RunOptions { timeout: Duration::from_secs(300), ..Default::default() };
+    trace::install(env, &mut session, &opts).map_err(core)?;
+    let run = session.native.clone().ok_or("the installer did not run")?;
+    if let Some(e) = &run.launch_error {
+        return Err(format!("the installer did not start: {e}"));
+    }
+    if run.timed_out || run.exit_code != Some(0) {
+        return Err(format!("the installer did not finish cleanly (exit {:?}, timed out {})", run.exit_code, run.timed_out));
+    }
+    pretty(&trace::finish(env, session).map_err(core)?)
 }
 
 /// Kills this process as soon as the first payload lands in `operations\<op>\q`, mid-apply, like an external kill.
@@ -109,6 +132,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     let core = |e: uni_core::Error| e.0;
     let out = match cmd {
         "list" => pretty(&inventory::list_apps(&env).map_err(core)?),
+        "trace" => trace_install(&env, arg(1)?),
         "begin" => pretty(&ops::begin(&env, arg(1)?).map_err(core)?),
         "native" => {
             let opts = RunOptions { timeout: Duration::from_secs(300), ..Default::default() };
@@ -199,6 +223,10 @@ mod tests {
     fn select_policies() {
         let doc = Evidence { code: EvidenceCode::UserDataLikely, points: -50, detail: String::new() };
         let block = Block { code: BlockCode::ProtectedPath, detail: String::new() };
+        let mut revert = cand("revert", false, vec![], vec![]);
+        revert.group = Group::Revert;
+        let mut blocked_revert = cand("blocked-revert", false, vec![block.clone()], vec![]);
+        blocked_revert.group = Group::Revert;
         let plan = Plan {
             schema: SCHEMA,
             created_ms: 0,
@@ -214,10 +242,13 @@ mod tests {
                 cand("review", false, vec![], vec![]),
                 cand("doc", false, vec![], vec![doc]),
                 cand("blocked", false, vec![block], vec![]),
+                revert,
+                blocked_revert,
             ],
         };
         assert_eq!(select(&plan, "default").unwrap(), ["safe"]);
-        assert_eq!(select(&plan, "unblocked").unwrap(), ["safe", "review"]);
+        assert_eq!(select(&plan, "default+reverts").unwrap(), ["safe", "revert"], "only an unblocked revert is added");
+        assert_eq!(select(&plan, "unblocked").unwrap(), ["safe", "review", "revert"]);
         assert!(select(&plan, "all").is_err());
     }
 }

@@ -23,6 +23,19 @@ function Lab([string]$file, [string[]]$argv) {
     Step "uni-lab $($argv -join ' ') -> $code"
     return $code
 }
+# One scenario action (before_install and after_install share them): file, delete or regval.
+function Invoke-Action($act) {
+    if ($act.file) { $path = X $act.file; New-Item (Split-Path $path) -ItemType Directory -Force | Out-Null; Set-Content -LiteralPath $path 'lab' }
+    elseif ($act.delete) { Remove-Item -LiteralPath (X $act.delete) -Force }
+    elseif ($act.regval) {
+        $m = [regex]::Match($act.regval, '^(hklm|hkcu)(64|32):(.+)\|(.+)$')
+        if (-not $m.Success) { throw "bad regval $($act.regval)" }
+        $hive = if ($m.Groups[1].Value -eq 'hklm') { 'LocalMachine' } else { 'CurrentUser' }
+        $view = if ($m.Groups[2].Value -eq '32') { 'Registry32' } else { 'Registry64' }
+        $rk = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view).CreateSubKey($m.Groups[3].Value)
+        $rk.SetValue($m.Groups[4].Value, (X $act.data)); $rk.Close()
+    } else { throw "unknown action: $($act | ConvertTo-Json -Compress)" }
+}
 
 try {
     Set-Content "$out\started.txt" (Get-Date -Format o)
@@ -48,10 +61,18 @@ try {
     if (-not $check.release) { throw 'uni-lab is a debug build' }
     if (-not $check.elevated) { throw 'the guest token is not elevated: per-machine installers would wait on a UAC prompt' }
 
+    # State that must exist before the baseline (a trace scenario overwrites it during the install).
+    if ($sc.before_install) { foreach ($act in $sc.before_install) { Invoke-Action $act; Step "before_install $($act | ConvertTo-Json -Compress)" } }
     Save-Inventory $out 's0' $T; Step 's0'
     $n = 0
     foreach ($inst in $sc.install) {
         $n++
+        if ($sc.trace) {
+            # A trace scenario has exactly one installer, run by uni-lab between two snapshots; 'st' is the state right after it.
+            if ((Lab 'trace.json' @('trace', "$bin\$inst")) -ne 0) { throw "trace of $inst failed" }
+            Save-Inventory $out 'st' $T; Step 'st'
+            continue
+        }
         $log = "$bin\install-$n.log"   # the Windows Installer service writes it; keep it off the mapped folder
         if ($inst -like '*.msi') { $proc = Start-Process msiexec.exe -ArgumentList '/i', "$bin\$inst", '/qn', '/l*v', $log -PassThru }
         else { $proc = Start-Process "$bin\$inst" -PassThru }
@@ -60,19 +81,7 @@ try {
         Step "install $inst -> $code"
         if ($code -ne 0) { throw "install $inst failed with $code" }
     }
-    foreach ($act in $sc.after_install) {
-        if ($act.file) { $path = X $act.file; New-Item (Split-Path $path) -ItemType Directory -Force | Out-Null; Set-Content -LiteralPath $path 'lab' }
-        elseif ($act.delete) { Remove-Item -LiteralPath (X $act.delete) -Force }
-        elseif ($act.regval) {
-            $m = [regex]::Match($act.regval, '^(hklm|hkcu)(64|32):(.+)\|(.+)$')
-            if (-not $m.Success) { throw "bad regval $($act.regval)" }
-            $hive = if ($m.Groups[1].Value -eq 'hklm') { 'LocalMachine' } else { 'CurrentUser' }
-            $view = if ($m.Groups[2].Value -eq '32') { 'Registry32' } else { 'Registry64' }
-            $rk = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view).CreateSubKey($m.Groups[3].Value)
-            $rk.SetValue($m.Groups[4].Value, (X $act.data)); $rk.Close()
-        } else { throw "unknown after_install action: $($act | ConvertTo-Json -Compress)" }
-        Step "after_install $($act | ConvertTo-Json -Compress)"
-    }
+    foreach ($act in $sc.after_install) { Invoke-Action $act; Step "after_install $($act | ConvertTo-Json -Compress)" }
     Save-Inventory $out 's1' $T; Step 's1'
 
     $null = Lab 'apps.json' @('list')

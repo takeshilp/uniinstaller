@@ -14,8 +14,9 @@ function Test-ReparsePoint([string]$Path) {
 function Read-Json([string]$Path) { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
 # HKCU\Software is shared between views, and HKLM\...\CurrentVersion\App Paths mirrors the 64-bit view in the 32-bit view (observed in the
 # guest: removing the hklm32 key makes the hklm64 key vanish). Such ids are one physical object, so they are folded onto the 64 view.
+# A revert candidate (revert:<value id>) is the same object as the value it restores.
 function Norm-Id([string]$id) {
-    $x = $id.ToLower() -replace '^(key|value):hkcu32:', '$1:hkcu64:'
+    $x = ($id.ToLower() -replace '^revert:', 'value:') -replace '^(key|value):hkcu32:', '$1:hkcu64:'
     return ($x -replace '^(key|value):hklm32:(software\\microsoft\\windows\\currentversion\\app paths\\)', '$1:hklm64:$2')
 }
 function New-Map { New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal) }
@@ -60,8 +61,10 @@ function Compare-Maps($A, $B) {
 
 function Get-Sel($Plan, [string]$Policy) {
     @($Plan.candidates | Where-Object {
+        $free = (@($_.blocks).Count -eq 0)
         if ($Policy -eq 'default') { $_.selected }
-        else { (@($_.blocks).Count -eq 0) -and -not (@($_.evidence | Where-Object { $_.code -eq 'userDataLikely' }).Count) }
+        elseif ($Policy -eq 'default+reverts') { $_.selected -or ($_.group -eq 'revert' -and $free) }
+        else { $free -and -not (@($_.evidence | Where-Object { $_.code -eq 'userDataLikely' }).Count) }
     } | ForEach-Object { Norm-Id $_.id })
 }
 
@@ -111,6 +114,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         $expect['op-native.json'] = 0; $expect['op-scan.json'] = 0; $expect['op-apply.json'] = 0; $expect['op-rescan.json'] = 0; $expect['op-restore.json'] = 0
         if ($sc.crash) { $expect['op-apply-crash.json'] = 99; $expect['op-after-crash.json'] = 0 }
     }
+    if ($sc.trace) { $expect['trace.json'] = 0 }
     if ($codes.'op-begin.json' -eq 2) { Add-Reason 'ERROR' 'op-begin exited 2: the guard refused in the guest' }
     foreach ($key in $expect.Keys) {
         $got = $codes.$key
@@ -121,9 +125,10 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     # Snapshots.
     $invErr = New-Object System.Collections.Generic.List[string]
     $snap = @{}
-    foreach ($n in 's0', 's1', 's2', 's3', 's4a', 's4', 's4r', 's5') { $snap[$n] = Load-Tsv (& $f "$n.tsv") $invErr }
+    foreach ($n in 's0', 's1', 'st', 's2', 's3', 's4a', 's4', 's4r', 's5') { $snap[$n] = Load-Tsv (& $f "$n.tsv") $invErr }
     $res.inventoryErrors = @($invErr | Select-Object -Unique | Select-Object -First 50)
     $need = if ($broken) { @('s0', 's1', 's5') } else { @('s0', 's1', 's2', 's3', 's4', 's4r', 's5') }
+    if ($sc.trace) { $need += 'st' }
     foreach ($n in $need) { if ($null -eq $snap[$n]) { Add-Reason 'ERROR' "snapshot $n is missing" } }
     if (($reasons | Where-Object { $_.level -eq 'ERROR' }).Count) { return (& $finish) }
 
@@ -131,7 +136,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     $tok = @{}
     foreach ($p in $envj.tokens.PSObject.Properties) { $tok[$p.Name] = [string]$p.Value }
     $pats = New-Object System.Collections.Generic.List[object]
-    foreach ($cls in 'owned', 'userdoc', 'control', 'gap') {
+    foreach ($cls in 'owned', 'userdoc', 'control', 'gap', 'revert') {
         foreach ($raw in @($sc.$cls)) {
             $t = [string]$raw
             foreach ($k in $tok.Keys) { $t = $t.Replace("{$k}", $tok[$k]) }
@@ -207,7 +212,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
 
     # Rule 5: precision (metrics only) and dangerous offers.
     $pool = @($offered | Where-Object { -not (@($_.evidence | Where-Object { $_.code -eq 'userDataLikely' }).Count) })
-    $isGood = { param($c) $x = & $classOf $c.nid; $x -eq 'owned' -or $x -eq 'gap' }
+    $isGood = { param($c) $x = & $classOf $c.nid; $x -eq 'owned' -or $x -eq 'gap' -or $x -eq 'revert' }
     $good = @($pool | Where-Object { & $isGood $_ })
     $res.precision = if ($pool.Count) { [math]::Round($good.Count / $pool.Count, 3) } else { $null }
     $pre = @($cands | Where-Object { $_.selected })
@@ -225,7 +230,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     $gaps = New-Object System.Collections.Generic.List[string]
     $problems = New-Object System.Collections.Generic.List[string]
     foreach ($i in $items) {
-        if ($i.status -eq 'removed') { continue }
+        if ($i.status -eq 'removed' -or $i.status -eq 'reverted') { continue }
         switch ($i.status) {
             'notFound' {
                 $still = $s4.Keys | Where-Object { Test-Contains $i.nid $_ } | Select-Object -First 1
@@ -250,7 +255,9 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     $rSet = @{}; foreach ($x in $reported) { $rSet[$x] = 1 }
     $vanishedUnreported = @($A | Where-Object { -not $rSet.ContainsKey($_) })
     $reportedNotGone = @($reported | Where-Object { -not $aSet.ContainsKey($_) })
-    $changed34 = @($s3.Keys | Where-Object { $s4.ContainsKey($_) -and $s3[$_] -cne $s4[$_] })
+    # A reverted value changes by design: its previous data is written back.
+    $revertedIds = @($items | Where-Object { $_.status -eq 'reverted' } | ForEach-Object { $_.nid })
+    $changed34 = @($s3.Keys | Where-Object { $s4.ContainsKey($_) -and $s3[$_] -cne $s4[$_] -and ($revertedIds -cnotcontains $_) })
     $res.applyConsistent = (-not $vanishedUnreported.Count) -and (-not $reportedNotGone.Count) -and (-not $changed34.Count)
     if (-not $res.applyConsistent) {
         Add-Reason 'FAIL' "apply report does not match reality: vanished unreported $($vanishedUnreported.Count) [$(($vanishedUnreported | Select-Object -First 5) -join '; ')], reported but not gone $($reportedNotGone.Count) [$(($reportedNotGone | Select-Object -First 5) -join '; ')], changed $($changed34.Count) [$(($changed34 | Select-Object -First 5) -join '; ')]"
@@ -269,6 +276,15 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         }
     }
     $res.falseDeletions = $falseCount; $res.risks = $risk
+
+    # Rule 17: places the inventory skips but the product captures (as noise) must never be covered by a removed item, because a removal
+    # there would go unmeasured. Keep in sync with the skips in inventory.ps1 that lie inside the trace scope.
+    foreach ($skipped in 'd3dscache', 'connecteddevicesplatform') {
+        $sk = "path:$($tok['LOCALAPPDATA'].ToLower())\$skipped"
+        foreach ($i in $R) {
+            if ((Test-Contains $i.nid $sk) -or (Test-Contains $sk $i.nid)) { Add-Reason 'FAIL' "a removed item covers or lies inside a place the inventory does not measure: $($i.nid) vs $sk" }
+        }
+    }
 
     # Rule 9: control objects present after apply must be unchanged.
     $ctlChanged = @($ctl | Where-Object { $s4.ContainsKey($_) -and $s2[$_] -cne $s4[$_] })
@@ -314,6 +330,46 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         }
     }
 
+    # shortcut: tracing is covered by one per-machine NSIS scenario; add traced MSI and per-user scenarios (Mark-of-the-Web is checked by hand).
+    # Rule 15 (trace scenarios): the journal is linked to the program, what the install created is offered, nothing that belongs to
+    # someone else is preselected, and every revert value is reverted and back to its state before the install.
+    if ($sc.trace) {
+        $tj = $null
+        try { $tj = Read-Json (& $f 'trace.json') } catch { }
+        $st = $snap['st']; $s0 = $snap['s0']
+        if (-not $tj -or -not $tj.id) { Add-Reason 'ERROR' 'trace.json is missing or unreadable' }
+        elseif ($tj.link.type -ne 'linked' -or $tj.link.app.displayName -ne $sc.target) { Add-Reason 'ERROR' "the journal is not linked to '$($sc.target)': $($tj.link.type)" }
+        # 15b: independent of trace.json: what appeared during the install (st minus s0) and is owned must be offered.
+        $notOffered = @($missedList | Where-Object { $st.ContainsKey($_) -and -not $s0.ContainsKey($_) })
+        if ($notOffered.Count) { Add-Reason 'FAIL' "install-created leftover not offered: $($notOffered[0]) (+$($notOffered.Count - 1))" }
+        # 15c
+        $guarded = @($s2.Keys | Where-Object { $x = & $classOf $_; $x -eq 'control' -or $x -eq 'userdoc' -or $x -eq 'revert' })
+        foreach ($c in @($cands | Where-Object { $_.selected -or $_.tier -eq 'safe' })) {
+            $hit = $guarded | Where-Object { Test-Contains $c.nid $_ } | Select-Object -First 1
+            if ($hit) { Add-Reason 'FAIL' "a preselected or safe candidate covers a control, userdoc or revert object: $($c.nid) covers $hit" }
+        }
+        # 15d
+        foreach ($rp in @($pats | Where-Object { $_.Class -eq 'revert' })) {
+            $id = $rp.Text
+            if (-not $s0.ContainsKey($id) -or -not $st.ContainsKey($id)) { Add-Reason 'ERROR' "test-app bug: revert value missing before or after the install: $id" }
+            elseif ($st[$id] -ceq $s0[$id]) { Add-Reason 'ERROR' "test-app bug: the install did not change $id" }
+            else {
+                $done = @($items | Where-Object { $_.nid -ceq $id -and $_.status -eq 'reverted' })
+                if (-not $done.Count) { Add-Reason 'FAIL' "revert value was not reverted: $id" }
+                elseif (-not $s4.ContainsKey($id) -or $s4[$id] -cne $s0[$id]) { Add-Reason 'FAIL' "reverted value differs from its state before the install: $id" }
+            }
+        }
+        # 15e: a control value the install changed has no attribution, so it must not be offered for revert.
+        foreach ($id in @($st.Keys | Where-Object { $_.StartsWith('value:', 'Ordinal') -and (& $classOf $_) -eq 'control' -and $s0.ContainsKey($_) -and $s0[$_] -cne $st[$_] })) {
+            if (@($cands | Where-Object { $_.group -eq 'revert' -and $_.nid -ceq $id }).Count) { Add-Reason 'FAIL' "unattributed value offered for revert: $id" }
+        }
+        # 15f
+        foreach ($c in @($cands | Where-Object { $_.group -eq 'revert' -and $_.selected })) { Add-Reason 'FAIL' "a revert candidate is preselected: $($c.nid)" }
+        if ($tj -and $tj.changes) { $res['traceCreated'] = @($tj.changes | Where-Object { $_.change -eq 'created' -and -not $_.noise }).Count }
+        $res['reverted'] = @($items | Where-Object { $_.status -eq 'reverted' }).Count
+        $res['traceEvidence'] = @($offered | Where-Object { @($_.evidence | Where-Object { $_.code -eq 'traceCreated' }).Count }).Count
+    }
+
     # Rule 13: known gaps (never part of the verdict).
     foreach ($id in $s5.Keys) { if ((& $classOf $id) -eq 'gap') { $gaps.Add("left behind: $id") } }
     if ($res.installDirStatus -eq 'notSet' -and $op.app.windowsInstaller) { $gaps.Add('MSI with empty InstallLocation') }
@@ -345,6 +401,7 @@ foreach ($d in Get-ChildItem -LiteralPath $RunDir -Directory -Force) {
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# $($d.Name): $($r.verdict)"); $md.Add('')
     foreach ($x in @($r.reasons)) { $md.Add("- $x") }
+    foreach ($m in 'traceCreated', 'traceEvidence', 'reverted') { if ($r.Contains($m)) { $md.Add("- ${m}: $($r[$m])") } }
     if ($cands) {
         $md.Add(''); $md.Add('## Candidates'); $md.Add(''); $md.Add('| id | group | tier | score | blocks | selected | class |'); $md.Add('|---|---|---|---|---|---|---|')
         foreach ($c in $cands) { $md.Add("| ``$($c.nid)`` | $($c.group) | $($c.tier) | $($c.score) | $((@($c.blocks) | ForEach-Object { $_.code }) -join ',') | $($c.selected) | $(& $classOf $c.nid) |") }

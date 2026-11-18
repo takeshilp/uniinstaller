@@ -74,6 +74,7 @@ function Save-Inventory([string]$Dir, [string]$Name, $T) {
     Add-Files $T.PD @("$pd\microsoft", "$pd\package cache") $L
     Add-Files $T.APPDATA @("$ap\microsoft") $L
     Add-Files $T.LOCALAPPDATA @("$lp\microsoft", "$lp\packages", "$lp\temp", "$lp\uniinstaller-data", "$lp\d3dscache", "$lp\connecteddevicesplatform") $L
+    Add-Files "$env:USERPROFILE\AppData\LocalLow" @() $L
     foreach ($r in 'PROGRAMS', 'COMMONPROGRAMS', 'DESKTOP', 'PUBDESKTOP', 'DOCS') { Add-Files $T[$r] @() $L }
     Add-Files 'C:\LabOutside' @() $L
     Add-Files $T.TASKS @("$($T.TASKS.ToLower())\microsoft") $L
