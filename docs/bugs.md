@@ -137,3 +137,13 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 ## Scenario files and 5.1 scripts: PowerShell reads a script without a BOM as ANSI
 - Symptom: a helper script with Russian button names failed to parse (`Unexpected token`), the names showed up as mojibake.
 - Fix: save helper scripts with non-ASCII text as UTF-8 with a BOM (the lab scripts stay ASCII-only, so they do not need one).
+
+## Hidden programs were not other apps (lab `shared-suite-hidden`)
+- Symptom: with the nested plugin registered as `SystemComponent=1`, lab run `20261118-235415` ended FAIL: the suite's scan offered the plugin's Run value, its
+  App Paths key, both links and the suite key holding `Plugin` without a block, and the `unblocked` policy removed them (7 RISK lines), plus the emptied
+  `Lab Vendor` Start Menu folder.
+- Cause: `ops::others` used the Apps & Features list, so `list_apps` never showed hidden entries and their folders, settings and Uninstall keys were no anchors.
+- Fix: `list_apps(env, true)` in `ops::others` (scan and apply); hidden entries are listed on request and need `hidden_ok` to be uninstalled.
+- Verified: `hidden_app_is_another_app` (`tests/scan.rs`) failed at its first `shared(...)` assert with `[]` and `apply_sees_hidden_apps` (`tests/ops.rs`) with
+  `left: Removed, right: Blocked` before the fix. Real data before and after (94 programs, 2228 lines): one candidate changed, PowerToys' settings folder Weak to
+  Blocked. Lab run 20261119-000039: `shared-suite-hidden` PASS and its Candidates table equal to `shared-suite`.

@@ -3,7 +3,7 @@
 ## Crates and modules
 `crates/core` (`uni_core`): `model` (serde types), `env` (Env, Folders, sandbox), `paths` (normalisation, canonical form, file id,
 walk, move/restore), `safety` (protected paths, registry shapes, tiers), `registry` (view-aware access, capture, restore),
-`inventory` (list apps, entry state), `command` (UninstallString to Launch), `native` (run uninstaller, process tree), `shortcuts` (.lnk),
+`inventory` (list apps, hidden entries, entry state), `command` (UninstallString to Launch), `native` (run uninstaller, process tree), `shortcuts` (.lnk),
 `scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see Lab). `src-tauri`: Tauri commands.
 
 ## Pipeline
@@ -30,6 +30,8 @@ Schema 2 (stage 2) adds `Target::RegRevert { key, name, previous }` (ids `revert
 trace types `Print`, `Change`, `TraceChange`, `TraceJournal`, `TraceLink`, `TraceSummary`, `Distrust`. Schema-1 manifests (0.1.x) still load and restore
 (a test keeps a real 0.1.1 manifest as a fixture); a manifest with a newer schema is refused. Downgrade: 0.1.x lists a schema-2 manifest that uses
 the new variants as `Broken`.
+`InstalledApp.hidden` (`HiddenReason`, `serde(default, skip_serializing_if = "Option::is_none")`) marks an entry Apps & Features hides; visible
+programs serialize byte-identically, so there is no schema bump and 0.2.0 ignores the field.
 Statuses: ItemStatus InProgress, Removed, NotFound, Changed, Blocked, AccessDenied, Locked, Failed, Reverted; RestoreStatus Restored, Conflict,
 Missing, Failed; OpStatus Running, AwaitingReview, Completed, CompletedWithWarnings, PendingReboot, PartiallyCompleted, Failed, Restored,
 PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress counts as a problem).
@@ -53,8 +55,8 @@ Hard blocks (never overridable, recomputed at apply): ProtectedPath, OutsideAllo
 5000 registry nodes), Unverifiable (any failure while computing identity: fail closed), OtherVolume (backups live on the data dir's volume).
 
 SharedWithOtherApp (`safety::Anchors`, applied in `scan::evaluate`, so a scan and an apply use the same rule):
-- Who counts as another app: every `list_apps` entry except the target's own (`ops::others`), read live at scan and again at apply.
-  Entries `list_apps` hides (`SystemComponent`, updates) are not seen.
+- Who counts as another app: every `list_apps(env, true)` entry except the target's own (`ops::others`), read live at scan and again at apply:
+  visible programs and hidden (`SystemComponent`) ones; nameless entries, updates and `ParentKeyName` children are not seen.
 - Their anchors: install folder, uninstaller exe and icon, plus their existing settings folders (`<AppData>\[<publisher>\]<name>`) and
   Software keys, named by the same rule as the target's own settings candidates (`scan::name_pairs`, every name variant including the
   version-free one). An app without InstallLocation also gets a derived folder (its uninstaller's folder when the icon sits beside it,
@@ -63,7 +65,7 @@ SharedWithOtherApp (`safety::Anchors`, applied in `scan::evaluate`, so a scan an
   contain ours; an install-folder child holding an uninstaller other than ours is blocked; a shortcut whose target meets the path
   rule is blocked, and a shortcut whose target cannot be read is `Unverifiable`.
 - A registry key is blocked when it equals or contains another app's settings key (same hive and view). Another app's Uninstall entry (its
-  `sources`, hidden entries excluded) is such a key too, so a trace can never propose it.
+  `sources`, hidden programs included) is such a key too, so a trace can never propose it.
 - A registry value (a Run value or a revert) is blocked when its key equals or lies inside another app's settings key or Uninstall entry
   (`Anchors::key_inside`).
 - A registry key or Run value is blocked when any REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ text in it (the whole captured tree for a key)
@@ -100,7 +102,7 @@ wait and stop flag as an uninstall); `finish` streams the "after" capture throug
   blinds everything below it (never Deleted or Created), and so does a switch between a link and a folder. Noise (browser and GPU caches, crash dumps,
   profiles, `ConnectedDevicesPlatform`) is matched by folder name below the capture root, stays in the journal with `noise: true`, is counted on the result
   screen, never gives evidence, but still counts as "created" when a folder is checked for being unchanged.
-- Link and trust. A journal is linked when exactly one new visible Uninstall entry (one level below an `uninstall_roots` entry) appears and `list_apps` shows
+- Link and trust. A journal is linked when exactly one new visible Uninstall entry (one level below an `uninstall_roots` entry) appears and the visible list (`list_apps(env, false)`) shows
   one program for it; none or several leave it unlinked and unused. `find_for` returns the newest loadable journal whose linked app shares a source key;
   it is trusted only while display version, install folder (normalised) and uninstall command (trimmed, lowercase) match, and, after the program's own
   uninstaller ran (`scan_leftovers`, not `describe` or `preview`), while no other Uninstall key the install created still exists
@@ -124,6 +126,30 @@ wait and stop flag as an uninstall); `finish` streams the "after" capture throug
 - Attribution: there is none per process. Everything that changed in scope between the two snapshots is in the journal, including other programs'
   background writes; the UI says so on the intro, result and review screens, and a background write is offered but not preselected unless it is the install folder.
 
+
+## Hidden programs (`inventory.rs`, `ops.rs`)
+- What is listed. `list_apps(env, include_hidden)` returns the programs Apps & Features lists; with `include_hidden` it adds entries with `SystemComponent=1`
+  (`HiddenReason::SystemComponent`, the only variant). Nameless entries, updates (`ReleaseType` update, hotfix, security update) and `ParentKeyName` children stay
+  invisible and are not other apps. Measured on the owner's machine (read-only, 2026-11-18): 344 Uninstall keys, 94 visible programs, 188 `SystemComponent`
+  entries (Visual C++ and .NET runtimes, SDK parts, Visual Studio MSIs, ASUS and RGB HALs, 19 NVIDIA components, Python and PowerToys MSIs, the WebView2
+  Runtime), 62 nameless keys, no named entry with `ParentKeyName` or an update `ReleaseType`, no hidden twin of a visible program and no hidden folder equal to,
+  holding or inside a visible app's folder.
+- Twin rule. Visible entries are deduplicated first; a hidden entry equal to a listed program (name, version, uninstall command, folder) is dropped, so
+  `list_apps(env, true)` is the default list plus hidden extras and ids and sources of visible programs never change.
+- Callers. `true`: `find_app` (so `describe`, `preview`, `begin` see hidden targets), `ops::others` (scan and apply) and the verify step of `apply`.
+  `false`: the GUI list unless the toggle is on, `uni list` unless `--hidden`, and `trace::link` (a hidden component installed alongside never links).
+- Guard. `ops::begin(env, id, hidden_ok)` refuses a hidden entry unless `hidden_ok`; the GUI sends it only after the user ticks the confirmation. One
+  confirmation for every hidden entry; no publisher rule (publisher text can be spoofed and is localized) and no bundle rule.
+- GUI. The programs screen has a per-session "Показать скрытые" toggle; hidden rows carry a warning pill, the card a warning strip, and the uninstall
+  dialog a checkbox that keeps "Запустить деинсталлятор" disabled until ticked.
+- Bundles. A hidden MSI of a WiX Burn bundle leaves the bundle installed and visible, so the bundle's anchors block shared leftovers; the MSI's own folder
+  children are offered at Review and never preselected. A hidden target that is itself a `ParentKeyName` parent: its children are not other apps and only
+  `app.sources` are offered.
+- Effect of counting hidden programs as other apps (real data, preview dump of the 94 visible programs before and after, 2228 lines): one candidate changed,
+  the PowerToys (Preview) x64 settings folder `...\AppData\Local\PowerToys` went from Weak to Blocked (`SharedWithOtherApp`, it contains the install folder of the
+  hidden PowerToys MSI); nothing else, no install-folder status changed. Preview of the 188 hidden programs: 929 candidates, 15 preselected (all Safe), no errors.
+- Lab proof: `shared-suite-hidden` (the nested plugin hidden) was FAIL before the change (run 20261118-235415, 7 unblocked offers removed) and PASS after
+  (run 20261119-000039).
 
 ## Lab (`crates/lab`, `lab/`)
 The lab runs real installers and the real `uni_core::ops` flow inside Windows Sandbox. Nothing in `crates/core` changed for it.
@@ -158,6 +184,9 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
   bug); 15e FAIL when a control value the install changed is offered as a revert; 15f FAIL when a revert is preselected. Rule 17 (all scenarios) FAILs when a
   removed item covers a place the inventory skips but the product captures (`d3dscache`, `connecteddevicesplatform`). Metrics: `traceCreated`, `traceEvidence`,
   `reverted`.
+- Hidden entries: the NSIS test app has a `HIDDEN` flag (`SystemComponent=1`); `labhidden.exe` is the scenario `hidden-user`, `labpluginhidden.exe` the nested
+  plugin of `shared-suite-hidden`. `uni-lab list` includes hidden entries and `uni-lab begin` passes `hidden_ok = true` (the lab acts as a user who ticked
+  the confirmation; the refusal is tested in `tests/ops.rs`).
 - Lab shortcuts: see the list below (the ones marked "lab").
 
 ## Known shortcuts (each is also a `// shortcut:` comment)
@@ -220,4 +249,10 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
   14. Lab coverage: one per-machine NSIS trace scenario; add traced MSI and per-user scenarios. Mark-of-the-Web is checked by hand only
       (`docs/development.md`).
   15. Downgrade: 0.1.x lists schema-2 manifests that use the new variants as Broken.
+- Hidden entries (`inventory.rs`): only `SystemComponent` entries are listed as hidden; nameless entries, updates (`ReleaseType`) and `ParentKeyName` children stay
+  invisible and are not other apps either (none of the last two on the owner's machine, 2026-11-18); list them if unwanted software is seen hiding that way.
+- Hidden twins (`inventory.rs`): a hidden twin of a listed program is dropped, not merged as a source; once the program is gone a leftover twin counts as
+  another app and rejects the shared folder (fail closed). Merge it if such twins show up as leftovers.
+- Hidden confirmation (`ops.rs`): every hidden entry gets the same single confirmation, no publisher or bundle check (runtimes, Burn packages, the WebView2
+  Runtime); add per-kind warnings if users remove runtimes by mistake.
 - Lab, analyzer: `analyze.ps1` has no unit tests; its rules are checked against the scenario verdicts, add a synthetic-run self-test if the rules change often.

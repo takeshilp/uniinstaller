@@ -16,7 +16,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p uni-core --test real_system -- --ignored --nocapture   # read-only, real machine
 cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture   # install-trace snapshot cost: objects, ms, memory
 npm run tauri dev                             # GUI; always through npm, plain `cargo run` gives a blank window
-cargo run -p uni-cli -- list                  # read-only CLI on the real machine
+cargo run -p uni-cli -- list                  # read-only CLI on the real machine; `list --hidden` adds the SystemComponent entries
+# dry run of every program to a file (diff two dumps to see what a rule change does to real data; UNI_PREVIEW_HIDDEN=1 adds hidden entries):
+UNI_PREVIEW_DUMP=<file> cargo test -p uni-core --test real_system real_system_preview_dump -- --ignored --nocapture
 ```
 `uni show <id>` prints the parsed uninstall command, `uni plan <id>` a dry-run plan. Neither changes anything
 (`export_plan` and reports only write JSON under `%LOCALAPPDATA%\uniinstaller-data`).
@@ -30,7 +32,9 @@ $env:UNIINSTALLER_SANDBOX = "$env:TEMP\uni-sandbox"; cargo run -p uni-cli -- san
 $env:UNIINSTALLER_SANDBOX = "$env:TEMP\uni-sandbox"; cargo run -p uni-cli -- sandbox-clean
 ```
 Seeded programs: Sandbox Notes (full flow), Sandbox Suite (shared and foreign-uninstaller blocks), Sandbox Shared Tool (stays
-installed), Sandbox Orphan (batch uninstaller leaves its key), Sandbox Broken (launch error).
+installed), Sandbox Orphan (batch uninstaller leaves its key), Sandbox Broken (launch error). "Sandbox System Component" is hidden and has no uninstall
+command, so it appears only with "Показать скрытые". To walk the hidden flow on Notes, hide it first:
+`reg add "HKCU\Software\uniinstaller-tests\sandbox\Uninstall\SandboxNotes" /v SystemComponent /t REG_DWORD /d 1 /f` (and the same for `Uninstall32`).
 Demo installer for install tracing: `<root>\installers\sandbox-traced-setup.cmd` (and `sandbox-traced-uninstall.cmd`), written by `sandbox-seed`. It
 installs "Sandbox Traced" under `pf\Trace Soft`, adds settings (with a `Cache` folder), a hidden component (`SandboxTracedRuntime`), an App Paths key, a Run value and
 vendor values, overwrites four values that exist before it runs (Run `SandboxTraced`, App Paths `shared-tool.exe`, `Shared Soft\Common|Handler`, and Sandbox
@@ -75,6 +79,8 @@ result with an independent inventory (recall, false deletions, restore, resume a
   Spell `software\\microsoft\\windows\\currentversion` out in full. A RISK or FAIL is a product finding: never edit the manifest or the
   policy to turn it green.
 
+- Hidden scenarios: `hidden-user` (per-user NSIS app with `SystemComponent=1`, expected PASS, 0 false deletions, restore ok) and `shared-suite-hidden`
+  (`shared-suite` with the nested plugin hidden, expected PASS with the same Candidates table as `shared-suite`; before the anchor change it was FAIL).
 - Trace scenarios (`trace-machine`): the app is installed by `uni-lab trace` between two product snapshots, so the journal and the inventory are compared
   independently (rules 15a-15f and 17 in `docs/architecture.md`). Expected: PASS, 3 reverted values, 0 false deletions, `{PF86}\Other Updater` offered at
   Review and not selected, no revert for the unrelated `LastCheck` value. A RISK or FAIL is a product finding, never fixed by editing the manifest.
@@ -120,6 +126,9 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
   остатков (strip, the "Прежние значения" group, a blocked row for Sandbox Notes' `InstallDir`) -> Запустить деинсталлятор -> tick "Прежние значения" ->
   Удалить выбранное (confirmation for 3 values) -> Восстановить всё. Verified on 2026-11-18: 26 created objects and 5 modified values, 3 values returned, the Run
   value exactly as the installer left it after the restore. Never pick a real installer, even in sandbox mode (the core refuses anyway).
+- Hidden programs in the GUI (sandbox only, ПЕСОЧНИЦА pill): hide Notes with the `reg add` lines above, then: Notes is absent; tick "Показать скрытые" and Notes and
+  "Sandbox System Component" appear with the "СКРЫТАЯ" pill; the Notes card shows the warning strip; "Запустить деинсталлятор" opens the dialog with the run
+  button disabled; tick the confirmation and it is enabled; run, review, "Удалить выбранное", "Восстановить всё". Verified on 2026-11-19 with UI Automation: all of the above, Run disabled until the box is ticked; the restore returned everything.
 - Running screen with a slow uninstaller and "Не ждать дальше".
 - Mark-of-the-Web on an installer (NOT run by the agent: it can pop a security dialog on the desktop). In the sandbox GUI: write
   `Set-Content -LiteralPath "<sandbox>\installers\sandbox-traced-setup.cmd" -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"`, trace the
