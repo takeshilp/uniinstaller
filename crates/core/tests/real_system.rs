@@ -19,3 +19,42 @@ fn real_system_list_and_preview() {
         println!("{}: {} candidates, {} selected", a.display_name, plan.candidates.len(), selected);
     }
 }
+
+/// Read-only: two captures of the real machine (the second streamed through a `Differ`, as `trace::finish` does). Prints the
+/// object counts, the milliseconds and the peak working-set growth that the budget in `docs/architecture.md` is measured by.
+/// Run it alone: `cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real registry and file system"]
+fn real_system_snapshot_cost() {
+    use uni_core::trace::{self, Differ};
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let working_set = || {
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: the pseudo handle is always valid and `c` is sized by `cb`.
+        unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb).unwrap() };
+        (c.WorkingSetSize, c.PeakWorkingSetSize)
+    };
+    let env = Env::system().unwrap();
+    let (base, _) = working_set();
+    let before = trace::capture(&env).unwrap();
+    let (held, peak1) = working_set();
+    println!("before: {} objects ({} files and folders, {} registry), {} unreadable, {} ms", before.objects, before.paths.len(), before.reg.len(), before.unreadable.len(), before.ms);
+    println!("before: working set +{} MB held, peak +{} MB", (held.saturating_sub(base)) >> 20, (peak1.saturating_sub(base)) >> 20);
+    for u in before.unreadable.iter().take(10) {
+        println!("  unreadable: {u}");
+    }
+    let objects = before.objects as usize;
+    let mut d = Differ::new(before);
+    let cap = trace::capture_with(&env, &mut |id, t, p, _| d.visit(id, t, p)).unwrap();
+    let (_, peak2) = working_set();
+    let roots: Vec<std::path::PathBuf> = env.folders.zone_roots().cloned().collect();
+    let (changes, unreadable) = d.finish(&cap.unreadable, &roots);
+    println!("after (streamed): {} objects, {} unreadable, {} ms", cap.objects, cap.unreadable.len(), cap.ms);
+    println!("both captures: peak working set +{} MB over the start", (peak2.saturating_sub(base)) >> 20);
+    println!("changes between the two captures: {} ({} noise), unreadable union {}", changes.len(), changes.iter().filter(|c| c.noise).count(), unreadable.len());
+    for c in changes.iter().take(10) {
+        println!("  {:?} {}", c.change, c.id);
+    }
+    assert!(objects < trace::MAX_OBJECTS);
+}

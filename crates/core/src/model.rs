@@ -409,3 +409,40 @@ pub struct TraceUse {
     /// Non-noise Modified files and Deleted objects: shown in the journal, never acted on.
     pub reported: usize,
 }
+
+/// What a traced install did to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Change {
+    Created,
+    Modified,
+    Deleted,
+}
+
+/// A cheap fingerprint of one object in a snapshot. Directory times are ignored (they change with every child), links and keys
+/// have no contents of their own, values carry their type and a SHA-256 of type + data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Print {
+    File { size: u64, mtime: u64 },
+    Dir {},
+    Link {},
+    Key {},
+    Value { kind: u32, sha256: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceChange {
+    /// `ops::target_key` of the target.
+    pub id: String,
+    pub change: Change,
+    pub target: Target,
+    pub before: Option<Print>,
+    pub after: Option<Print>,
+    /// Full value data from before the install; kept only where a revert could use it (`trace::finish`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<RegVal>,
+    /// A browser cache, a GPU shader cache and the like: kept in the journal, never evidence.
+    pub noise: bool,
+}

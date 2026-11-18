@@ -13,6 +13,9 @@ use windows::core::GUID;
 pub const SANDBOX_MARKER: &str = ".uniinstaller-sandbox";
 pub const SANDBOX_VAR: &str = "UNIINSTALLER_SANDBOX";
 pub const TEST_KEY_PREFIX: &str = r"Software\uniinstaller-tests";
+/// The Tauri identifier (`src-tauri/tauri.conf.json`, kept equal by a test there): the GUI's WebView2 profile lives in
+/// `%LOCALAPPDATA%\<identifier>`, so it is a protected tree and never traced.
+pub const APP_IDENTIFIER: &str = "io.github.takeshilp.uniinstaller";
 const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const RUN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 const APP_PATHS: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
@@ -82,6 +85,9 @@ impl Folders {
             sub("RoamingAppData", "Microsoft"),
             sub("LocalAppData", "Microsoft"),
             sub("LocalAppData", "Packages"),
+            // the GUI's WebView2 profile (Tauri identifier)
+            sub("LocalAppData", APP_IDENTIFIER),
+            sub("RoamingAppData", APP_IDENTIFIER),
         ]
         .into_iter()
         .flatten());

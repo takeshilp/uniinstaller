@@ -204,3 +204,13 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running the application");
 }
+
+#[cfg(test)]
+mod tests {
+    /// The core protects the WebView2 profile folder named after the Tauri identifier; keep both equal.
+    #[test]
+    fn identifier_matches_core() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"], uni_core::env::APP_IDENTIFIER);
+    }
+}
