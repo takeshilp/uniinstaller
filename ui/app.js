@@ -16,8 +16,42 @@ const fmtSize = (b) => {
   return `${nf.format(i === 0 ? v : Math.round(v * 10) / 10)} ${S.sizeUnits[i]}`;
 };
 const fmtDate = (ms) => new Date(ms).toLocaleString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-// shortcut: a letter tile instead of the extracted program icon, extract via ExtractIconEx if users want it.
 const letter = (name) => esc((name || '?').trim().charAt(0).toUpperCase());
+// Program icons as PNG data URLs by app id (null: none, the letter tile stays), fetched in page order, 4 at a time, after each render.
+// History rows keep the letter: the program may be gone.
+const icons = new Map();
+const iconQueue = [];
+const iconPending = new Set();
+let iconsRunning = 0;
+const appTile = (a, size) => {
+  const url = icons.get(a.id);
+  return url ? `<span class="tile ${size}"><img class="appicon" src="${esc(url)}" alt=""></span>`
+    : `<span class="tile letter ${size}" data-icon="${esc(a.id)}">${letter(a.displayName)}</span>`;
+};
+function loadIcons() {
+  document.querySelectorAll('[data-icon]').forEach((el) => {
+    const id = el.dataset.icon;
+    if (!icons.has(id) && !iconPending.has(id)) { iconPending.add(id); iconQueue.push(id); }
+  });
+  while (iconsRunning < 4 && iconQueue.length) {
+    const id = iconQueue.shift();
+    iconsRunning++;
+    invoke('app_icon', { id }).catch(() => null).then((url) => {
+      icons.set(id, url);
+      iconPending.delete(id);
+      iconsRunning--;
+      if (url) {
+        document.querySelectorAll('[data-icon]').forEach((el) => {
+          if (el.dataset.icon !== id) return;
+          el.classList.remove('letter');
+          el.removeAttribute('data-icon');
+          el.innerHTML = `<img class="appicon" src="${esc(url)}" alt="">`;
+        });
+      }
+      loadIcons();
+    });
+  }
+}
 const pill = ([kind, text]) => `<span class="pill ${kind}">${esc(text)}</span>`;
 const GROUPS = ['programFiles', 'shortcuts', 'registry', 'data', 'revert'];
 const lastPart = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
@@ -141,13 +175,14 @@ function renderList() {
   $('#count').textContent = S.found(apps.length) + (state.showHidden ? S.hiddenCount(apps.filter((a) => a.hidden).length) : '');
   list.innerHTML = apps.length ? apps.map((a) => `
     <button class="card row" data-act="open" data-id="${esc(a.id)}">
-      <span class="tile letter sm">${letter(a.displayName)}</span>
+      ${appTile(a, 'sm')}
       <span class="grow"><div class="name">${esc(a.displayName)}</div>
         <div class="muted">${esc([a.publisher, a.displayVersion].filter(Boolean).join(' · ') || '—')}</div></span>
       <span class="muted">${a.estimatedSizeKb != null ? fmtSize(a.estimatedSizeKb * 1024) : ''}</span>
       ${a.hidden ? `<span class="pill warn" title="${esc(S.hiddenReason[a.hidden] || a.hidden)}">${S.hiddenPill}</span>` : ''}
       ${pill(['muted', a.perUser ? S.onlyMe : S.forAll])}${ic('')}
     </button>`).join('') : `<div class="card muted">${S.nothingFound}</div>`;
+  loadIcons();
 }
 
 views.card = () => {
@@ -168,7 +203,7 @@ views.card = () => {
   const hid = a.hidden ? `<div class="strip warn"><span>${esc(S.hiddenCard(S.hiddenReason[a.hidden] || a.hidden))}</span></div>` : '';
   const html = `<div class="col">${back}
     <div class="head" style="justify-content:flex-start;align-items:center;gap:20px">
-      <span class="tile letter lg">${letter(a.displayName)}</span>
+      ${appTile(a, 'lg')}
       <div><h1 class="display" style="font-size:40px">${esc(a.displayName)}</h1><p class="subtitle" style="margin-top:6px">${sub || '—'}</p></div></div>
     ${hid}${warn}${err}${tr}
     <div class="card"><h3 style="margin-bottom:16px">${S.details}</h3><dl class="kv">
@@ -565,6 +600,7 @@ function render() {
     : state.info?.elevated ? `<span class="pill muted">${S.adminPill}</span>` : '';
   if (state.view === 'list') renderList();
   renderPopover(); renderModal(); renderToast(); renderBanner();
+  loadIcons();
 }
 
 // ---------- actions ----------
