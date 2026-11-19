@@ -53,7 +53,7 @@ function loadIcons() {
   }
 }
 const pill = ([kind, text]) => `<span class="pill ${kind}">${esc(text)}</span>`;
-const GROUPS = ['programFiles', 'shortcuts', 'registry', 'data', 'revert'];
+const GROUPS = ['programFiles', 'shortcuts', 'registry', 'services', 'data', 'revert'];
 const lastPart = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
 const regDisplay = (k) => `${k.hive.toUpperCase()}\\${k.path} (${k.view})`;
 
@@ -76,8 +76,27 @@ function set(patch) { Object.assign(state, patch); render(); }
 const fail = (e) => set({ error: String(e), busy: false, loading: null });
 
 // ---------- helpers on plans and operations ----------
-const candName = (c) => c.target.type === 'path' ? lastPart(c.target.path) : c.target.type === 'regKey' ? lastPart(c.target.key.path) : c.target.name || S.regDefault;
-const candWhere = (c) => c.target.type === 'path' ? c.target.path : c.target.type === 'regKey' ? regDisplay(c.target.key) : `${regDisplay(c.target.key)} → ${c.target.name || S.regDefault}`;
+const isSystem = (t) => t.type === 'service' || t.type === 'task';
+// A value of a captured service key (an ident's `node`) by name, and a DWORD value as a number.
+const regVal = (node, name) => (node?.values || []).find((v) => v.name.toLowerCase() === name.toLowerCase());
+const dword = (v) => (v && v.kind === 4 && v.data.length === 4 ? (v.data[0] | (v.data[1] << 8) | (v.data[2] << 16) | (v.data[3] << 24)) >>> 0 : null);
+// What a service or task row shows: its name, what it runs and its state. `ident` is the scan's identity or the item's backup (absent when blocked
+// before one was taken). Untrusted text: callers pass the result through esc().
+// shortcut: an indirect display name (`@file,-id`) shows the key name instead; resolve it in Rust (SHLoadIndirectString) if users see raw names.
+const sysLines = (t, ident) => {
+  if (t.type === 'service') {
+    const n = ident?.node;
+    const disp = n ? fmtVal(regVal(n, 'DisplayName')) : '';
+    const name = disp && disp !== S.valEmpty && !disp.startsWith('@') ? disp : t.name;
+    const image = n ? fmtVal(regVal(n, 'ImagePath')) : '';
+    const start = n ? (S.startType[dword(regVal(n, 'Start'))] ?? '?') : '';
+    return { name, where: S.svcWhere(t.name, image === S.valEmpty ? '' : image), state: n ? S.svcState(start, dword(regVal(n, 'DelayedAutostart')) === 1, ident.running) : '' };
+  }
+  const acts = ident?.actions || [];
+  return { name: lastPart(t.path), where: S.taskWhere(t.path, acts[0] || ''), state: ident?.actions ? S.taskState(ident.enabled, acts.length) : '' };
+};
+const candName = (c) => isSystem(c.target) ? sysLines(c.target, c.ident).name : c.target.type === 'path' ? lastPart(c.target.path) : c.target.type === 'regKey' ? lastPart(c.target.key.path) : c.target.name || S.regDefault;
+const candWhere = (c) => isSystem(c.target) ? sysLines(c.target, c.ident).where : c.target.type === 'path' ? c.target.path : c.target.type === 'regKey' ? regDisplay(c.target.key) : `${regDisplay(c.target.key)} → ${c.target.name || S.regDefault}`;
 // A registry value for people: text, list, number, else the first bytes in hex. Untrusted: callers pass the result through esc().
 const fmtVal = (v) => {
   if (!v) return S.valEmpty;
@@ -93,7 +112,7 @@ const fmtVal = (v) => {
 };
 // Evidence for a forced target is the user's word (folder and name), not a registry entry: its own wording where it differs.
 const evText = (code) => (state.op?.forced && S.evidenceForced[code]) || S.evidence[code] || code;
-const isRegistry = (c) => c.target.type !== 'path';
+const isRegistry = (c) => ['regKey', 'regValue', 'regRevert'].includes(c.target.type);
 const isRevert = (c) => c.target.type === 'regRevert';
 const groupable = (c) => c.blocks.length === 0 && (c.tier === 'safe' || c.tier === 'review');
 const groupOf = (g) => (state.plan?.candidates || []).filter((c) => c.group === g);
@@ -105,6 +124,7 @@ const itemGroup = (op, i) => {
   const c = op.plan?.candidates.find((x) => x.id === i.candidateId);
   if (c) return c.group;
   if (i.target.type === 'regRevert') return 'revert';
+  if (isSystem(i.target)) return 'services';
   return i.target.type === 'path' ? (/\.lnk$/i.test(i.target.path) ? 'shortcuts' : 'programFiles') : 'registry';
 };
 
@@ -442,11 +462,12 @@ function childRow(c) {
   const folder = c.target.type === 'path'
     ? `<button class="iconbtn" data-act="folder" data-path="${esc(c.target.path)}" title="${S.showInFolder}">${ic('')}</button>` : '';
   const was = c.target.type === 'regRevert' ? `<div class="s">${esc(S.wasNow(fmtVal(c.target.previous), fmtVal(c.ident?.val)))}</div>` : '';
+  const sys = isSystem(c.target) ? `<div class="s">${esc(sysLines(c.target, c.ident).state)}</div>` : '';
   return `<div class="child ${c.tier === 'weak' ? 'weakrow' : ''}" title="${esc(tip)}">
     <input type="checkbox" data-act="toggle" data-id="${esc(c.id)}" ${state.selected.has(c.id) ? 'checked' : ''} ${c.blocks.length || state.preview ? 'disabled' : ''}>
-    <span class="grow"><div class="t">${esc(candName(c))}</div><div class="s">${esc(candWhere(c))}</div>${was}
+    <span class="grow"><div class="t">${esc(candName(c))}</div><div class="s">${esc(candWhere(c))}</div>${was}${sys}
       <div class="s">${esc(why)}</div>${blocked}</span>
-    <span class="sizeval muted" style="font-size:15px">${isRegistry(c) ? '' : fmtSize(c.size)}</span>${folder}</div>`;
+    <span class="sizeval muted" style="font-size:15px">${c.target.type === 'path' ? fmtSize(c.size) : ''}</span>${folder}</div>`;
 }
 
 views.review = () => {
@@ -460,6 +481,9 @@ views.review = () => {
   if (op?.forced) {
     strips.push(`<div class="strip info"><span>${S.forceReviewNote}</span></div>`);
     if (!op.forced.searchNames.length) strips.push(`<div class="strip warn"><span>${esc(S.forceNoNameSearch(op.app.displayName))}</span></div>`);
+  }
+  if (!state.info.elevated && !state.info.sandbox && groupOf('services').length) {
+    strips.push(`<div class="strip warn"><span>${S.servicesNeedAdmin}</span><button class="btn secondary" data-act="admin">${S.restartAdmin}</button></div>`);
   }
   const tu = plan.trace;
   if (tu) {
@@ -479,11 +503,12 @@ views.review = () => {
     <div style="margin-top:14px"><button class="btn primary" data-act="home">${S.done}</button></div></div>`;
   const sel = selectedCands();
   const regN = sel.filter(isRegistry).length;
+  const sysN = sel.filter((c) => isSystem(c.target)).length;
   const selSize = sel.reduce((s, c) => s + c.size, 0);
   const bar = state.preview
     ? `<div></div><div class="acts"><button class="btn secondary" data-act="back-card">${S.back}</button>
        <button class="btn primary" data-act="export-json">${S.exportJson}</button></div>`
-    : `<div><div class="lbl">${S.selected}</div><div class="tot">${fmtSize(selSize)}${regN ? `<small>· ${S.registryRecords(regN)}</small>` : ''}</div></div>
+    : `<div><div class="lbl">${S.selected}</div><div class="tot">${fmtSize(selSize)}${regN ? `<small>· ${S.registryRecords(regN)}</small>` : ''}${sysN ? `<small>· ${S.systemObjects(sysN)}</small>` : ''}</div></div>
        <div class="acts"><button class="btn secondary" data-act="scan-op" ${dis()}>${S.scanAgain}</button>
        <button class="btn primary" data-act="apply" ${dis()} ${sel.length ? '' : 'disabled'}>${ic('')} ${S.deleteSelected}</button></div>`;
   return { html: `<div><button class="link back" data-act="home">${ic('')} ${S.allPrograms}</button>${strips.join('')}${head}${body}</div>`, bar: plan.candidates.length || state.preview ? bar : '' };
@@ -499,10 +524,11 @@ views.result = () => {
   const verCard = vLines.length ? `<div class="card"><h3 style="margin-bottom:8px">${S.verification}</h3>${vLines.map((l) => `<div class="muted">${esc(l)}</div>`).join('')}</div>` : '';
   const denied = op.items.some((i) => i.status === 'accessDenied') && !state.info.elevated
     ? `<div class="strip warn"><span>${S.deniedStrip}</span>${state.info.sandbox ? '' : `<button class="btn secondary" data-act="admin">${S.restartAdmin}</button>`}</div>` : '';
+  const sysRestored = op.items.some((i) => isSystem(i.target) && i.restore === 'restored') ? `<div class="strip info"><span>${S.systemRestoredNote}</span></div>` : '';
   const rowsFor = (g) => op.items.filter((i) => itemGroup(op, i) === g).map((i) => {
     const p = i.restore ? S.restoreStatus[i.restore] : S.itemStatus[i.status];
-    const name = i.target.type === 'path' ? lastPart(i.target.path) : i.target.type === 'regKey' ? lastPart(i.target.key.path) : i.target.name || S.regDefault;
-    const where = i.target.type === 'path' ? i.target.path : i.target.type === 'regKey' ? regDisplay(i.target.key) : `${regDisplay(i.target.key)} → ${i.target.name || S.regDefault}`;
+    const name = candName({ target: i.target, ident: i.regBackup });
+    const where = candWhere({ target: i.target, ident: i.regBackup });
     const note = i.restoreDetail || i.detail;
     return `<div class="child"><span class="grow"><div class="t">${esc(name)}</div><div class="s">${esc(where)}</div>${note ? `<div class="s">${esc(note)}</div>` : ''}</span>${pill(p || ['muted', i.status])}</div>`;
   }).join('');
@@ -520,7 +546,7 @@ views.result = () => {
     <h1 class="display" style="font-size:44px">${esc(S.opStatus[op.status] || op.status)}</h1>
     <p class="subtitle">${esc(S.resultCounts(failed, op.items.length))}${op.statusDetail ? ` · ${esc(op.statusDetail)}` : ''}</p></div>
     <button class="link" data-act="export-report">${S.exportReport}</button></div>
-    ${denied}${forcedStrip}${verCard}${groups}</div>`;
+    ${denied}${sysRestored}${forcedStrip}${verCard}${groups}</div>`;
   return { html, bar };
 };
 
@@ -542,6 +568,16 @@ function renderPopover() {
 function renderModal() {
   const m = $('#modal');
   if (!state.modal) { m.innerHTML = ''; return; }
+  if (state.modal === 'system') {
+    const n = selectedCands().filter((c) => isSystem(c.target)).length;
+    m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
+      <h2 id="mt">${esc(S.confirmSystemTitle(n))}</h2>
+      <div class="muted">${S.confirmSystemNote}</div>
+      <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
+      <button class="btn primary" data-act="modal-system-go">${S.proceed}</button></div></div></div>`;
+    $('#mcancel').focus();
+    return;
+  }
   if (state.modal === 'revert') {
     const n = selectedCands().filter(isRevert).length;
     m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
@@ -776,7 +812,8 @@ const actions = {
   'export-json': () => exportJson(),
   'export-report': () => exportJson(),
   'scan-op': () => scanOp(state.op.id),
-  apply: () => (selectedCands().some(isRevert) ? set({ modal: 'revert' }) : applySelected()),
+  apply: () => (selectedCands().some((c) => isSystem(c.target)) ? set({ modal: 'system' }) : selectedCands().some(isRevert) ? set({ modal: 'revert' }) : applySelected()),
+  'modal-system-go': () => { if (selectedCands().some(isRevert)) set({ modal: 'revert' }); else { set({ modal: null }); applySelected(); } },
   'modal-revert-go': () => { set({ modal: null }); applySelected(); },
   restore: () => runOp('restore', { opId: state.op.id }),
   retry: () => runOp('apply', { opId: state.op.id, ids: retryable(state.op).map((i) => i.candidateId) }),
