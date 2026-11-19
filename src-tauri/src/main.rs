@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! Thin Tauri commands over `uni-core`. All logic lives in the core crate.
 use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +13,7 @@ use tauri_plugin_dialog::DialogExt;
 use uni_core::env::Env;
 use uni_core::model::*;
 use uni_core::native::RunOptions;
-use uni_core::{elevation, force, inventory, ops, paths, trace};
+use uni_core::{elevation, force, icon, inventory, ops, paths, trace};
 
 struct StopFlag(Arc<AtomicBool>);
 
@@ -28,6 +31,24 @@ struct ForceSlot(Mutex<Option<PathBuf>>);
 
 impl ForceSlot {
     fn get(&self) -> MutexGuard<'_, Option<PathBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Program icons: the apps of every `list_apps` answer by id (the UI sends only ids), and PNG data URLs by icon file and index
+/// (many hidden entries share one); None means no usable icon and the UI keeps the letter tile.
+// shortcut: the cache lives for the session, so an updated program shows its old icon until the app restarts; key it by file time if that matters.
+#[derive(Default)]
+struct Icons {
+    apps: HashMap<String, InstalledApp>,
+    urls: HashMap<(PathBuf, i32), Option<String>>,
+}
+
+#[derive(Clone, Default)]
+struct IconSlot(Arc<Mutex<Icons>>);
+
+impl IconSlot {
+    fn get(&self) -> MutexGuard<'_, Icons> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -70,9 +91,30 @@ fn app_info(env: State<Env>) -> AppInfo {
 }
 
 #[tauri::command]
-async fn list_apps(env: State<'_, Env>, include_hidden: bool) -> Res<Vec<InstalledApp>> {
+async fn list_apps(env: State<'_, Env>, icons: State<'_, IconSlot>, include_hidden: bool) -> Res<Vec<InstalledApp>> {
     let env = env.inner().clone();
-    blocking(move || s(inventory::list_apps(&env, include_hidden))).await
+    let apps = blocking(move || s(inventory::list_apps(&env, include_hidden))).await?;
+    // extend, not replace: ids from an earlier hidden list keep working
+    icons.get().apps.extend(apps.iter().map(|a| (a.id.clone(), a.clone())));
+    Ok(apps)
+}
+
+/// The program's icon as a PNG data URL, or None (the UI keeps the letter tile). Read-only: icon resources are read as data.
+#[tauri::command]
+async fn app_icon(env: State<'_, Env>, icons: State<'_, IconSlot>, id: String) -> Res<Option<String>> {
+    let env = env.inner().clone();
+    let icons = icons.inner().clone();
+    blocking(move || {
+        let Some(app) = icons.get().apps.get(&id).cloned() else { return Ok(None) };
+        let Some(src) = icon::source(&app, &env) else { return Ok(None) };
+        if let Some(url) = icons.get().urls.get(&src) {
+            return Ok(url.clone());
+        }
+        let url = icon::extract(&src.0, src.1).map(|b| format!("data:image/png;base64,{}", STANDARD.encode(b)));
+        icons.get().urls.insert(src, url.clone());
+        Ok(url)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -364,9 +406,11 @@ fn main() {
         .manage(StopFlag(Arc::new(AtomicBool::new(false))))
         .manage(TraceSlot(Mutex::new(TraceState::default())))
         .manage(ForceSlot(Mutex::new(None)))
+        .manage(IconSlot::default())
         .invoke_handler(tauri::generate_handler![
             app_info,
             list_apps,
+            app_icon,
             describe_app,
             preview_plan,
             export_plan,
