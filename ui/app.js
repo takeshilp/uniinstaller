@@ -202,7 +202,7 @@ views.card = () => {
       : `<div class="strip warn"><span>${esc(S.traceUntrusted(fmtDate(d.trace.createdMs), S.distrust[d.trace.distrust] || d.trace.distrust))}</span></div>`) : '';
   const hid = a.hidden ? `<div class="strip warn"><span>${esc(S.hiddenCard(S.hiddenReason[a.hidden] || a.hidden))}</span></div>` : '';
   const html = `<div class="col">${back}
-    <div class="head" style="justify-content:flex-start;align-items:center;gap:20px">
+    <div class="head" style="justify-content:flex-start;align-items:center;gap:20px;flex-wrap:nowrap">
       ${appTile(a, 'lg')}
       <div><h1 class="display" style="font-size:40px">${esc(a.displayName)}</h1><p class="subtitle" style="margin-top:6px">${sub || '—'}</p></div></div>
     ${hid}${warn}${err}${tr}
