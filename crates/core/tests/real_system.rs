@@ -183,3 +183,55 @@ fn real_system_icons() {
     );
     assert!(hits > 0);
 }
+
+/// Read-only: the real machine's services and scheduled tasks as the leftover scan sees them. Prints the elevation, the service type
+/// counts, the milliseconds of `services()` and `tasks()`, the third-party services whose key cannot be captured (an unreadable
+/// `Security` subkey without admin), the task counts, and every service or task candidate in the dry run of every listed program
+/// (hidden ones too) with its tier, score and blocks. Asserts that none of them is preselected.
+/// `cargo test -p uni-core --test real_system real_system_services_tasks -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real registry, the service manager and the task scheduler"]
+fn real_system_services_tasks() {
+    use uni_core::model::Target;
+    use uni_core::{registry, sysobj};
+    let env = Env::system().unwrap();
+    println!("elevated: {}", uni_core::elevation::is_elevated());
+    let t = Instant::now();
+    let svcs = sysobj::services(&env).unwrap();
+    let ms_services = t.elapsed().as_millis();
+    let count = |f: &dyn Fn(&sysobj::Svc) -> bool| svcs.iter().filter(|s| f(s)).count();
+    println!(
+        "services: {} keys in {ms_services} ms: {} drivers, {} Win32, {} per-user, {} without ImagePath, {} with ServiceDll, {} marked for deletion",
+        svcs.len(),
+        count(&|s| s.kind & sysobj::TYPE_DRIVERS != 0),
+        count(&|s| s.kind & sysobj::TYPE_WIN32 != 0),
+        count(&|s| s.kind & sysobj::TYPE_USER != 0),
+        count(&|s| s.image.is_empty()),
+        count(&|s| s.dll.is_some()),
+        count(&|s| s.marked),
+    );
+    let win = env.folders.windows_dir.to_string_lossy().to_lowercase();
+    let third: Vec<&sysobj::Svc> = svcs.iter().filter(|s| s.kind & sysobj::TYPE_WIN32 != 0 && !s.image.is_empty() && !s.image.trim_start_matches('"').to_lowercase().starts_with(&win)).collect();
+    let unreadable: Vec<String> = third.iter().filter(|s| registry::capture(&env.services.child(&s.name)).is_err()).map(|s| s.name.clone()).collect();
+    println!("third-party Win32 services: {}, whose key cannot be captured: {} {unreadable:?}", third.len(), unreadable.len());
+    let t = Instant::now();
+    let tasks = sysobj::tasks(&env).unwrap();
+    let ms_tasks = t.elapsed().as_millis();
+    let ms = tasks.iter().filter(|t| sysobj::is_windows_task(&t.path)).count();
+    println!("tasks: {} in {ms_tasks} ms: {ms} under \\Microsoft, {} elsewhere, {} with non-exec actions", tasks.len(), tasks.len() - ms, tasks.iter().filter(|t| t.other > 0).count());
+
+    let t = Instant::now();
+    let apps = list_apps(&env, true).unwrap();
+    let mut found = 0;
+    for a in &apps {
+        let Ok(plan) = ops::preview(&env, &a.id) else { continue };
+        for c in plan.candidates.iter().filter(|c| matches!(c.target, Target::Service { .. } | Target::Task { .. })) {
+            found += 1;
+            let mut b: Vec<String> = c.blocks.iter().map(|b| format!("{:?}: {}", b.code, b.detail)).collect();
+            b.sort();
+            println!("candidate\t{}\t{}\t{:?}\t{}\t{}\t{}", a.display_name, c.id, c.tier, c.score, c.selected, b.join(" | "));
+            assert!(!c.selected, "a service or task is preselected: {}", c.id);
+        }
+    }
+    println!("{} programs scanned, {found} service or task candidates, {} ms", apps.len(), t.elapsed().as_millis());
+}
