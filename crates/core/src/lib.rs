@@ -11,6 +11,7 @@ pub mod ops;
 pub mod paths;
 pub mod scan;
 pub mod registry;
+pub mod rm;
 pub mod sandbox;
 pub mod safety;
 pub mod shortcuts;

@@ -235,3 +235,40 @@ fn real_system_services_tasks() {
     }
     println!("{} programs scanned, {found} service or task candidates, {} ms", apps.len(), t.elapsed().as_millis());
 }
+
+/// Read-only: the Restart Manager's answer for files this machine holds open. `NTUSER.DAT` is always held by system processes; paths
+/// in `UNI_LOCK_PATHS` (`;`-separated) are printed too. Never closes anything.
+#[test]
+#[ignore = "asks the real Restart Manager (read-only)"]
+fn real_system_lock_holders() {
+    use uni_core::model::{HolderBlock, HolderKind};
+    use uni_core::rm;
+    let ntuser = PathBuf::from(std::env::var("USERPROFILE").unwrap()).join("NTUSER.DAT");
+    let t = Instant::now();
+    let (hs, reasons) = rm::holders(std::slice::from_ref(&ntuser)).unwrap();
+    println!("NTUSER.DAT: {} ms, reasons {reasons:#x}", t.elapsed().as_millis());
+    for h in &hs {
+        println!("  holder pid {} {:?} image {:?} kind {:?} -> {:?}", h.pid, h.name, h.image, h.kind, rm::block(h, std::process::id(), &[]));
+    }
+    assert!(!hs.is_empty());
+    assert!(hs.iter().all(|h| h.kind == HolderKind::Critical));
+    assert!(hs.iter().all(|h| rm::block(h, std::process::id(), &[]) == Some(HolderBlock::Critical)));
+    for p in std::env::var("UNI_LOCK_PATHS").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
+        let p = PathBuf::from(p);
+        let t = Instant::now();
+        let kind = if p.is_dir() { uni_core::model::PathKind::Dir } else { uni_core::model::PathKind::File };
+        let b = rm::blockers(&p, kind, rm::MAX_PROBE);
+        let probe_ms = t.elapsed().as_millis();
+        let t = Instant::now();
+        let r = if b.files.is_empty() { Ok((vec![], 0)) } else { rm::holders(&b.files) };
+        println!("{}: probe {probe_ms} ms ({} files, {} folders, truncated {}), RM {} ms", p.display(), b.files.len(), b.folders, b.truncated, t.elapsed().as_millis());
+        match r {
+            Ok((hs, reasons)) => {
+                for h in &hs {
+                    println!("  holder pid {} {:?} image {:?} kind {:?} -> {:?} (reasons {reasons:#x})", h.pid, h.name, h.image, h.kind, rm::block(h, std::process::id(), &[]));
+                }
+            }
+            Err(e) => println!("  error: {e}"),
+        }
+    }
+}

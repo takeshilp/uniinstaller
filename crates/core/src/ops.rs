@@ -234,6 +234,7 @@ fn create(env: &Env, app: InstalledApp, launch: Launch, forced: Option<Forced>) 
         status: OpStatus::Running,
         status_detail: None,
         forced,
+        continue_after_reboot: None,
     };
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
@@ -796,6 +797,7 @@ mod tests {
             schema: 1, id: "op-1".into(), created_ms: 1, app: app(),
             launch: Launch { raw: String::new(), exe: PathBuf::new(), args: String::new(), argv: vec![], msi_product: None },
             native, entry_after: entry, plan: None, items, empty_dirs_removed: vec![], verify: None, status: OpStatus::Running, status_detail: None, forced: None,
+            continue_after_reboot: None,
         }
     }
 

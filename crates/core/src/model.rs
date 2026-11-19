@@ -410,6 +410,77 @@ pub struct Operation {
     /// (0.2.0, hidden-apps) ignore it and list the operation as a normal one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced: Option<Forced>,
+    /// When the operation started waiting for a restart (ms): its uninstaller asked for one, or the user asked to retry locked items after
+    /// one. Absent otherwise, so other manifests stay byte-identical and older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_after_reboot: Option<u64>,
+}
+
+/// A process that has a file of a locked item open, as the Restart Manager reports it. Transient: never stored in a manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Holder {
+    pub pid: u32,
+    /// Creation time as a FILETIME; with the pid it is the process identity (a reused pid is another process).
+    pub started: u64,
+    pub name: String,
+    pub image: String,
+    pub service: Option<String>,
+    pub kind: HolderKind,
+    pub block: Option<HolderBlock>,
+}
+
+/// The Restart Manager's application type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HolderKind {
+    MainWindow,
+    OtherWindow,
+    Service,
+    Explorer,
+    Console,
+    Critical,
+    Unknown,
+}
+
+/// Why Uniinstaller will not close a holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HolderBlock {
+    Ours,
+    Uninstaller,
+    Critical,
+    Service,
+    Explorer,
+    Console,
+    NeedsForce,
+}
+
+/// Who holds the files of one locked item. Transient: never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemHolders {
+    pub candidate_id: String,
+    /// Blocking files found.
+    pub files: usize,
+    /// Blocking folders found (a folder that is open cannot be named by the Restart Manager).
+    pub folders: usize,
+    pub truncated: bool,
+    pub holders: Vec<Holder>,
+    /// `RmRebootReason` bits; non-zero means only a restart frees the item.
+    pub reasons: u32,
+    pub error: Option<String>,
+}
+
+/// The result of closing the confirmed holders and retrying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Closed {
+    pub op: Operation,
+    pub closed: Vec<Holder>,
+    pub still_running: Vec<Holder>,
+    pub shutdown_error: Option<String>,
+    pub restart_error: Option<String>,
 }
 
 /// What is stored on a forced operation: only what the scan needs again. Absent on every other operation.

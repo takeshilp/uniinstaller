@@ -59,7 +59,7 @@ impl Drop for Tracked {
     }
 }
 
-fn ft(f: FILETIME) -> u64 {
+pub(crate) fn ft(f: FILETIME) -> u64 {
     ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
 }
 
@@ -99,13 +99,12 @@ fn mark_exits(t: &mut [Tracked]) {
     }
 }
 
-/// Adds processes whose parent is tracked and which were created after it (and, if the parent already exited,
-/// before it exited). Returns whether anything new was added.
-fn add_descendants(t: &mut Vec<Tracked>) -> bool {
-    let mut found: Vec<(u32, u32, String)> = Vec::new();
+/// Every running process as (pid, parent pid, image name), from one Toolhelp snapshot; empty if the snapshot fails.
+pub(crate) fn processes() -> Vec<(u32, u32, String)> {
+    let mut found = Vec::new();
     // SAFETY: Toolhelp snapshot walk with a properly sized entry; the snapshot handle is closed.
     unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return false };
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return found };
         let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
         let mut ok = Process32FirstW(snap, &mut e).is_ok();
         while ok {
@@ -115,8 +114,14 @@ fn add_descendants(t: &mut Vec<Tracked>) -> bool {
         }
         let _ = CloseHandle(snap);
     }
+    found
+}
+
+/// Adds processes whose parent is tracked and which were created after it (and, if the parent already exited,
+/// before it exited). Returns whether anything new was added.
+fn add_descendants(t: &mut Vec<Tracked>) -> bool {
     let mut added = false;
-    for (pid, ppid, image) in found {
+    for (pid, ppid, image) in processes() {
         if t.iter().any(|p| p.pid == pid) {
             continue;
         }
