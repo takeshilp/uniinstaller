@@ -147,3 +147,24 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 - Verified: `hidden_app_is_another_app` (`tests/scan.rs`) failed at its first `shared(...)` assert with `[]` and `apply_sees_hidden_apps` (`tests/ops.rs`) with
   `left: Removed, right: Blocked` before the fix. Real data before and after (94 programs, 2228 lines): one candidate changed, PowerToys' settings folder Weak to
   Blocked. Lab run 20261119-000039: `shared-suite-hidden` PASS and its Candidates table equal to `shared-suite`.
+
+## Forced removal: the language folders of Windows components appear and vanish right after an MSI install (lab `force-msi-bare`)
+- Symptom: the first run of `force-msi-bare` (a scenario that must change nothing, the force check says `listed:installer`) was FAIL "a failed begin changed the system (6 differences)":
+  `...\Windows Media Player\en-us`, `...\Windows NT\TableTextService\ru-ru`, `...\Windows Defender Advanced Threat Protection\en-us`, `...\Common Files\Microsoft Shared\MSInfo\ru-ru`
+  (both Program Files folders). It repeated on a second run (runs 20261119-124815 and the single-scenario rerun); a later full run (20261119-125520) did not show it.
+- Cause: not the product (`uni-lab force` exits 3 right after the read-only check). These are the unreadable language folders the guest inventory already lists as `e` lines (see "Lab observations");
+  right after an MSI install the inventory lists them as folders in `s1` and not at all in `s5`.
+- Fix: the s1/s5 comparison of an `expect_force` scenario (`analyze.ps1`, rule 16e) skips ids the inventory reported as unreadable. Re-analysing the same run: PASS.
+- Verified: `lab/analyze.ps1 -RunDir` on the failing run gave PASS; the other three `force-*` scenarios were unaffected.
+
+## Scenario JSON written through a shell heredoc loses its backslashes
+- Symptom: the first lab run of the four `force-*` scenarios ended ERROR for all of them: "analyzer failed: Unrecognized escape sequence" while reading `scenario.json`.
+- Cause: the files had been created with `cat <<EOF` from an agent shell that halves every double backslash, so the JSON string `"{LOCALAPPDATA}\\Programs"` became `"{LOCALAPPDATA}\Programs"` (an invalid escape); the guests ran against the broken copy and did nothing useful.
+- Fix: write scenario files with a file-writing tool and check them with `python -c "import json,sys; json.load(open(sys.argv[1]))" <file>` before a lab run.
+
+## Forced removal: the component scan is slow in a debug build
+- Symptom: the read-only probe took 9 to 14 s per check that reached the Windows Installer rule (budget 3 s) on the owner's machine (25,087 component keys, 25,418 values).
+- Cause: `winreg` and `windows` are unoptimised in the dev profile; the same code takes 1.8 s in a release build (2.3 to 2.7 s for a whole check). Opening the component keys with `KEY_QUERY_VALUE` instead of `KEY_READ`
+  and decoding the enumerated values instead of reading each one again saved about 15 %.
+- Fix: none beyond that; the shipped app is a release build. The GUI shows a spinner while it checks. Cache the scan per session if it ever matters (shortcut 6 of "Forced removal").
+- Verified: `real_system_force_probe` on `C:\Program Files\nodejs` and `...\MSBuild`, debug 9.5 s, release 1.9 s.

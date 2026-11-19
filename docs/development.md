@@ -35,6 +35,9 @@ Seeded programs: Sandbox Notes (full flow), Sandbox Suite (shared and foreign-un
 installed), Sandbox Orphan (batch uninstaller leaves its key), Sandbox Broken (launch error). "Sandbox System Component" is hidden and has no uninstall
 command, so it appears only with "Показать скрытые". To walk the hidden flow on Notes, hide it first:
 `reg add "HKCU\Software\uniinstaller-tests\sandbox\Uninstall\SandboxNotes" /v SystemComponent /t REG_DWORD /d 1 /f` (and the same for `Uninstall32`).
+"Sandbox Portable" (folder `users\me\AppData\Local\Programs\Sandbox Portable`, no Uninstall entry; an `unins000.cmd`, a Start Menu link, a Run value, a settings folder and a key name it) is the demo for
+"Удалить по пути". Read-only probe of the owner's machine for the identity check (nothing is run, version info is read as data; `%VAR%` is expanded):
+`UNI_FORCE_PATHS='C:\Program Files\MPV;D:\2Programs' cargo test -p uni-core --test real_system real_system_force_probe -- --ignored --nocapture`.
 Demo installer for install tracing: `<root>\installers\sandbox-traced-setup.cmd` (and `sandbox-traced-uninstall.cmd`), written by `sandbox-seed`. It
 installs "Sandbox Traced" under `pf\Trace Soft`, adds settings (with a `Cache` folder), a hidden component (`SandboxTracedRuntime`), an App Paths key, a Run value and
 vendor values, overwrites four values that exist before it runs (Run `SandboxTraced`, App Paths `shared-tool.exe`, `Shared Soft\Common|Handler`, and Sandbox
@@ -81,6 +84,10 @@ result with an independent inventory (recall, false deletions, restore, resume a
 
 - Hidden scenarios: `hidden-user` (per-user NSIS app with `SystemComponent=1`, expected PASS, 0 false deletions, restore ok) and `shared-suite-hidden`
   (`shared-suite` with the nested plugin hidden, expected PASS with the same Candidates table as `shared-suite`; before the anchor change it was FAIL).
+- Forced-removal scenarios (`force-portable`, `force-broken`, `force-msi-bare`, `force-service`, manifest keys `force: { path, name, publisher, run }` and `expect_force`, action `delkey`):
+  `force-portable` installs an NSIS app built with `NOARP` (no uninstaller, no Uninstall entry) and removes it by path without running anything (PASS, 7 leftovers found, 0 false
+  deletions, restore ok); `force-broken` deletes the Uninstall key after the install and runs the found `uninstall.exe` (PASS, 5 found); `force-msi-bare` expects `listed:installer` and
+  `force-service` `refused:service` (rule 16e). A RISK or FAIL is a product finding, never fixed by editing the manifest.
 - Trace scenarios (`trace-machine`): the app is installed by `uni-lab trace` between two product snapshots, so the journal and the inventory are compared
   independently (rules 15a-15f and 17 in `docs/architecture.md`). Expected: PASS, 3 reverted values, 0 false deletions, `{PF86}\Other Updater` offered at
   Review and not selected, no revert for the unrelated `LastCheck` value. A RISK or FAIL is a product finding, never fixed by editing the manifest.
@@ -129,6 +136,12 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
 - Hidden programs in the GUI (sandbox only, ПЕСОЧНИЦА pill): hide Notes with the `reg add` lines above, then: Notes is absent; tick "Показать скрытые" and Notes and
   "Sandbox System Component" appear with the "СКРЫТАЯ" pill; the Notes card shows the warning strip; "Запустить деинсталлятор" opens the dialog with the run
   button disabled; tick the confirmation and it is enabled; run, review, "Удалить выбранное", "Восстановить всё". Verified on 2026-11-19 with UI Automation: all of the above, Run disabled until the box is ticked; the restore returned everything.
+- Forced removal in the GUI (sandbox only, ПЕСОЧНИЦА pill): "Удалить по пути" -> "Выбрать программу…" -> the native dialog (drive it with UI Automation: it is a child `Window` of the app
+  window; the file-name box is a `ComboBoxEx32` > `Edit` with automation id 1148 (1152 in the folder dialog) that answers `WM_SETTEXT` but not `ValuePattern`, and "Открыть" answers
+  `BM_CLICK`) -> `...\Local\Programs\Sandbox Portable\portable.exe`. The confirm screen suggests "portable" (no version info), shows `unins000.cmd` unselected and the run button
+  disabled until it or "Не запускать" is chosen; run, review (forced strip, nothing ticked), tick the groups (Weak rows need their own tick), "Удалить выбранное", the result
+  with the ПРИНУДИТЕЛЬНО pill, "Восстановить всё". Also: the folder dialog on the same folder, `pf\Sandbox Soft\Shared Tool` (Listed folder, "Открыть программу" opens its card),
+  Sandbox Notes' `resources` (Listed inside, no open button), `pf` and the sandbox root (refused). Verified on 2026-11-19, see `docs/bugs.md`. UI Automation names of buttons with an icon glyph start with the glyph: match by suffix.
 - Running screen with a slow uninstaller and "Не ждать дальше".
 - Mark-of-the-Web on an installer (NOT run by the agent: it can pop a security dialog on the desktop). In the sandbox GUI: write
   `Set-Content -LiteralPath "<sandbox>\installers\sandbox-traced-setup.cmd" -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"`, trace the

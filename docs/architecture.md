@@ -4,7 +4,7 @@
 `crates/core` (`uni_core`): `model` (serde types), `env` (Env, Folders, sandbox), `paths` (normalisation, canonical form, file id,
 walk, move/restore), `safety` (protected paths, registry shapes, tiers), `registry` (view-aware access, capture, restore),
 `inventory` (list apps, hidden entries, entry state), `command` (UninstallString to Launch), `native` (run uninstaller, process tree), `shortcuts` (.lnk),
-`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see Lab). `src-tauri`: Tauri commands.
+`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals), `force` (forced removal by path). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see Lab). `src-tauri`: Tauri commands.
 
 ## Pipeline
 `describe` parses the uninstall command; `begin` records the pre-uninstall snapshot; `run_native` runs the vendor uninstaller and waits for
@@ -32,6 +32,10 @@ trace types `Print`, `Change`, `TraceChange`, `TraceJournal`, `TraceLink`, `Trac
 the new variants as `Broken`.
 `InstalledApp.hidden` (`HiddenReason`, `serde(default, skip_serializing_if = "Option::is_none")`) marks an entry Apps & Features hides; visible
 programs serialize byte-identically, so there is no schema bump and 0.2.0 ignores the field.
+`Operation.forced` (`Forced { picked, folder, search_names }`, `serde(default, skip_serializing_if = "Option::is_none")`) marks a forced removal; normal manifests stay
+byte-identical, there is no schema bump and no new `OpStatus` (0.2.0 and the hidden-apps build ignore the field, list the operation as a normal one and can restore it).
+Downgrade: 0.2.0 lists a forced operation as a normal one and can restore it, but a rescan there treats the folder as corroborated (the found uninstaller sits in it)
+and preselects shortcuts and Run values; do not rescan forced operations in an older version.
 Statuses: ItemStatus InProgress, Removed, NotFound, Changed, Blocked, AccessDenied, Locked, Failed, Reverted; RestoreStatus Restored, Conflict,
 Missing, Failed; OpStatus Running, AwaitingReview, Completed, CompletedWithWarnings, PendingReboot, PartiallyCompleted, Failed, Restored,
 PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress counts as a problem).
@@ -151,6 +155,46 @@ wait and stop flag as an uninstall); `finish` streams the "after" capture throug
 - Lab proof: `shared-suite-hidden` (the nested plugin hidden) was FAIL before the change (run 20261118-235415, 7 unblocked offers removed) and PASS after
   (run 20261119-000039).
 
+## Forced removal (`force.rs`, `ops::begin_forced`)
+Purpose: remove a program the program list does not know (portable drops, broken installs, leftovers of a failed uninstall) by a path the user picks, without ever
+treating a path as a program that something else owns. The GUI entry is "Удалить по пути" (file dialog for an exe or a folder; shortcuts are resolved by the dialog itself).
+- Target. A stand-in `InstalledApp` (`force::app_for`: id `force:<norm(picked)>`, no sources, `install_location` = the folder, the picked exe as `display_icon` for a
+  file-only pick) plus `Operation.forced`. `Operation.launch` is the found uninstaller, or the empty placeholder (`exe` empty) when none is chosen: `ops::skips_native`
+  (forced and empty exe) makes `overall_status` and `scan_leftovers` work without a native run, `run_native` refuses an empty launch. `ForceCheck` (`Ok{found}`, `Listed{app, how}`,
+  `Refused{code, detail}`) is only a message for the confirm screen and is never stored; `begin_forced` re-runs `check` and takes only the confirmed name, publisher
+  and one of the uninstallers the check found.
+- `force::check` rules, in order (every refusal is a result, `Err` only for an unexpected read failure): 1 sanity (local absolute path, inside the sandbox folder in
+  sandbox mode, exists, no reparse point, canonical, an `.exe` or a folder; a `.lnk` is `BadPath`); 2 the folder the pick stands for (a folder pick is its own; an exe
+  stands for its folder only when that folder is not a root and holds no other program: no other exe besides `unins*`, or every other exe has the same ProductName, else
+  file-only); 3 another user's profile; 4 a listed program (hidden included) whose folder (`InstallLocation`, else the uninstaller's folder when the icon sits in it) is
+  the pick (`Listed Folder`) or holds it (`Listed Inside`), deepest wins, a tie is `OtherPrograms`; 5 the InstallLocation gate (`scan::dir_problem`); 6 TrustedInstaller
+  ownership of the pick and its folder (unreadable owner refuses); 7 `Anchors::covering` (the pick equals or holds another program's files, folder or settings);
+  8 an Uninstall key outside the list whose InstallLocation, icon or uninstall command points into the pick and whose uninstaller exists (`Installed`; a key with a missing
+  uninstaller is ignored); 9 Windows Installer component registrations (`Env::installer_data`) at or below the pick, or in a folder that holds it (never a root): any product
+  not in the list is `Installed`, one listed program is `Listed Installer`, several are `OtherPrograms`; 10 a shortcut to the pick named after a listed program
+  (`Listed Shortcut`); 11 a registered service whose `ImagePath` runs from the pick (`Service`); 12 what was found (uninstallers `unins*` directly in the folder, `.exe` in
+  the real system and `.cmd`/`.bat` in the sandbox; version info read as data; shortcuts; other volume; outside the zones; suggested name = ProductName, else the exe's
+  stem or the folder's name, never a parent folder's name).
+- Scan rules for a forced target (`scan::scan(.., forced)`): never corroborated, nothing preselected, settings folders and keys looked for only by `Forced.search_names`
+  (`force::search_names`: variants of at least `MIN_NAME` = 4 characters, or exactly the product name, the exe's stem or the picked folder's name), shortcuts and Run/App Paths
+  references anchored at the picked file for a file-only pick. Every hard block applies unchanged at scan and apply; `ops::forced_in_scope` re-checks the sandbox root at scan and apply.
+  Scores: folder child 45 (Review), shortcut 30 + exact name 20 (+ publisher 10, + missing 15), Run value or App Paths key 30 (+15), settings folder 20, settings key
+  20 + 30 when a value points into the folder, file-only picked exe 60; the group checkboxes tick Safe and Review items, Weak ones need individual ticks.
+- GUI. The confirm screen has no uninstaller preselected and keeps the run button disabled until one (or "do not run") is chosen; after a found uninstaller exits with a
+  code other than 0, times out or is stopped, the flow does not go on to the leftovers by itself (spec 3.2). The review, result and history show a "ПРИНУДИТЕЛЬНО" pill.
+- Cost. The component scan reads every `Installer\UserData\*\Components` key on each check: 25,087 keys and 25,418 values on the owner's machine, 1.8 s in a release build and
+  9 to 11 s in a debug build (about 2.3 s for a whole check in release). A cache per session is the upgrade if it gets slow.
+- Measured on the owner's machine (read-only probe `real_system_force_probe`, 2026-11-19): `C:\Program Files`, the profile and `C:\Users\Default` NotAllowed; Windows Mail and Internet
+  Explorer NotAllowed (TrustedInstaller); `C:\Program Files\MSBuild` Ok (a residual, see shortcuts); 7-Zip Listed folder; nodejs and GitHub CLI Listed installer; dotnet and Python's
+  `Scripts\f2py.exe` OtherPrograms (several MSI products); Perplexity Service; Razer and `Razer\RazerAppEngine` Listed shortcut (Razer Synapse); ASUS `AIOFanSDK` Listed inside; Steam
+  ASPIS Listed folder, Jedi Fallen Order Listed inside (Steam); MPV (folder and exe) Ok with the name `mpv`; `D:\2Programs` OtherPrograms; `D:\2Programs\Chrome` and
+  `D:\6Games\spartanport` Ok, every file candidate Blocked `OtherVolume`. A probe result that differs from the prediction is a finding, never a reason to loosen a rule.
+- Lab. `uni-lab force <path> <name> [--publisher <p>] [--run]` prints the check result and exits 3 for Listed and Refused. Rule 16 in `analyze.ps1` (forced scenarios): ERROR when
+  `op-begin.json` has no `forced`, FAIL for any selected candidate, FAIL when `op-apply.json` lost `forced`, FAIL when a run-less operation has a `native`; rule 16e: `expect_force`
+  (`listed:<how>` or `refused:<code>`) must match and the system must be unchanged (the 1-to-5 snapshot comparison ignores the unreadable language folders the inventory lists
+  unstably right after an MSI install). Scenarios: `force-portable` (NSIS `NOARP`, nothing run, 7 leftovers found, 0 false deletions, restore ok), `force-broken` (Uninstall key
+  deleted after install, the found `uninstall.exe` is run, 5 leftovers found), `force-msi-bare` (`listed:installer`) and `force-service` (`refused:service`).
+
 ## Lab (`crates/lab`, `lab/`)
 The lab runs real installers and the real `uni_core::ops` flow inside Windows Sandbox. Nothing in `crates/core` changed for it.
 - `uni-lab` commands: `check`, `list`, `begin <app>`, `native <op>`, `scan <op>`, `apply <op> default|unblocked [--crash-after-first-move]`,
@@ -255,4 +299,23 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
   another app and rejects the shared folder (fail closed). Merge it if such twins show up as leftovers.
 - Hidden confirmation (`ops.rs`): every hidden entry gets the same single confirmation, no publisher or bundle check (runtimes, Burn packages, the WebView2
   Runtime); add per-kind warnings if users remove runtimes by mistake.
+- Forced removal (`force.rs`, one comment per item in the code):
+  1. No window picking ("Hunter mode"): a WebView cannot be a drag target over other windows; pick the exe instead, add a picker with a native overlay.
+  2. Uninstallers are found only by `unins*` names directly in the folder; deeper folders and other names (`remove.exe`, `setup.exe /uninstall`) are missed, widen this if users report misses.
+  3. A folder inside a listed program's folder is refused (`ListedHow::Inside`): plugins and mods dropped into a host cannot be forced.
+  4. Unlisted Uninstall keys whose uninstaller is gone are ignored; adopt them as the target's own entry if they show up as leftovers.
+  5. Services refuse the pick (the services feature will offer removal instead); `ServiceDll` (svchost) services, drivers given as `\SystemRoot\...` and scheduled tasks are not checked.
+  6. The MSI component scan reads every component key on each check; cache it per session if it gets slow.
+  7. Version info uses the first translation only; the main exe is the single exe in the folder or the one whose stem equals the folder's name.
+  8. The identity check runs at begin; a program installed later around the folder is seen only by the usual scan and apply blocks.
+  9. File-only identity has no neighbouring files; references are matched to the exact file only.
+  10. A forced folder on another drive: every file candidate is Blocked `OtherVolume` (the existing shortcut above), and most portable programs on the owner's machine are on `D:`.
+  11. The name rule runs at begin only; the GUI hint is static and the review strip says when name search was skipped.
+  12. A listed program that owns the pick through none of its folder, its MSI components or a same-named shortcut is not seen.
+  13. TrustedInstaller is checked on the pick and its folder only; SYSTEM-owned tool folders such as `C:\Program Files\MSBuild` pass; an unreadable owner refuses.
+  14. The upward MSI rule claims a whole folder for one file (fail closed).
+  15. An exe widens to its folder only with no other exe or the same ProductName; otherwise file-only, and outside the zones the file itself is then Blocked `OutsideAllowedZone`.
+  16. Shortcuts are resolved by the file dialog only; core accepts an `.exe` or a folder.
+  17. The clean-exit gate sees only the launcher's exit code (an NSIS uninstaller copies itself and the launcher exits 0).
+  18. Lab, `force-*`: the 1-to-5 comparison of an `expect_force` scenario skips folders the inventory could not read; the real data shapes of the SCM and Windows Installer checks are proven by `force-service` and `force-msi-bare` only for one product each.
 - Lab, analyzer: `analyze.ps1` has no unit tests; its rules are checked against the scenario verdicts, add a synthetic-run self-test if the rules change often.
