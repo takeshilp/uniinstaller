@@ -636,7 +636,7 @@ function renderModal() {
     const hs = state.closeList || [];
     m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
       <h2 id="mt">${esc(S.confirmCloseTitle(hs.length))}</h2>
-      <div class="cmd">${hs.map((h) => esc(`${holderName(h)} — ${h.image}, PID ${h.pid}`)).join('<br>')}</div>
+      <div class="cmd">${hs.map((h) => esc(`${holderName(h)}${h.image && h.image !== holderName(h) ? ` — ${h.image}` : ''}, PID ${h.pid}`)).join('<br>')}</div>
       <div class="muted">${S.confirmCloseNote}</div>
       <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
       <button class="btn primary" data-act="modal-close-go">${S.closeGo}</button></div></div></div>`;
