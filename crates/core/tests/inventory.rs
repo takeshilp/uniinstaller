@@ -1,5 +1,6 @@
 mod common;
 use common::Fixture;
+use uni_core::icon;
 use uni_core::inventory::{self, list_apps};
 use uni_core::model::*;
 use uni_core::registry;
@@ -108,4 +109,17 @@ fn hidden_entries_listed_on_request() {
     assert_eq!(suites[0].sources.len(), 1);
     assert!(serde_json::to_value(suites[0]).unwrap().get("hidden").is_none(), "no hidden field for a visible program");
     assert_eq!(inventory::find_app(&f.env, "HKCU64:SandboxSystemComponent").unwrap().hidden, Some(HiddenReason::SystemComponent));
+}
+
+/// The sandbox programs point at fake files and system tools, so no icon comes out and the GUI keeps the letter tile without an error.
+#[test]
+fn sandbox_programs_keep_the_letter() {
+    let f = Fixture::new();
+    let apps = list_apps(&f.env, true).unwrap();
+    for a in &apps {
+        let got = icon::source(a, &f.env).and_then(|(p, i)| icon::extract(&p, i));
+        assert!(got.is_none(), "{} got an icon", a.display_name);
+    }
+    let notes = apps.iter().find(|a| a.display_name == "Sandbox Notes").unwrap();
+    assert_eq!(icon::source(notes, &f.env), Some((uni_core::sandbox::notes_dir(&f.env).join("Sandbox Notes.exe"), 0)));
 }

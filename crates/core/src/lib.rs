@@ -3,6 +3,7 @@ pub mod command;
 pub mod elevation;
 pub mod env;
 pub mod force;
+pub mod icon;
 pub mod inventory;
 pub mod model;
 pub mod native;

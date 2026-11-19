@@ -1,6 +1,10 @@
 //! Read-only checks against the real machine. Run with:
 //! `cargo test -p uni-core --test real_system -- --ignored --nocapture`
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Instant;
 use uni_core::env::Env;
+use uni_core::icon;
 use uni_core::inventory::list_apps;
 use uni_core::model::Tier;
 use uni_core::ops;
@@ -146,4 +150,36 @@ fn real_system_force_probe() {
             }
         }
     }
+}
+
+/// Read-only: extracts the icon of every listed program (hidden ones too) with the GUI's per-file cache, and prints the programs that
+/// have a DisplayIcon but got none. Budget: all programs in at most 3 s on one thread (the GUI asks 4 at a time after the list is shown).
+/// `cargo test -p uni-core --test real_system real_system_icons -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real registry and file system"]
+fn real_system_icons() {
+    let env = Env::system().unwrap();
+    let apps = list_apps(&env, true).unwrap();
+    let mut cache: HashMap<(PathBuf, i32), Option<Vec<u8>>> = HashMap::new();
+    let (mut hits, mut vhits) = (0, 0);
+    let t = Instant::now();
+    for a in &apps {
+        let src = icon::source(a, &env);
+        let got = src.as_ref().and_then(|s| cache.entry(s.clone()).or_insert_with(|| icon::extract(&s.0, s.1)).clone());
+        if got.is_some() {
+            hits += 1;
+            vhits += usize::from(a.hidden.is_none());
+        } else if let Some(d) = &a.display_icon {
+            println!("letter: {} ({d} -> {:?})", a.display_name, src.map(|s| s.0));
+        }
+    }
+    let ms = t.elapsed().as_millis();
+    let visible = apps.iter().filter(|a| a.hidden.is_none()).count();
+    println!(
+        "{} programs ({visible} visible): {hits} icons ({vhits} visible), {} letters, {} distinct sources, {ms} ms",
+        apps.len(),
+        apps.len() - hits,
+        cache.len()
+    );
+    assert!(hits > 0);
 }
