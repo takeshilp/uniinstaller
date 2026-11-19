@@ -4,7 +4,7 @@
 `crates/core` (`uni_core`): `model` (serde types), `env` (Env, Folders, sandbox), `paths` (normalisation, canonical form, file id,
 walk, move/restore), `safety` (protected paths, registry shapes, tiers), `registry` (view-aware access, capture, restore),
 `inventory` (list apps, hidden entries, entry state), `command` (UninstallString to Launch), `native` (run uninstaller, process tree), `shortcuts` (.lnk),
-`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals), `force` (forced removal by path). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see docs/lab.md). `src-tauri`: Tauri commands.
+`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals), `force` (forced removal by path), `icon` (program icons for the GUI: DisplayIcon or uninstaller exe read as data, 64 px PNG). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see docs/lab.md). `src-tauri`: Tauri commands.
 
 ## Pipeline
 `describe` parses the uninstall command; `begin` records the pre-uninstall snapshot; `run_native` runs the vendor uninstaller and waits for
@@ -40,6 +40,17 @@ Statuses: ItemStatus InProgress, Removed, NotFound, Changed, Blocked, AccessDeni
 Missing, Failed; OpStatus Running, AwaitingReview, Completed, CompletedWithWarnings, PendingReboot, PartiallyCompleted, Failed, Restored,
 PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress counts as a problem).
 
+## Program icons
+- `icon::source(app, env)`: the DisplayIcon file and index (`path[,index]`, negative = resource id) when it is a local existing file, else the uninstaller when it is an `.exe`
+  outside the Windows folder (never msiexec, rundll32 or another system binary); otherwise None and the GUI keeps the letter tile. UNC values are skipped so the list never
+  touches a network share. `inventory::icon_path` is not changed (scan, force and trace use it).
+- `icon::extract(path, index)`: `SHDefExtractIconW` (64 px, loads the file as data, never runs it, no COM) then `GetIconInfo` + `GetDIBits` to BGRA, alpha from the AND mask
+  for legacy icons without alpha, RGBA PNG through the `png` crate; every GDI handle is freed.
+- GUI: `list_apps` remembers the apps by id (`IconSlot`), the new command `app_icon(id)` returns a PNG data URL (session cache by file and index); the JS queue fetches
+  4 at a time in page order after each render, an error or None keeps the letter. The CSP was unchanged (`img-src 'self' data:` already allowed it). History rows keep the letter.
+- Measured on the owner's machine, 2026-11-19 (`real_system_icons`, debug build, one thread): 282 programs (94 visible), 103 icons (75 visible), 179 letters, 89 distinct
+  sources, 1.4 s. Every entry with a DisplayIcon got an icon. Discord (`Update.exe`) and rustup (`rustup.exe`) have no icon resources at all, so they keep the letter.
+
 See docs/safety.md.
 
 See docs/tracing.md.
@@ -71,7 +82,8 @@ See docs/lab.md.
 - Reboot (`ops.rs`): "rebooted since" from uptime only.
 - Concurrency (`ops.rs`): `OP_LOCK` is per process.
 - MSI with empty InstallLocation (`scan.rs`): little leftover coverage.
-- Icons (`ui/app.js`): letter tile instead of the program icon.
+- Icons (`icon.rs`): MSI `ProductIcon` is not read (5 of 16 visible MSI entries without DisplayIcon) and monochrome icons get the letter.
+- Icon cache (`main.rs`): it lasts the session, an updated program shows its old icon until restart.
 - WOW64 redirection (tests): only plumbing is tested because HKCU is not redirected. The lab's `msi-bare-x86` covers HKLM 32-bit removal and restore.
 - Updater (`main.rs`, `release.yml`): no rollback; verified end to end 0.1.0 -> 0.1.1 only by hand (see `docs/development.md`).
 - Secrets at rest (`ops.rs`): manifests hold registry backups in clear text.

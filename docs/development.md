@@ -15,6 +15,7 @@ cargo test --workspace                        # fixtures only: temp dirs and HKC
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p uni-core --test real_system -- --ignored --nocapture   # read-only, real machine
 cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture   # install-trace snapshot cost: objects, ms, memory
+cargo test -p uni-core --test real_system real_system_icons -- --ignored --nocapture   # icon of every program: icons, letters, ms
 npm run tauri dev                             # GUI; always through npm, plain `cargo run` gives a blank window
 cargo run -p uni-cli -- list                  # read-only CLI on the real machine; `list --hidden` adds the SystemComponent entries
 # dry run of every program to a file (diff two dumps to see what a rule change does to real data; UNI_PREVIEW_HIDDEN=1 adds hidden entries):
@@ -44,7 +45,8 @@ vendor values, overwrites four values that exist before it runs (Run `SandboxTra
 Notes' `InstallDir`), and stands in for a background writer (`pfx86\Other Updater`, `Other Soft\Updater|LastCheck`). In sandbox mode the GUI's "Отследить установку"
 dialog starts in `installers\` and offers only `.cmd` and `.bat`; `trace::installer_launch` refuses anything else, so a real installer can never run from a sandbox GUI.
 `sandbox-clean` refuses unless the folder carries the `.uniinstaller-sandbox` marker.
-Debug builds refuse `begin`, `run_native`, `apply`, `restore` and `trace::install` for any non-sandbox environment, so `tauri dev` can never uninstall or install a real program.
+Debug builds refuse `begin`, `begin_forced`, `run_native`, `apply`, `restore` and `trace::install` for any non-sandbox environment, so `tauri dev` can never uninstall or install a real program.
+Viewing the real program list with `npm run tauri dev` (no `UNIINSTALLER_SANDBOX`) is therefore safe, for example to check icons; the update button and "Перезапустить от имени администратора" are not guarded, do not press them.
 
 ## The lab (Windows Sandbox, real installers)
 Purpose: run real installers and the product's real uninstall, scan, apply and restore flow inside Windows Sandbox and measure the
@@ -142,6 +144,8 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
   disabled until it or "Не запускать" is chosen; run, review (forced strip, nothing ticked), tick the groups (Weak rows need their own tick), "Удалить выбранное", the result
   with the ПРИНУДИТЕЛЬНО pill, "Восстановить всё". Also: the folder dialog on the same folder, `pf\Sandbox Soft\Shared Tool` (Listed folder, "Открыть программу" opens its card),
   Sandbox Notes' `resources` (Listed inside, no open button), `pf` and the sandbox root (refused). Verified on 2026-11-19, see `docs/bugs.md`. UI Automation names of buttons with an icon glyph start with the glyph: match by suffix.
+- Program icons (read-only, real list in `npm run tauri dev` without `UNIINSTALLER_SANDBOX`; sandbox mode shows letters only): verified on 2026-11-19 with UI Automation and window screenshots: 94 visible programs
+  (75 with an icon), 282 with the hidden ones (103); hidden entries without DisplayIcon keep the letter, the 7-Zip card shows the 48 px icon, Discord and rustup keep the letter (no icon resources).
 - Running screen with a slow uninstaller and "Не ждать дальше".
 - Mark-of-the-Web on an installer (NOT run by the agent: it can pop a security dialog on the desktop). In the sandbox GUI: write
   `Set-Content -LiteralPath "<sandbox>\installers\sandbox-traced-setup.cmd" -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"`, trace the
