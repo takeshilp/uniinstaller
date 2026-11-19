@@ -19,6 +19,8 @@ pub const APP_IDENTIFIER: &str = "io.github.takeshilp.uniinstaller";
 const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const RUN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
 const APP_PATHS: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+const INSTALLER_DATA: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData";
+const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
 
 #[derive(Clone, Debug, Default)]
 pub struct Folders {
@@ -34,6 +36,9 @@ pub struct Folders {
     pub windows_dir: PathBuf,
     /// Used to resolve bare exe names; real even in the sandbox.
     pub system_dir: PathBuf,
+    /// The folder that holds every user's profile, and the current user's own profile (a forced removal refuses other users').
+    pub user_profiles: Option<PathBuf>,
+    pub profile: Option<PathBuf>,
 }
 
 impl Folders {
@@ -104,6 +109,8 @@ impl Folders {
             protected_trees: trees,
             windows_dir: n["Windows"].clone(),
             system_dir: n["System"].clone(),
+            user_profiles: get("UserProfiles"),
+            profile: get("Profile"),
         })
     }
 
@@ -171,6 +178,10 @@ pub struct Env {
     pub run_roots: Vec<RegPath>,
     pub app_paths_roots: Vec<RegPath>,
     pub software_roots: Vec<RegPath>,
+    /// `...\Installer\UserData`: Windows Installer's per-user component registrations (read by `force::check`).
+    pub installer_data: RegPath,
+    /// `...\Services` (read by `force::check`).
+    pub services: RegPath,
     pub data_dir: PathBuf,
     pub sandbox: bool,
 }
@@ -190,6 +201,8 @@ impl Env {
             run_roots: both(&[(Hkcu, V64), (Hklm, V64), (Hklm, V32)], RUN),
             app_paths_roots: both(&[(Hklm, V64), (Hklm, V32), (Hkcu, V64)], APP_PATHS),
             software_roots: vec![RegPath::new(Hkcu, V64, "Software"), RegPath::new(Hklm, V64, "SOFTWARE"), RegPath::new(Hklm, V32, "SOFTWARE")],
+            installer_data: RegPath::new(Hklm, V64, INSTALLER_DATA),
+            services: RegPath::new(Hklm, V64, SERVICES),
             data_dir,
             sandbox: false,
         })
@@ -249,6 +262,8 @@ impl Env {
             run_roots: vec![k("Run", View::V64)],
             app_paths_roots: vec![k("AppPaths", View::V64)],
             software_roots: vec![k("Software", View::V64)],
+            installer_data: k("InstallerUserData", View::V64),
+            services: k("Services", View::V64),
             data_dir,
             sandbox: true,
         }

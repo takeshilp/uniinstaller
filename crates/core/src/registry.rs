@@ -62,6 +62,11 @@ fn decode_utf16(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&u).trim_end_matches('\0').to_string()
 }
 
+/// The text of an already enumerated REG_SZ / REG_EXPAND_SZ value, not expanded.
+pub fn raw_text(v: &RegValue<'_>) -> Option<String> {
+    matches!(v.vtype, RegType::REG_SZ | RegType::REG_EXPAND_SZ).then(|| decode_utf16(&v.bytes))
+}
+
 /// REG_SZ / REG_EXPAND_SZ as text; `expand` runs environment expansion (harmless on plain REG_SZ).
 pub fn read_string(k: &RegKey, name: &str, expand: bool) -> Option<String> {
     let v = k.get_raw_value(name).ok()?;

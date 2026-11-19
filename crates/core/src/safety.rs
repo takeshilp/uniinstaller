@@ -285,6 +285,8 @@ mod tests {
     fn fake() -> Folders {
         let p = |s: &str| PathBuf::from(s);
         Folders {
+            user_profiles: Some(p(r"C:\Users")),
+            profile: Some(p(r"C:\Users\me")),
             program_files: vec![p(r"C:\Program Files")],
             app_data: vec![p(r"C:\Users\me\AppData\Roaming"), p(r"C:\ProgramData")],
             start_menu: vec![p(r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"), p(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs")],

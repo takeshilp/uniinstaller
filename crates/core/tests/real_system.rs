@@ -91,3 +91,59 @@ fn real_system_snapshot_cost() {
     }
     assert!(objects < trace::MAX_OBJECTS);
 }
+
+/// Read-only: runs `force::check` (and, for an Ok result, the dry-run scan of the forced target) for each path in `UNI_FORCE_PATHS`
+/// (`;`-separated, `%VAR%` expanded) and prints the verdicts. Nothing is run: version info is read as data. Asserts that no forced
+/// candidate is preselected. `UNI_FORCE_PATHS=<paths> cargo test -p uni-core --test real_system real_system_force_probe -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real registry and file system"]
+fn real_system_force_probe() {
+    use std::collections::BTreeMap;
+    use uni_core::model::{ForceCheck, Tier};
+    let Some(list) = std::env::var_os("UNI_FORCE_PATHS") else {
+        println!("UNI_FORCE_PATHS is not set: skipped");
+        return;
+    };
+    let env = Env::system().unwrap();
+    for raw in list.to_string_lossy().split(';').filter(|p| !p.trim().is_empty()) {
+        let path = std::path::PathBuf::from(uni_core::registry::expand_env(raw.trim()));
+        let t = std::time::Instant::now();
+        let verdict = uni_core::force::check(&env, &path);
+        let ms = t.elapsed().as_millis();
+        match verdict {
+            Err(e) => println!("{}\tERROR\t{e}\t{ms} ms", path.display()),
+            Ok(ForceCheck::Refused { code, detail }) => println!("{}\tREFUSED {code:?}\t{detail}\t{ms} ms", path.display()),
+            Ok(ForceCheck::Listed { app, how }) => println!("{}\tLISTED {how:?}\t{} ({})\t{ms} ms", path.display(), app.display_name, app.id),
+            Ok(ForceCheck::Ok { found }) => {
+                let others = list_apps(&env, true).unwrap();
+                let app = uni_core::force::app_for(&found.forced, &found.name, found.publisher.as_deref(), found.file_version.as_deref());
+                let plan = uni_core::scan::scan(&env, &app, None, &others, true, None, Some(&found.forced)).unwrap();
+                let mut tiers: BTreeMap<String, usize> = BTreeMap::new();
+                let mut blocks: BTreeMap<String, usize> = BTreeMap::new();
+                for c in &plan.candidates {
+                    *tiers.entry(format!("{:?}", c.tier)).or_default() += 1;
+                    for b in &c.blocks {
+                        *blocks.entry(format!("{:?}", b.code)).or_default() += 1;
+                    }
+                    assert!(!c.selected, "a forced candidate is preselected: {}", c.id);
+                    assert!(c.tier != Tier::Safe, "a forced candidate is Safe: {}", c.id);
+                }
+                println!(
+                    "{}\tOK\tfolder={:?} name={:?} publisher={:?} version={:?} search_names={:?} uninstallers={} shortcuts={} other_volume={} outside_zones={} | dir={:?} candidates={} tiers={tiers:?} blocks={blocks:?} | {ms} ms",
+                    path.display(),
+                    found.forced.folder,
+                    found.name,
+                    found.publisher,
+                    found.file_version,
+                    found.forced.search_names,
+                    found.uninstallers.len(),
+                    found.shortcuts.len(),
+                    found.other_volume,
+                    found.outside_zones,
+                    plan.install_dir_status,
+                    plan.candidates.len(),
+                );
+            }
+        }
+    }
+}

@@ -405,6 +405,8 @@ fn debug_guard_refuses_system_env() {
     assert!(e.0.contains("sandbox"), "{e}");
     let e = ops::run_native(&env, "op-1", &opts()).unwrap_err();
     assert!(e.0.contains("sandbox"), "{e}");
+    let e = ops::begin_forced(&env, std::path::Path::new(r"C:\x"), "X", None, None).unwrap_err();
+    assert!(e.0.contains("sandbox"), "{e}");
 }
 
 
@@ -613,6 +615,7 @@ fn stage1_manifest_loads_and_restores() {
     assert_eq!(op.schema, 1);
     assert!(op.plan.as_ref().unwrap().trace.is_none());
     assert!(op.app.hidden.is_none(), "the old format has no hidden mark");
+    assert!(op.forced.is_none(), "the old format has no forced mark");
     assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Ok { op } if op.id == "op-1"));
     let restored = ops::restore(&f.env, "op-1").unwrap();
     assert_eq!(restored.status, OpStatus::Restored, "{:#?}", restored.items.iter().map(|i| (&i.candidate_id, i.restore, &i.restore_detail)).collect::<Vec<_>>());

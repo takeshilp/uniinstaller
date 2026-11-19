@@ -19,6 +19,10 @@ pub fn user_programs(env: &Env) -> PathBuf {
 pub fn notes_dir(env: &Env) -> PathBuf {
     user_programs(env).join("Sandbox Notes")
 }
+/// "Sandbox Portable": a program no Uninstall entry knows (the forced-removal demo); see `seed`.
+pub fn portable_dir(env: &Env) -> PathBuf {
+    user_programs(env).join("Sandbox Portable")
+}
 pub fn suite_dir(env: &Env) -> PathBuf {
     pf(env).join("Sandbox Soft")
 }
@@ -156,6 +160,20 @@ pub fn seed(root: &Path, tag: &str) -> Result<Env> {
     register(&env, &Entry { key: "SandboxPatchKB1", name: Some("Sandbox Patch KB1"), version: "1", publisher: "x", location: None, icon: None, uninstall: None }, false)?;
     set_string(&registry::create(&env.uninstall_roots[0].child("SandboxPatchKB1"), KEY_ALL_ACCESS)?, "ParentKeyName", "Sandbox Notes", false)?;
     register(&env, &Entry { key: "SandboxNameless", name: None, version: "1", publisher: "x", location: None, icon: None, uninstall: None }, false)?;
+
+    // 6b. Sandbox Portable: a program with no Uninstall entry (forced removal). Its folder holds an `unins000.cmd` that deletes the exe, and a
+    // Start Menu link, a Run value, a settings folder and a vendorless key name it. None of them points into another seeded app.
+    let pd = portable_dir(&env);
+    let pexe = pd.join("portable.exe");
+    write(&pexe, b"MZ fake")?;
+    write(&pd.join(r"data\cache.bin"), b"cache")?;
+    write(&pd.join("unins000.cmd"), format!("@echo off\r\ndel /q \"{}\"\r\n", pexe.display()).as_bytes())?;
+    fs::create_dir_all(start_menu(&env))?;
+    shortcuts::create(&start_menu(&env).join("Sandbox Portable.lnk"), &pexe)?;
+    set_string(&run, "SandboxPortable", &format!("\"{}\"", pexe.display()), false)?;
+    write(&roaming(&env).join(r"Sandbox Portable\settings.ini"), b"[x]\n")?;
+    let psw = registry::create(&env.software_roots[0].child("Sandbox Portable"), KEY_ALL_ACCESS)?;
+    set_string(&psw, "Path", &pd.to_string_lossy(), false)?;
 
     // 7. Sandbox Traced: a demo installer for install tracing. The values it overwrites exist before it runs; the two scripts in
     // `installers\` install and uninstall it. Nothing runs until the GUI or a test runs the setup script.

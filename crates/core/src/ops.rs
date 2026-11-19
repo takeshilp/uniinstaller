@@ -236,6 +236,50 @@ fn create(env: &Env, app: InstalledApp, launch: Launch, forced: Option<Forced>) 
     Ok(op)
 }
 
+/// Starts a forced removal ("remove by path"): re-checks the pick (`force::check` must still say Ok), takes the name and publisher the
+/// user confirmed, and, if the user chose one of the uninstallers found in the folder, records it as the operation's launch;
+/// otherwise the launch is the empty placeholder and the operation goes straight to the leftover search.
+pub fn begin_forced(env: &Env, picked: &Path, name: &str, publisher: Option<&str>, uninstaller: Option<&Path>) -> Result<Operation> {
+    guard(env)?;
+    let _g = lock();
+    let ForceCheck::Ok { found } = crate::force::check(env, picked)? else {
+        return Err(Error("this path cannot be removed by force; check it again".into()));
+    };
+    let found = *found;
+    let text = |s: &str, what: &str| -> Result<String> {
+        let s = s.trim();
+        if s.chars().count() > 200 || s.chars().any(char::is_control) {
+            return Err(Error(format!("the {what} is too long or has control characters")));
+        }
+        Ok(s.to_string())
+    };
+    let name = text(name, "name")?;
+    if name.is_empty() {
+        return Err(Error("the program needs a name".into()));
+    }
+    let publisher = text(publisher.unwrap_or(""), "publisher")?;
+    let publisher = (!publisher.is_empty()).then_some(publisher);
+    let launch = match uninstaller {
+        Some(u) => {
+            let exe = found.uninstallers.iter().find(|x| norm(x) == norm(u)).ok_or_else(|| Error("not an uninstaller found in this folder".into()))?;
+            Launch { raw: format!("\"{}\"", exe.display()), exe: exe.clone(), args: String::new(), argv: vec![], msi_product: None }
+        }
+        None => Launch { raw: String::new(), exe: PathBuf::new(), args: String::new(), argv: vec![], msi_product: None },
+    };
+    let mut forced = found.forced;
+    forced.search_names = crate::force::search_names(&name, &forced.picked, forced.folder.as_deref(), found.product.as_deref());
+    let app = crate::force::app_for(&forced, &name, publisher.as_deref(), found.file_version.as_deref());
+    create(env, app, launch, Some(forced))
+}
+
+/// A forced operation in a sandbox must still point inside the sandbox folder (a manifest copied in cannot aim at real folders).
+fn forced_in_scope(env: &Env, op: &Operation) -> Result<()> {
+    match &op.forced {
+        Some(f) if !crate::force::in_sandbox(env, f.folder.as_deref().unwrap_or(&f.picked)) => Err(Error("this forced operation points outside the sandbox folder".into())),
+        _ => Ok(()),
+    }
+}
+
 /// A forced operation without an uninstaller to run (`launch` is the empty placeholder): it goes straight to the leftover search.
 fn skips_native(op: &Operation) -> bool {
     op.forced.is_some() && op.launch.exe.as_os_str().is_empty()
@@ -265,6 +309,7 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     valid_op_id(op_id)?;
     let _g = lock();
     let mut op = load(env, op_id)?;
+    forced_in_scope(env, &op)?;
     let native = op.native.clone();
     match &native {
         Some(n) => {
@@ -346,6 +391,7 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     valid_op_id(op_id)?;
     let _g = lock();
     let mut op = load(env, op_id)?;
+    forced_in_scope(env, &op)?;
     let plan = op.plan.clone().ok_or_else(|| Error("no plan: search for leftovers first".into()))?;
     let others = others(env, &op.app)?;
     let anchors = anchors_of(env, &others);
