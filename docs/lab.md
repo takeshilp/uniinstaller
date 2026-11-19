@@ -5,7 +5,7 @@ The lab that runs real installers inside Windows Sandbox: the commands, the guar
 ## Lab (`crates/lab`, `lab/`)
 The lab runs real installers and the real `uni_core::ops` flow inside Windows Sandbox. Nothing in `crates/core` changed for it.
 - `uni-lab` commands: `check`, `list`, `begin <app>`, `native <op>`, `scan <op>`, `apply <op> default|unblocked [--crash-after-first-move]`,
-  `restore <op>`, `show <op>`. Exit codes: 2 = refused by the guard, 99 = the deliberate kill of `--crash-after-first-move`, 1 = error.
+  `holders <op>`, `close-retry <op>`, `restore <op>`, `show <op>`. Exit codes: 2 = refused by the guard, 99 = the deliberate kill of `--crash-after-first-move`, 1 = error.
   `apply` policies: `default` is the product's preselection; `default+reverts` and `default+system` add every unblocked revert or every unblocked service and task
   (the groups the product never preselects); `unblocked` ticks every candidate without a hard block and without
   `UserDataLikely`, like a user who ticks everything the product does not warn about.
@@ -46,6 +46,12 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
   PASS in runs 20261119-180421 and 20261119-180600 (the full run, 15 scenarios all PASS): 12 leftovers found of 12, 0 false deletions, 5 items removed (the service and the task among them, 80 Safe,
   not preselected), the service's six values (ImagePath as ExpandString) and the task XML hash equal after the restore (`s3` equals `s5` line for line), `force-service` still `refused:service`.
   The stop of a running service is not exercised (the payload is not a service binary).
+- Locked file and close-retry (`nsis-user`, scenario key `close`): `lab/build.ps1` compiles `lab/apps/lockholder.cs` with Windows PowerShell 5.1 `Add-Type` into `lockholder.exe`; the guest starts one copy that
+  holds `app.log` with no sharing and a second copy that holds nothing (the bystander), then `uni-lab apply`, `holders <op>` and `close-retry <op>` (the lab acts as a user who confirmed the list `holders` showed) and writes
+  `locker.json` (the holder's and the bystander's pid and `HasExited`). Rule 19 (close scenarios): FAIL when `op-holders.json` does not name the holder for the locked item, when `closed` has a pid other than the
+  holder's or the bystander's pid, when the holder is still running, when the bystander exited, or when an item that holds the locked file is not `removed`; rules 6 to 11 read the operation `close-retry` returned. Metric `closed`.
+  PASS in the run 20261119-233620 (`nsis-user` alone) and in the full run 20261119-233732 (15 scenarios PASS, every other row equal to run 20261119-180600): `holders` named `lockholder.exe` (type `mainWindow`, reasons 0), `closed: 1`, the holder exited, the bystander alive, 8 of 8 removed, restore ok, `shutdownError` and
+  `restartError` null; the gap `locked file left in place` no longer shows. Not exercised: Explorer, services, elevated holders, an app that refuses to close and a real restart (the console refusal is in `tests/locked.rs`).
 - Hidden entries: the NSIS test app has a `HIDDEN` flag (`SystemComponent=1`); `labhidden.exe` is the scenario `hidden-user`, `labpluginhidden.exe` the nested
   plugin of `shared-suite-hidden`. `uni-lab list` includes hidden entries and `uni-lab begin` passes `hidden_ok = true` (the lab acts as a user who ticked
   the confirmation; the refusal is tested in `tests/ops.rs`).

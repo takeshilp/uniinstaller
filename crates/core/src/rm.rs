@@ -424,6 +424,22 @@ mod tests {
         assert!(!blockers(&big, PathKind::Dir, 5).truncated);
     }
 
+    /// The premise of the probe: any open file inside a folder stops the folder's move, even one opened with every share flag.
+    #[test]
+    fn open_file_inside_stops_a_folder_move() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("a.txt"), "x").unwrap();
+        let h = open(&d.join("a.txt"), 7);
+        let e = fs::rename(&d, t.path().join("moved")).unwrap_err();
+        println!("folder move with a share-all handle inside: {e}");
+        assert!(matches!(e.raw_os_error(), Some(5 | 32 | 33)), "{e}");
+        assert!(d.exists());
+        drop(h);
+        fs::rename(&d, t.path().join("moved")).unwrap();
+    }
+
     #[test]
     fn blockers_do_not_follow_a_junction() {
         let t = tempfile::tempdir().unwrap();

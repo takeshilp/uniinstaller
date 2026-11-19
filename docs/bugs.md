@@ -170,3 +170,33 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
   and decoding the enumerated values instead of reading each one again saved about 15 %.
 - Fix: none beyond that; the shipped app is a release build. The GUI shows a spinner while it checks. Cache the scan per session if it ever matters (shortcut 6 of "Forced removal").
 - Verified: `real_system_force_probe` on `C:\Program Files\nodejs` and `...\MSBuild`, debug 9.5 s, release 1.9 s.
+
+## RmGetList fails with error 5 when a folder is registered
+- Symptom: a Restart Manager query for a locked folder item, alone or next to a held file, returned error 5 and the whole answer was lost.
+- Cause: `RmRegisterResources` accepts a folder but `RmGetList` then fails with ERROR_ACCESS_DENIED (measured on the owner's machine with the current folder and with Discord's `leveldb` folder).
+- Fix: folders are never registered. `rm::blockers` probes each file and folder with a DELETE open and `rm::holders` is given the blocking files only; a held folder is reported as "a folder is open" without a name.
+- Verified: read-only probe on 2026-11-19; `tests/locked.rs` and the `rm` unit tests register files only.
+
+## Restart Manager takes about 240 ms per file under Program Files
+- Symptom: asking about every file of a program folder under `C:\Program Files` took 25 s for 100 files; a file outside Program Files takes 1 to 14 ms.
+- Cause: measured, linear, for 7-Zip and Git files, held or not (an unheld file in the profile is fast, a held one costs about 0.5 s).
+- Fix: probe first (`CreateFile` with DELETE access is microseconds per file), register only the files that failed with 32 or 33, at most 64 per item.
+- Verified: read-only RM calls on the owner's machine, 2026-11-19; `real_system_lock_holders` prints the timings (`UNI_LOCK_PATHS` adds files of your choice).
+
+## A folder move fails with error 5 when any file inside is open, even with every share flag
+- Symptom: moving a folder into quarantine ended `AccessDenied`, not `Locked`, although the open handle in it shared read, write and delete.
+- Cause: the move of a folder fails with ERROR_ACCESS_DENIED as long as any file below it is open; only the folder's own handle conflicts through share flags.
+- Fix: `rm::held` opens entries below a folder item with no sharing (any open handle then fails with 32), and the item itself with full sharing.
+- Verified: `rm::tests::open_file_inside_stops_a_folder_move` (a share-all handle, `fs::rename` returns os error 5) and `rm::tests::blockers_probe`.
+
+## Restart Manager closes console programs with Ctrl+C to the whole console
+- Symptom: none in the product (found in planning): a PowerShell holder in a console is reported as type 5 (Console).
+- Cause: to stop a console program the Restart Manager attaches to its console from inside the calling process and sends a control signal, which every program in that console receives; the RstrtMgr imports and the documented guidelines say the same.
+- Fix: console holders are refused (`HolderBlock::Console`, no close button); the test and lab holder is a compiled window program (`lab/apps/lockholder.cs`), which RM reports as a main-window program and closes with a window message.
+- Verified: `tests/locked.rs::console_holder_is_refused` (kind Console, the child untouched) and `close_and_retry_closes_only_the_confirmed_holder` (window holder closed in about 0.6 s, a bystander copy and the test harness untouched).
+
+## Restart Manager returns " " as the name of an exe without a version resource
+- Symptom: the holder list shows an empty name.
+- Cause: `RM_PROCESS_INFO.strAppName` is a single space for such an exe (the compiled lock holder is one).
+- Fix: `rm::holders` trims the name and falls back to the image name.
+- Verified: `tests/locked.rs` asserts a non-blank name for the holder; the GUI shows `lockholder.exe`.

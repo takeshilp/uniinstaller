@@ -36,9 +36,13 @@ programs serialize byte-identically, so there is no schema bump and 0.2.0 ignore
 byte-identical, there is no schema bump and no new `OpStatus` (0.2.0 and the hidden-apps build ignore the field, list the operation as a normal one and can restore it).
 Downgrade: 0.2.0 lists a forced operation as a normal one and can restore it, but a rescan there treats the folder as corroborated (the found uninstaller sits in it)
 and preselects shortcuts and Run values; do not rescan forced operations in an older version.
+`Operation.continue_after_reboot` (`Option<u64>`, `serde(default, skip_serializing_if = "Option::is_none")`, JSON `continueAfterReboot`): when the operation started waiting for a restart. `run_native`
+sets it when the uninstaller asked for one (`PendingReboot` with no items); "Повторить после перезагрузки" sets it on an operation with a `Locked` or `AccessDenied` item. Normal manifests stay byte-identical, there is
+no schema bump, older builds ignore it. The transient `Holder`, `HolderKind`, `HolderBlock`, `ItemHolders` and `Closed` are answers of `ops::lock_holders` and `ops::close_and_retry`; they are never stored (docs/locked.md).
 Statuses: ItemStatus InProgress, Removed, NotFound, Changed, Blocked, AccessDenied, Locked, Failed, Reverted; RestoreStatus Restored, Conflict,
 Missing, Failed; OpStatus Running, AwaitingReview, Completed, CompletedWithWarnings, PendingReboot, PartiallyCompleted, Failed, Restored,
-PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress counts as a problem).
+PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress counts as a problem). PendingReboot also covers an operation with the restart marker and a
+`Locked` or `AccessDenied` item left; there is no per-item PendingReboot.
 
 ## Program icons
 - `icon::source(app, env)`: the DisplayIcon file and index (`path[,index]`, negative = resource id) when it is a local existing file, else the uninstaller when it is an `.exe`
@@ -80,9 +84,9 @@ See docs/lab.md.
 - Settings key case (`safety.rs`): `key_holding` compares with `RegPath::same` (ASCII case) and `below` (Unicode case), so non-ASCII names that differ only in case are not seen as equal; compare lowercased paths if one shows up.
 - Install-dir leftovers are never preselected unless a trusted trace journal confirms them (`safety.rs`).
 - Retention (`ops.rs`): quarantine, manifests, plans and reports are never purged.
-- Locked files (`ops.rs`): reported as Locked, retry by hand; no Restart Manager.
+- Locked files (`rm.rs`, `ops.rs`): who holds them and a confirmed close-and-retry are in docs/locked.md; its shortcut list is below.
 - Scoring (`safety.rs`): weights and the DOC_EXT / DATA_DIR_NAMES lists are not calibrated.
-- Reboot (`ops.rs`): "rebooted since" from uptime only.
+- Reboot (`ops.rs`): "rebooted since" comes from uptime, see "Locked files and restarts" below.
 - Concurrency (`ops.rs`): `OP_LOCK` is per process.
 - MSI with empty InstallLocation (`scan.rs`): little leftover coverage.
 - Icons (`icon.rs`): MSI `ProductIcon` is not read (5 of 16 visible MSI entries without DisplayIcon) and monochrome icons get the letter.
@@ -99,7 +103,7 @@ See docs/lab.md.
 - Lab, metrics: recall and precision are reported, not gated; set thresholds after at least 3 stable full runs and recalibrate the `safety.rs` weights from that data.
 - Lab, crash point (`uni-lab`): the kill is only "after the first quarantined path"; add a registry-phase kill if resume bugs show up there.
 - Lab, cost: one fresh sandbox per scenario (about 30 s of boot each) and a full `_in` copy per run (delete old runs by hand with `cmd /c rmdir /s /q`); batch scenarios if full runs get too slow.
-- Lab, payload: an inert `whoami.exe` copy that never runs, so there is no "app running during uninstall" case; add a long-running payload when Restart Manager work starts.
+- Lab, payload: an inert `whoami.exe` copy that never runs, so there is no "app running during uninstall" case; the locked-file scenario `nsis-user` uses a window program (`lab/apps/lockholder.cs`) as the holder, a long-running payload is still not used.
 - Lab, coverage: reboot, MSIX, several users, drivers and update-over-previous are not exercised; add them with their stage-2/3 features.
 - Lab, detection: sandbox detection uses `wsb list` plus the `WindowsSandbox`, `WindowsSandboxClient` and `WindowsSandboxRemoteSession` processes; switch to `wsb start`/`connect` with known ids if it proves unreliable.
 - Lab, build: WiX 5 comes from nuget.org on the first build; vendor a pinned copy if the lab must build offline.
@@ -154,7 +158,7 @@ See docs/lab.md.
   1. Detection is by reference only (image, `ServiceDll` or an exec action into the confirmed folder or picked file): no trace evidence (services and tasks are not captured), no name match, and an app without a confirmed folder gets none. Add a trace capture of service names and task paths when the budget allows.
   2. Never preselected (`default_selected`); the tier comes from the uncalibrated weights (65 Review, 80 Safe when the program is gone). Revisit with lab statistics.
   3. Any dependent blocks, including one of the same program and a group dependency; remove the program that owns the dependent first. After a first apply the operation offers no rescan.
-  4. The stop waits 30 s with no stop button and never kills; a service that does not stop ends Locked. Add Restart Manager or a "stop waiting" button.
+  4. The stop waits 30 s with no stop button and never kills; services are not registered with the Restart Manager, so a service that does not stop ends Locked and can be retried by hand or after a restart (docs/locked.md). Add a "stop waiting" button.
   5. A service the SCM only marked for deletion ends `Removed` with a detail; there is no per-item PendingReboot status.
   6. Restore sets only the `CreateServiceW` fields and delayed start through the API; the other values (description, failure actions, triggers, parameters, security descriptor) are written into the key and apply at the latest after a restart. Account passwords are not restored.
   7. Tasks with a stored password cannot be recreated, and a task's security descriptor is not backed up.
@@ -170,4 +174,19 @@ See docs/lab.md.
   17. Lab: a running service, a custom security descriptor and password tasks are not exercised (the payload is not a service binary).
   18. The "outside the program's folder" rule checks Program Files roots only and fails closed: the program's own second folder (its x86 half, the vendor's Common Files) blocks too; widen `own` to the program's other registered folders if users report blocked services of their own program.
   19. An existing program whose owner cannot be read blocks the service (fail closed); measure on real data before relaxing.
+- Locked files and restarts (`rm.rs`, `ops.rs`, `sysobj.rs`, `main.rs`, `app.js`, `lab/`, one comment per item in the code, details in docs/locked.md):
+  1. `rm::held`: the probe opens for DELETE (with no sharing inside a folder item). For that instant another program's open can fail with 32 and an oplock can break; a handle opened only for attributes is not seen. Upgrade: per-file attribution in the stage-2 helper.
+  2. `rm::holders`: folders are never registered (`RmGetList` fails with 5). A folder held as a current folder or by a watcher is reported only as "a folder is open", without a name. Upgrade: handle enumeration in the helper.
+  3. `rm::MAX_FILES` / `MAX_PROBE`: 64 files asked about, 20,000 entries probed per item.
+  4. `ops::holders_of`: one Restart Manager query per item (about 0.5 s per held file, about 240 ms per registered file under Program Files). Upgrade: batch the queries.
+  5. `sysobj` STOP_WAIT: services are not registered with the Restart Manager; a service that did not stop stays Locked, with the restart reminder.
+  6. `rm::block`: only window programs are closed. Refused: console programs (RM would send Ctrl+C to every program in that console and attach to it from inside our process), services, Explorer, critical, unknown-type, elevated or other-session holders, any WebView2 process, and the recorded uninstaller.
+  7. `ops::close_and_retry`: `RmShutdown` waits as long as the Restart Manager does; there is no cancel button. Upgrade: `RmCancelCurrentTask`.
+  8. `main.rs` `HolderSlot`: the close needs the PIDs the modal showed to equal the last stored list.
+  9. `ops::close_and_retry`: `RmRestart` restarts only programs registered for restart, and closing is not journalled: a crash between the shutdown and the restart leaves the programs closed.
+  10. `app.js` `scanLabel`: an item that ends `Changed` after a close needs a rescan by hand.
+  11. `ops::boot_ms`: restarts are detected from uptime, so a shutdown with Fast Startup is not a restart. Upgrade: `PrefetchParameters\BootId`, once it is measured to change on hybrid boots.
+  12. `ops::mark_native_reboot`: operations from older builds have no marker and never show the banner; open them from History.
+  13. `ops::remind_after_reboot`: no boot-time moves (`MoveFileEx` DELAY_UNTIL_REBOOT) and no RunOnce key. The user starts Uniinstaller after the restart and the banner offers to continue.
+  14. `lab/guest/run.ps1`: one window holder plus one bystander in `nsis-user`. The console refusal is covered only by the fixture. Explorer, services, elevated holders, a refusing app and a real restart are not exercised.
 - Lab, analyzer: `analyze.ps1` has no unit tests; its rules are checked against the scenario verdicts, add a synthetic-run self-test if the rules change often.

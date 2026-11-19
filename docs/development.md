@@ -16,6 +16,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p uni-core --test real_system -- --ignored --nocapture   # read-only, real machine
 cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture   # install-trace snapshot cost: objects, ms, memory
 cargo test -p uni-core --test real_system real_system_icons -- --ignored --nocapture   # icon of every program: icons, letters, ms
+cargo test -p uni-core --test real_system real_system_lock_holders -- --ignored --nocapture   # Restart Manager, read-only: who holds NTUSER.DAT (ms, holders, reasons); UNI_LOCK_PATHS=<a;b> adds files of your choice. Never closes anything
 cargo test -p uni-core --test real_system real_system_services_tasks -- --ignored --nocapture   # services and tasks: counts, ms, every candidate (read-only; run it elevated to see the admin-only keys)
 npm run tauri dev                             # GUI; always through npm, plain `cargo run` gives a blank window
 cargo run -p uni-cli -- list                  # read-only CLI on the real machine; `list --hidden` adds the SystemComponent entries
@@ -75,9 +76,9 @@ result with an independent inventory (recall, false deletions, restore, resume a
 - Verdicts: ERROR (the run is not trustworthy: driver, guest or exit-code problem, nothing measured), FAIL (a product defect: false
   deletion, inconsistent apply report, inexact restore, changed scan, bad resume), RISK (a user-data or control object removed that the
   product offered without a block and the policy `unblocked` ticked), PASS. Recall and precision are reported, not gated. Known gaps
-  (Classes, the emptied task folder, locked file, MSI with empty InstallLocation) are listed and never fail a scenario.
+  (Classes, the emptied task folder, MSI with empty InstallLocation) are listed and never fail a scenario.
 - Adding a scenario: `lab/scenarios/<name>.json` with `install` (files in `target\lab\build`, built by `lab/build.ps1`), `after_install`
-  (`file`, `delete`, `regval` actions), `target` (the DisplayName), `select` (`default`, `default+reverts`, `default+system` or `unblocked`), optional `lock`, `crash`,
+  (`file`, `delete`, `regval` actions), `target` (the DisplayName), `select` (`default`, `default+reverts`, `default+system` or `unblocked`), optional `lock` (a window program from `lab/apps/lockholder.cs` holds that file, a second copy holds nothing), `close` (after the apply: `uni-lab holders`, then `close-retry`; rule 19 in docs/lab.md), `crash`,
   `expect_begin_error`, `trace` (the single installer runs under `uni-lab trace`, see below), `before_install` (actions run before the baseline `s0`, for state that
   an install overwrites), and the manifest classes `owned`, `userdoc`, `control`, `gap` and `revert` (values the install overwrote and the product should write
   back; the analyzer maps `revert:<id>` candidates onto their `value:<id>`). Patterns start with `key:` or `value:` for
@@ -152,6 +153,17 @@ npm run tauri build     # target/release/bundle/nsis/Uniinstaller_<v>_x64-setup.
   with the stand-in service and task, unticked, 65 Review) -> "Запустить деинсталлятор" (80 Safe once the exe is gone) -> tick the group -> "Удалить выбранное" (the confirmation "Остановить и удалить службы и задачи: 2?")
   -> the result group -> "Восстановить всё" (the info strip that recreated services are not started). Verified on 2026-11-19 with UI Automation and window screenshots. The real-system preview of Yandex Telemost
   (read-only) shows the same group with the real service (running) and task, and the warning strip with the administrator restart button when not elevated.
+- Locked files in the GUI (sandbox only, ПЕСОЧНИЦА pill): `sandbox-seed`, `npm run tauri dev` with `UNIINSTALLER_SANDBOX` set in the same shell call, and compile the holder once
+  (`New-Item -ItemType Directory -Force target\manual; powershell -NoProfile -Command "Add-Type -Path lab\apps\lockholder.cs -OutputAssembly target\manual\lockholder.exe -OutputType WindowsApplication -ReferencedAssemblies System.Windows.Forms"`).
+  Start `Start-Process target\manual\lockholder.exe -ArgumentList '"<sandbox>\users\me\AppData\Local\Programs\Sandbox Notes\config.ini"','"<sandbox>\ready.txt"','900'` (the only program you may let the app close; it ends by
+  itself after 900 s). Sandbox Notes -> Запустить деинсталлятор -> tick "Файлы программы" -> Удалить выбранное: the row shows ЗАНЯТО and "Держит: lockholder.exe (PID n, окно)", the strip has
+  "Закрыть эти программы и повторить". **If the modal lists anything other than the holder you started, press Отмена and stop**: `UNIINSTALLER_SANDBOX` sandboxes files and the registry, not processes.
+  Confirm: УБРАНО, the holder has exited, the strip "Закрыто: lockholder.exe." shows. Second walk (new `sandbox-seed`, the native uninstaller deletes the Uninstall key, so a restored Notes is not startable again): hold `config.ini` with a PowerShell
+  console (`Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',<a quoted command that runs `$f=[IO.File]::Open('<config.ini>','Open','Read','None'); Start-Sleep 600`>`) -> the row says
+  "Держит: Windows PowerShell 5.1 (PID n, консоль) — консольная программа: закройте её окно сами", there is no close button. Press "Повторить после перезагрузки": the strip and the ПЕРЕЗАГРУЗКА pill in История;
+  stop your holder, set `"continueAfterReboot"` in that op's `manifest.json` to `1` (edit it as UTF-8: `Get-Content` without `-Encoding UTF8` re-encodes the Russian OS error text), restart the GUI: the banner "Компьютер перезагружен: можно
+  продолжить удаление «Sandbox Notes»." with Продолжить, Позже, Не напоминать; Продолжить opens the result ("Сейчас этот объект никто не держит"), Повторить removes the file and clears the marker. Verified on 2026-11-19 with UI
+  Automation and window screenshots (PrintWindow of the app window only). Stop the holders you started, close the app, `sandbox-clean`.
 - Running screen with a slow uninstaller and "Не ждать дальше".
 - Mark-of-the-Web on an installer (NOT run by the agent: it can pop a security dialog on the desktop). In the sandbox GUI: write
   `Set-Content -LiteralPath "<sandbox>\installers\sandbox-traced-setup.cmd" -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"`, trace the

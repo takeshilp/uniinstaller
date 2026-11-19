@@ -66,7 +66,7 @@ Each is also a `// shortcut:` comment in the code; the list is in `docs/architec
 1. Detection by reference only; no trace evidence, no name match; an app without a confirmed folder gets none.
 2. Never preselected; the tier comes from uncalibrated weights.
 3. Any dependent blocks; remove the program that owns the dependent first. After a first apply the operation offers no rescan.
-4. The stop waits 30 s, no stop button, never kills; a service that does not stop ends Locked.
+4. The stop waits 30 s, no stop button, never kills; a service that does not stop ends Locked, and Locked can be retried by hand or after a restart (docs/locked.md).
 5. A service only marked for deletion ends `Removed` with a detail; there is no PendingReboot status per item.
 6. Restore sets only the `CreateServiceW` fields and delayed start through the API; the other values apply at the latest after a restart; passwords are not restored.
 7. Tasks with a stored password cannot be recreated; a task's security descriptor is not backed up.
