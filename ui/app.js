@@ -35,6 +35,7 @@ const state = {
   update: null, updating: false,
   trace: null,
   showHidden: false, hiddenOk: false,
+  force: null,
 };
 
 function set(patch) { Object.assign(state, patch); render(); }
@@ -56,6 +57,8 @@ const fmtVal = (v) => {
   if (!out) return S.valEmpty;
   return out.length > 80 ? `${out.slice(0, 80)}…` : out;
 };
+// Evidence for a forced target is the user's word (folder and name), not a registry entry: its own wording where it differs.
+const evText = (code) => (state.op?.forced && S.evidenceForced[code]) || S.evidence[code] || code;
 const isRegistry = (c) => c.target.type !== 'path';
 const isRevert = (c) => c.target.type === 'regRevert';
 const groupable = (c) => c.blocks.length === 0 && (c.tier === 'safe' || c.tier === 'review');
@@ -80,8 +83,9 @@ views.list = () => (state.tab === 'history' ? viewHistory() : viewPrograms());
 function viewPrograms() {
   const tabs = tabsHtml();
   const traceBtn = `<button class="btn secondary" data-act="trace-open" ${dis()}>${ic('\uE896')} ${S.traceStart}</button>`;
+  const forceBtn = `<button class="btn secondary" data-act="force-open" ${dis()}>${ic('\uE74D')} ${S.forceStart}</button>`;
   const hiddenToggle = `<label class="check"><input type="checkbox" data-act="show-hidden" ${state.showHidden ? 'checked' : ''} ${dis()}> ${S.showHidden}</label>`;
-  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div><div style="display:flex;gap:12px;align-items:center">${hiddenToggle}${traceBtn}${tabs}</div></div>`;
+  const head = `<div class="head"><div><h1 class="display">${S.homeTitle}</h1><p class="subtitle">${S.homeSub}</p></div><div style="display:flex;gap:12px;align-items:center">${hiddenToggle}${forceBtn}${traceBtn}${tabs}</div></div>`;
   let body;
   if (state.appsError) {
     body = `<div class="strip danger"><span>${S.loadError}: ${esc(state.appsError)}</span><button class="btn secondary" data-act="reload">${S.retry}</button></div>`;
@@ -119,7 +123,7 @@ function viewHistory() {
         <span class="tile letter sm">${letter(op.app.displayName)}</span>
         <span class="grow"><div class="name">${esc(op.app.displayName)}</div>
           <div class="muted">${esc(fmtDate(op.createdMs))} · ${S.objects(op.items.length)}</div></span>
-        ${pill(S.opStatusPill[op.status] || ['muted', op.status])}${ic('')}</button>`;
+        ${op.forced ? pill(['warn', S.forcedPill]) : ''}${pill(S.opStatusPill[op.status] || ['muted', op.status])}${ic('')}</button>`;
     }).join('');
   }
   return { html: `<div class="col">${head}${body}</div>`, bar: '' };
@@ -261,6 +265,99 @@ views.trace = () => {
       <button class="btn secondary" data-act="trace-pick" ${state.busy ? 'disabled' : ''}>${S.tracePick}</button></div></div>`, bar };
 };
 
+// ---------- forced removal ("remove by path") ----------
+views.force = () => {
+  const f = state.force;
+  const back = `<button class="link back" data-act="force-cancel">${ic('')} ${S.allPrograms}</button>`;
+  if (f.phase === 'checking') {
+    return { html: `<div class="center"><div class="spinner"></div><h1 class="display" style="font-size:32px">${S.forceChecking}</h1><p class="subtitle">${S.forceCheckingSub}</p></div>`, bar: '' };
+  }
+  if (f.phase === 'refused') {
+    const c = f.check;
+    return { html: `<div class="col">${back}<div class="strip danger"><span>${esc(S.forceRefused[c.code] || c.code)}</span></div>
+      <div class="card mono muted pre">${esc(c.detail)}</div></div>`,
+      bar: `<div></div><div class="acts"><button class="btn secondary" data-act="force-other">${S.forceOther}</button>
+        <button class="btn primary" data-act="force-cancel">${S.toPrograms}</button></div>` };
+  }
+  if (f.phase === 'listed') {
+    const c = f.check;
+    const open = c.how !== 'inside' ? `<button class="btn primary" data-act="force-open-app" data-id="${esc(c.app.id)}">${S.forceOpenApp}</button>` : '';
+    return { html: `<div class="col">${back}<div class="strip info"><span>${esc(S.forceListed[c.how](c.app.displayName))}</span></div></div>`,
+      bar: `<div></div><div class="acts"><button class="btn secondary" data-act="force-other">${S.forceOther}</button>${open}</div>` };
+  }
+  if (f.phase === 'confirm') {
+    const fd = f.check.found;
+    const row = (k, v, mono) => `<dt>${k}</dt><dd><span class="${mono ? 'mono' : ''}">${v}</span></dd>`;
+    const info = [fd.product, fd.publisher, fd.fileVersion].filter(Boolean).join(' · ');
+    const where = fd.forced.folder
+      ? `<dt>${S.kFolder}</dt><dd><span class="mono">${esc(fd.forced.folder)}</span><button class="iconbtn" data-act="folder" data-path="${esc(fd.forced.folder)}" title="${S.showInFolder}">${ic('')}</button></dd>`
+      : row(S.kFileOnly, esc(fd.forced.picked), true);
+    const strips = (fd.otherVolume ? `<div class="strip warn"><span>${S.forceOtherVolume}</span></div>` : '')
+      + (fd.outsideZones ? `<div class="strip warn"><span>${S.forceOutsideZones}</span></div>` : '');
+    const noUn = !fd.uninstallers.length;
+    const radios = noUn ? `<div class="muted">${S.forceUnMissing}</div>`
+      : fd.uninstallers.map((u, i) => `<label class="opt"><input type="radio" name="fun" data-act="force-un" data-i="${i}" ${f.un === i ? 'checked' : ''}>
+          <span><div class="t">${esc(lastPart(u))}</div><div class="mono muted" style="word-break:break-all">${esc(u)}</div><div class="faint" style="font-size:13px">${S.forceUnFound}</div></span></label>`).join('')
+        + `<label class="opt"><input type="radio" name="fun" data-act="force-un" data-i="-1" ${f.un === -1 ? 'checked' : ''}><span>${S.forceUnNone}</span></label>`;
+    const label = f.un !== null && f.un >= 0 ? S.runUninstaller : (f.un === -1 || noUn) ? S.searchLeftovers : S.forceUnChoose;
+    const links = fd.shortcuts.length ? listCard(S.forceLinksTitle, fd.shortcuts) : `<div class="card muted">${S.forceLinksNone}</div>`;
+    const bar = `<div></div><div class="acts"><button class="btn secondary" data-act="force-cancel">${S.cancel}</button>
+      <button class="btn primary" id="frun" data-act="force-go" ${forceReady() && !state.busy ? '' : 'disabled'}>${label}</button></div>`;
+    return { html: `<div class="col">${back}<div class="head"><div><h1 class="display">${S.forceTitle}</h1></div></div>
+      <div class="strip warn"><span>${S.forceNote}</span></div>${strips}
+      <div class="card"><h3 style="margin-bottom:16px">${S.forcePicked}</h3><dl class="kv">${where}${info ? row(S.kProductInfo, esc(info)) : ''}</dl>
+        ${fd.forced.folder ? '' : `<div class="muted" style="margin-top:10px">${S.kFileOnlyNote}</div>`}</div>
+      <div class="card"><h3>${S.forceNameTitle}</h3>
+        <label class="field"><span class="lbl">${S.forceName}</span><input type="text" id="fname" maxlength="200" autocomplete="off" value="${esc(f.name)}"></label>
+        <label class="field"><span class="lbl">${S.forcePublisher}</span><input type="text" id="fpub" maxlength="200" autocomplete="off" value="${esc(f.publisher)}"></label>
+        <div class="faint" style="margin-top:10px;font-size:13px">${S.forceNameHint}</div></div>
+      <div class="card"><h3 style="margin-bottom:8px">${S.forceUnTitle}</h3>${radios}</div>${links}</div>`, bar };
+  }
+  // pick
+  return { html: `<div class="col">${back}<div class="head"><div><h1 class="display">${S.forceTitle}</h1><p class="subtitle">${S.forceSub}</p></div></div>
+    <div class="strip warn"><span>${S.forceNote}</span></div>
+    <div class="card"><div style="display:flex;gap:12px;flex-wrap:wrap">
+      <button class="btn secondary" data-act="force-pick-file" ${dis()}>${S.forcePickFile}</button>
+      <button class="btn secondary" data-act="force-pick-folder" ${dis()}>${S.forcePickFolder}</button></div>
+      <div class="muted" style="margin-top:14px">${S.forceListedHint}</div></div></div>`,
+    bar: `<div></div><div class="acts"><button class="btn secondary" data-act="force-cancel">${S.cancel}</button></div>` };
+};
+
+// The run button needs a name and, when uninstallers were found, an explicit choice (none is preselected).
+const forceReady = () => {
+  const f = state.force;
+  return !!f.name.trim() && (!f.check.found.uninstallers.length || f.un !== null);
+};
+
+async function forcePick(folder) {
+  set({ busy: true });
+  let picked;
+  try { picked = await invoke('force_pick', { folder, title: folder ? S.forcePickTitleFolder : S.forcePickTitleFile, filter: S.forceFilter }); }
+  catch (e) { set({ busy: false, error: String(e) }); return; }
+  if (!picked) { set({ busy: false }); return; }
+  set({ force: { phase: 'checking' } });
+  let check;
+  try { check = await invoke('force_check'); } catch (e) { set({ force: { phase: 'pick' }, busy: false, error: String(e) }); return; }
+  const f = { phase: check.type === 'ok' ? 'confirm' : check.type, check, un: null, name: '', publisher: '' };
+  if (check.type === 'ok') { f.name = check.found.name || ''; f.publisher = check.found.publisher || ''; }
+  set({ force: f, busy: false });
+}
+
+async function forceRun() {
+  const f = state.force, fd = f.check.found;
+  const uninstaller = f.un !== null && f.un >= 0 ? fd.uninstallers[f.un] : null;
+  if (uninstaller) {
+    set({ view: 'running', busy: true, elapsed: 0, procs: [] });
+    timer = setInterval(() => { state.elapsed++; const el = $('#elapsed'); if (el) el.textContent = fmtElapsed(state.elapsed); }, 1000);
+  } else set({ view: 'loading', loading: S.forceStarting, busy: true });
+  let op;
+  try { op = await invoke('force_run', { name: f.name.trim(), publisher: f.publisher.trim() || null, uninstaller }); }
+  catch (e) { clearInterval(timer); set({ view: 'force', busy: false, loading: null, error: String(e) }); return; }
+  clearInterval(timer);
+  state.busy = false;
+  await afterNative(op);
+}
+
 views.outcome = () => {
   const o = state.outcome;
   return {
@@ -303,8 +400,8 @@ function reviewGroupCard(g) {
 
 function childRow(c) {
   const best = [...c.evidence].sort((a, b) => b.points - a.points)[0];
-  const tip = c.evidence.map((e) => `${S.evidence[e.code] || e.code} (${e.points > 0 ? '+' : ''}${e.points})`).join('\n');
-  const why = c.tier === 'weak' ? S.weakMatch : `${best ? S.evidence[best.code] || best.code : ''} · ${S.score(c.score)}`;
+  const tip = c.evidence.map((e) => `${evText(e.code)} (${e.points > 0 ? '+' : ''}${e.points})`).join('\n');
+  const why = c.tier === 'weak' ? S.weakMatch : `${best ? evText(best.code) : ''} · ${S.score(c.score)}`;
   const blocked = c.blocks.length
     ? `<div class="bl">${esc(S.blocked(c.blocks.map((b) => `${S.blockCode[b.code] || b.code}${b.detail ? ` (${b.detail})` : ''}`).join('; ')))}</div>` : '';
   const folder = c.target.type === 'path'
@@ -320,11 +417,15 @@ function childRow(c) {
 views.review = () => {
   const plan = state.plan, op = state.op;
   const total = plan.candidates.filter((c) => c.blocks.length === 0).reduce((s, c) => s + c.size, 0);
-  const eyebrow = state.preview ? S.previewEyebrow : S.removedEyebrow(op.app.displayName, op.native?.exitCode);
+  const eyebrow = state.preview ? S.previewEyebrow : op.forced ? S.forceEyebrow(op.app.displayName, op.native?.exitCode) : S.removedEyebrow(op.app.displayName, op.native?.exitCode);
   const strips = [];
   if (plan.stillRunning?.length) strips.push(`<div class="strip warn"><span>${esc(S.stillRunning(plan.stillRunning.join(', ')))}</span></div>`);
   if (plan.installDirStatus.type === 'rejected') strips.push(`<div class="strip warn"><span>${esc(S.dirRejected(plan.installDirStatus.reason))}</span></div>`);
-  if (plan.installDirStatus.type === 'notSet') strips.push(`<div class="strip warn"><span>${S.dirNotSet}</span></div>`);
+  if (plan.installDirStatus.type === 'notSet') strips.push(`<div class="strip warn"><span>${esc(op?.forced ? S.forceFileOnly(op.forced.picked) : S.dirNotSet)}</span></div>`);
+  if (op?.forced) {
+    strips.push(`<div class="strip info"><span>${S.forceReviewNote}</span></div>`);
+    if (!op.forced.searchNames.length) strips.push(`<div class="strip warn"><span>${esc(S.forceNoNameSearch(op.app.displayName))}</span></div>`);
+  }
   const tu = plan.trace;
   if (tu) {
     const when = fmtDate(tu.createdMs);
@@ -358,7 +459,8 @@ views.result = () => {
   const failed = op.items.filter((i) => ['removed', 'notFound', 'reverted'].includes(i.status)).length;
   const verify = op.verify;
   const vLines = verify
-    ? [verify.appStillListed ? S.verifyListed : S.verifyGone, verify.reappeared.length ? S.verifyReappeared(verify.reappeared.length) : S.verifyClean] : [];
+    ? [verify.appStillListed ? S.verifyListed : S.verifyGone, verify.reappeared.length ? S.verifyReappeared(verify.reappeared.length) : S.verifyClean].slice(op.forced ? 1 : 0) : [];
+  const forcedStrip = op.forced ? `<div class="strip info"><span>${esc(op.native ? S.forceResultRan(op.launch.exe) : S.forceResultSkipped)}</span></div>` : '';
   const verCard = vLines.length ? `<div class="card"><h3 style="margin-bottom:8px">${S.verification}</h3>${vLines.map((l) => `<div class="muted">${esc(l)}</div>`).join('')}</div>` : '';
   const denied = op.items.some((i) => i.status === 'accessDenied') && !state.info.elevated
     ? `<div class="strip warn"><span>${S.deniedStrip}</span>${state.info.sandbox ? '' : `<button class="btn secondary" data-act="admin">${S.restartAdmin}</button>`}</div>` : '';
@@ -379,11 +481,11 @@ views.result = () => {
     <div class="acts">${nRest ? `<button class="btn secondary" data-act="restore" ${dis()}>${S.restoreAll}</button>` : ''}
     ${nRetry ? `<button class="btn secondary" data-act="retry" ${dis()}>${S.retryFailed}</button>` : ''}
     ${scanLabel ? `<button class="btn primary" data-act="scan-op" ${dis()}>${S.searchLeftovers}</button>` : `<button class="btn primary" data-act="home">${S.toPrograms}</button>`}</div>`;
-  const html = `<div class="col"><div class="head"><div><p class="eyebrow">${esc(S.resultEyebrow(op.app.displayName, fmtDate(op.createdMs)))}</p>
+  const html = `<div class="col"><div class="head"><div><p class="eyebrow">${esc(S.resultEyebrow(op.app.displayName, fmtDate(op.createdMs)))}${op.forced ? ` ${pill(['warn', S.forcedPill])}` : ''}</p>
     <h1 class="display" style="font-size:44px">${esc(S.opStatus[op.status] || op.status)}</h1>
     <p class="subtitle">${esc(S.resultCounts(failed, op.items.length))}${op.statusDetail ? ` · ${esc(op.statusDetail)}` : ''}</p></div>
     <button class="link" data-act="export-report">${S.exportReport}</button></div>
-    ${denied}${verCard}${groups}</div>`;
+    ${denied}${forcedStrip}${verCard}${groups}</div>`;
   return { html, bar };
 };
 
@@ -507,10 +609,13 @@ async function startUninstall() {
 async function afterNative(op) {
   state.op = op;
   const n = op.native || {};
-  if (op.status === 'awaitingReview') return scanOp(op.id);
+  // A forced removal's uninstaller was found by path: go on to the leftovers by itself only after a clean exit (spec 3.2).
+  const forcedDoubt = !!op.forced && !!op.native && (n.exitCode !== 0 || n.timedOut || n.stoppedByUser);
+  if (op.status === 'awaitingReview' && !forcedDoubt) return scanOp(op.id);
   const o = { canScan: false, detail: [n.exitCode != null ? S.exitCode(n.exitCode) : '', n.launchError || '', op.statusDetail || ''].filter(Boolean).join('\n') };
   if (n.launchError) o.title = S.outNotStarted;
   else if (op.status === 'pendingReboot') { o.title = S.outReboot; o.sub = S.outRebootSub; }
+  else if (forcedDoubt) { o.title = n.timedOut ? S.outTimeout : n.stoppedByUser ? S.outRunning : S.forceUnFailed(n.exitCode); o.sub = S.forceUnFailedSub; o.canScan = true; }
   else if (op.status === 'running') { o.title = n.timedOut ? S.outTimeout : S.outRunning; o.canScan = true; }
   else if (op.status === 'failed') o.title = S.outStillInstalled;
   else o.title = S.opStatus[op.status] || op.status;
@@ -608,6 +713,14 @@ const actions = {
   'trace-done': () => traceDone(),
   'trace-cancel': () => { invoke('trace_cancel').catch(() => {}); set({ view: 'list', tab: 'programs', trace: null }); },
   'trace-open-app': (el) => openCard(el.dataset.id),
+  'force-open': () => set({ view: 'force', force: { phase: 'pick' }, popover: false }),
+  'force-pick-file': () => forcePick(false),
+  'force-pick-folder': () => forcePick(true),
+  'force-un': (el) => { state.force.un = Number(el.dataset.i); render(); },
+  'force-go': () => forceRun(),
+  'force-other': () => set({ force: { phase: 'pick' } }),
+  'force-open-app': (el) => openCard(el.dataset.id),
+  'force-cancel': () => set({ view: 'list', tab: 'programs', force: null }),
   'back-card': () => set({ view: 'card', preview: false }),
   confirm: () => set({ modal: 'uninstall', hiddenOk: false }),
   'show-hidden': (el) => { state.showHidden = el.checked; loadApps(); },
@@ -662,6 +775,11 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('input', (e) => {
   if (e.target.id === 'q') { state.query = e.target.value; renderList(); }
+  if (e.target.id === 'fname' || e.target.id === 'fpub') {
+    state.force[e.target.id === 'fname' ? 'name' : 'publisher'] = e.target.value;
+    const run = $('#frun');
+    if (run) run.disabled = !forceReady() || state.busy;
+  }
 });
 
 document.addEventListener('keydown', (e) => {

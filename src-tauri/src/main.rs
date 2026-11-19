@@ -10,7 +10,7 @@ use tauri_plugin_dialog::DialogExt;
 use uni_core::env::Env;
 use uni_core::model::*;
 use uni_core::native::RunOptions;
-use uni_core::{elevation, inventory, ops, paths, trace};
+use uni_core::{elevation, force, inventory, ops, paths, trace};
 
 struct StopFlag(Arc<AtomicBool>);
 
@@ -22,6 +22,15 @@ struct TraceState {
 }
 
 struct TraceSlot(Mutex<TraceState>);
+
+/// The program file or folder the user picked for a forced removal ("remove by path"); the UI never sends a path back.
+struct ForceSlot(Mutex<Option<PathBuf>>);
+
+impl ForceSlot {
+    fn get(&self) -> MutexGuard<'_, Option<PathBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 impl TraceSlot {
     fn get(&self) -> MutexGuard<'_, TraceState> {
@@ -194,6 +203,64 @@ async fn pick_installer(app: AppHandle, env: State<'_, Env>, slot: State<'_, Tra
     Ok(st.picked.clone())
 }
 
+/// Asks for the program (or its folder) to remove by path. Runs on a worker thread (the dialog blocks). Returns the new pick, or None
+/// when the dialog was cancelled (the earlier pick stays in the slot). The file dialog resolves shortcuts itself. In sandbox mode it
+/// starts in the sandbox folder, and `force::check` refuses anything outside it anyway.
+#[tauri::command]
+async fn force_pick(app: AppHandle, env: State<'_, Env>, slot: State<'_, ForceSlot>, folder: bool, title: String, filter: String) -> Res<Option<PathBuf>> {
+    let sandbox_dir = env.sandbox.then(|| env.data_dir.parent().map(PathBuf::from)).flatten();
+    let picked = blocking(move || {
+        let mut d = app.dialog().file().set_title(title);
+        if !folder {
+            d = d.add_filter(filter, &["exe", "lnk"]);
+        }
+        if let Some(w) = app.get_webview_window("main") {
+            d = d.set_parent(&w);
+        }
+        if let Some(dir) = sandbox_dir {
+            d = d.set_directory(dir);
+        }
+        Ok(if folder { d.blocking_pick_folder() } else { d.blocking_pick_file() }.and_then(|f| f.into_path().ok()))
+    })
+    .await?;
+    if picked.is_some() {
+        *slot.get() = picked.clone();
+    }
+    Ok(picked)
+}
+
+/// Read-only identity check of the picked path (`force::check`).
+#[tauri::command]
+async fn force_check(env: State<'_, Env>, slot: State<'_, ForceSlot>) -> Res<ForceCheck> {
+    let env = env.inner().clone();
+    let path = slot.get().clone().ok_or("choose a program or a folder first")?;
+    blocking(move || s(force::check(&env, &path))).await
+}
+
+/// begin_forced, then the uninstaller the user chose (if any); progress goes out as `native-progress` events.
+#[tauri::command]
+async fn force_run(app: AppHandle, env: State<'_, Env>, stop: State<'_, StopFlag>, slot: State<'_, ForceSlot>, name: String, publisher: Option<String>, uninstaller: Option<PathBuf>) -> Res<Operation> {
+    let env = env.inner().clone();
+    let flag = stop.0.clone();
+    flag.store(false, Ordering::SeqCst);
+    let path = slot.get().clone().ok_or("choose a program or a folder first")?;
+    blocking(move || {
+        let op = s(ops::begin_forced(&env, &path, &name, publisher.as_deref(), uninstaller.as_deref()))?;
+        if op.launch.exe.as_os_str().is_empty() {
+            return Ok(op);
+        }
+        let opts = RunOptions {
+            stop: flag,
+            on_poll: Some(Box::new(move |p| {
+                let _ = app.emit("native-progress", p.to_vec());
+            })),
+            ..Default::default()
+        };
+        s(ops::run_native(&env, &op.id, &opts))
+    })
+    .await
+}
+
 /// Takes the "before" snapshot of the picked installer's trace (read-only).
 #[tauri::command]
 async fn trace_begin(env: State<'_, Env>, slot: State<'_, TraceSlot>) -> Res<TraceBegun> {
@@ -296,6 +363,7 @@ fn main() {
         .manage(env)
         .manage(StopFlag(Arc::new(AtomicBool::new(false))))
         .manage(TraceSlot(Mutex::new(TraceState::default())))
+        .manage(ForceSlot(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             app_info,
             list_apps,
@@ -312,6 +380,9 @@ fn main() {
             open_in_explorer,
             restart_as_admin,
             pick_installer,
+            force_pick,
+            force_check,
+            force_run,
             trace_begin,
             trace_install,
             trace_finish,
