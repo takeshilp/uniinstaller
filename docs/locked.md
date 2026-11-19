@@ -76,5 +76,9 @@ The numbered list (each is a `// shortcut:` comment at the named place) is in `d
 item, services not registered, only window programs closed, no cancel button, the `HolderSlot` equality, no journal for the close, `scanLabel`, uptime-based restart detection, no marker on old operations, no
 boot-time moves, the lab's single holder kind.
 
+## Scan output unchanged
+This feature does not change scan output: the preview dump of every listed program (`real_system_preview_dump`, 94 programs, 2251 lines) taken on `claude/services` and on `claude/locked` back to back on 2026-11-19 is identical.
+(`UNI_PREVIEW_DUMP` must be an absolute path: the test runs in `crates/core`.)
+
 ## Not checked
 RM inside GitHub Actions (the fixture runs in `ci.yml` with the rest of `cargo test`); an app that asks to save or refuses (351); Explorer, a service or an elevated process as a holder; Fast Startup; a real restart.
