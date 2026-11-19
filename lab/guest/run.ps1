@@ -23,10 +23,17 @@ function Lab([string]$file, [string[]]$argv) {
     Step "uni-lab $($argv -join ' ') -> $code"
     return $code
 }
-# One scenario action (before_install and after_install share them): file, delete or regval.
+# One scenario action (before_install and after_install share them): file, delete, delkey or regval.
 function Invoke-Action($act) {
     if ($act.file) { $path = X $act.file; New-Item (Split-Path $path) -ItemType Directory -Force | Out-Null; Set-Content -LiteralPath $path 'lab' }
     elseif ($act.delete) { Remove-Item -LiteralPath (X $act.delete) -Force }
+    elseif ($act.delkey) {
+        $m = [regex]::Match($act.delkey, '^(hklm|hkcu)(64|32):(.+)$')
+        if (-not $m.Success) { throw "bad delkey $($act.delkey)" }
+        $hive = if ($m.Groups[1].Value -eq 'hklm') { 'LocalMachine' } else { 'CurrentUser' }
+        $view = if ($m.Groups[2].Value -eq '32') { 'Registry32' } else { 'Registry64' }
+        [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view).DeleteSubKeyTree($m.Groups[3].Value)
+    }
     elseif ($act.regval) {
         $m = [regex]::Match($act.regval, '^(hklm|hkcu)(64|32):(.+)\|(.+)$')
         if (-not $m.Success) { throw "bad regval $($act.regval)" }
@@ -84,19 +91,31 @@ try {
     foreach ($act in $sc.after_install) { Invoke-Action $act; Step "after_install $($act | ConvertTo-Json -Compress)" }
     Save-Inventory $out 's1' $T; Step 's1'
 
-    $null = Lab 'apps.json' @('list')
-    $app = @((Read-Json 'apps.json') | Where-Object { $_.displayName -eq $sc.target })
-    if ($app.Count -ne 1) { throw "expected one program named '$($sc.target)', found $($app.Count)" }
-    $code = Lab 'op-begin.json' @('begin', $app[0].id)
-    if ($sc.expect_begin_error) {
+    if ($sc.force) {
+        # Forced removal: the program is named by path, not picked from the list. Every argument is quoted, because Start-Process
+        # -ArgumentList joins the array without quoting in PowerShell 5.1 and these values hold spaces.
+        $fargs = @('force', "`"$(X $sc.force.path)`"", "`"$($sc.force.name)`"")
+        if ($sc.force.publisher) { $fargs += @('--publisher', "`"$($sc.force.publisher)`"") }
+        if ($sc.force.run) { $fargs += '--run' }
+        $code = Lab 'op-begin.json' $fargs
+    } else {
+        $null = Lab 'apps.json' @('list')
+        $app = @((Read-Json 'apps.json') | Where-Object { $_.displayName -eq $sc.target })
+        if ($app.Count -ne 1) { throw "expected one program named '$($sc.target)', found $($app.Count)" }
+        $code = Lab 'op-begin.json' @('begin', $app[0].id)
+    }
+    if ($sc.expect_begin_error -or $sc.expect_force) {
         Save-Inventory $out 's5' $T; Step 's5'
     } else {
         if ($code -ne 0) { throw 'begin failed' }
         $op = (Read-Json 'op-begin.json').id
         $q = "$env:LOCALAPPDATA\uniinstaller-data\operations\$op\q"
-        $clicker = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$lab\guest\clicker.ps1", '-Log', "$out\clicks.log"
-        try { $code = Lab 'op-native.json' @('native', $op) } finally { Stop-Process -Id $clicker.Id -Force -ErrorAction SilentlyContinue }
-        if ($code -ne 0) { throw 'native failed' }
+        # A forced operation without --run has no native step (nothing was chosen to run).
+        if ((-not $sc.force) -or $sc.force.run) {
+            $clicker = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$lab\guest\clicker.ps1", '-Log', "$out\clicks.log"
+            try { $code = Lab 'op-native.json' @('native', $op) } finally { Stop-Process -Id $clicker.Id -Force -ErrorAction SilentlyContinue }
+            if ($code -ne 0) { throw 'native failed' }
+        }
         Save-Inventory $out 's2' $T; Step 's2'
         if ((Lab 'op-scan.json' @('scan', $op)) -ne 0) { throw 'scan failed' }
         Save-Inventory $out 's3' $T; Step 's3'

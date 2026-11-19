@@ -4,9 +4,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 use uni_core::env::{Env, SANDBOX_VAR};
-use uni_core::model::{EvidenceCode, Group, Plan};
+use uni_core::model::{EvidenceCode, ForceCheck, Group, Plan};
 use uni_core::native::RunOptions;
-use uni_core::{elevation, inventory, ops, paths, trace};
+use uni_core::{elevation, force, inventory, ops, paths, trace};
 use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
 use windows::Win32::System::WindowsProgramming::GetUserNameW;
 use windows::core::PWSTR;
@@ -16,7 +16,9 @@ const LAB_VAR: &str = "UNIINSTALLER_LAB";
 const LAB_MARKER: &str = ".uniinstaller-lab";
 const REFUSED: i32 = 2;
 const CRASH_CODE: u32 = 99;
-const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | native <op> | scan <op> | apply <op> default|default+reverts|unblocked [--crash-after-first-move] | restore <op> | show <op>";
+/// `force` found the path Listed or Refused: the check result is printed instead of an operation.
+const CHECK_REFUSED: i32 = 3;
+const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | force <path> <name> [--publisher <p>] [--run] | native <op> | scan <op> | apply <op> default|default+reverts|unblocked [--crash-after-first-move] | restore <op> | show <op>";
 
 /// Pure. The token user must be the Windows Sandbox account (it exists disabled on a normal host) and
 /// UNIINSTALLER_LAB must name a local folder with the lab marker (explicit intent, not a location proof).
@@ -134,6 +136,22 @@ fn run(args: &[String]) -> Result<i32, String> {
         "list" => pretty(&inventory::list_apps(&env, true).map_err(core)?), // a hidden target is found by name like any other
         "trace" => trace_install(&env, arg(1)?),
         "begin" => pretty(&ops::begin(&env, arg(1)?, true).map_err(core)?), // the lab acts as a user who ticked the hidden-component confirmation; the refusal is tested in tests/ops.rs
+        // Forced removal of a program the list does not know: the check result (exit 3) when the path is Listed or Refused, else the new
+        // operation; `--run` chooses the first uninstaller found in the folder.
+        "force" => {
+            let path = PathBuf::from(arg(1)?);
+            let publisher = args.iter().position(|a| a == "--publisher").and_then(|i| args.get(i + 1)).map(String::as_str);
+            match force::check(&env, &path).map_err(core)? {
+                ForceCheck::Ok { found } => {
+                    let uninstaller = if args.iter().any(|a| a == "--run") { Some(found.uninstallers.first().cloned().ok_or("--run: no uninstaller was found in the folder")?) } else { None };
+                    pretty(&ops::begin_forced(&env, &path, arg(2)?, publisher, uninstaller.as_deref()).map_err(core)?)
+                }
+                other => {
+                    println!("{}", pretty(&other)?);
+                    return Ok(CHECK_REFUSED);
+                }
+            }
+        }
         "native" => {
             let opts = RunOptions { timeout: Duration::from_secs(300), ..Default::default() };
             pretty(&ops::run_native(&env, arg(1)?, &opts).map_err(core)?)

@@ -108,10 +108,14 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     if (($reasons | Where-Object { $_.level -eq 'ERROR' }).Count -and (-not $dn -or -not $dn.ok)) { return (& $finish) }
 
     $codes = $dn.exitCodes
-    $broken = [bool]$sc.expect_begin_error
-    $expect = [ordered]@{ 'op-begin.json' = $(if ($broken) { 1 } else { 0 }) }
+    # A forced scenario with expect_force only checks what the force check says (uni-lab exits 3 and prints the check result).
+    $expectForce = [string]$sc.expect_force
+    $broken = ([bool]$sc.expect_begin_error) -or ($expectForce -ne '')
+    $expect = [ordered]@{ 'op-begin.json' = $(if ($expectForce) { 3 } elseif ($sc.expect_begin_error) { 1 } else { 0 }) }
     if (-not $broken) {
-        $expect['op-native.json'] = 0; $expect['op-scan.json'] = 0; $expect['op-apply.json'] = 0; $expect['op-rescan.json'] = 0; $expect['op-restore.json'] = 0
+        # A forced operation without a chosen uninstaller has no native step.
+        if ((-not $sc.force) -or $sc.force.run) { $expect['op-native.json'] = 0 }
+        $expect['op-scan.json'] = 0; $expect['op-apply.json'] = 0; $expect['op-rescan.json'] = 0; $expect['op-restore.json'] = 0
         if ($sc.crash) { $expect['op-apply-crash.json'] = 99; $expect['op-after-crash.json'] = 0 }
     }
     if ($sc.trace) { $expect['trace.json'] = 0 }
@@ -165,7 +169,23 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
 
     # Broken scenario: begin must fail and nothing may change.
     if ($broken) {
-        $cmp = Compare-Maps $snap['s1'] $snap['s5']
+        # Rule 16e: the force check must say what the scenario expects (listed:<how> or refused:<code>).
+        if ($expectForce) {
+            $fc = Read-Json (& $f 'op-begin.json')
+            $gotForce = if ($fc.type -eq 'listed') { "listed:$($fc.how)" } else { "$($fc.type):$($fc.code)" }
+            if ($gotForce -ne $expectForce) { Add-Reason 'FAIL' "force check gave $gotForce, expected $expectForce" }
+        }
+        $m1 = $snap['s1']; $m5 = $snap['s5']
+        if ($expectForce) {
+            # Folders the inventory could not read (the en-us and ru-ru language folders of Windows components) are listed unstably in
+            # the first seconds after an MSI install; the force check itself writes nothing, so they are left out of this comparison.
+            $skip = @{}
+            foreach ($e in $invErr) { $skip[($e -replace ' \S+$', '')] = 1 }
+            $m1 = New-Map; $m5 = New-Map
+            foreach ($k in $snap['s1'].Keys) { if (-not $skip.ContainsKey($k)) { $m1[$k] = $snap['s1'][$k] } }
+            foreach ($k in $snap['s5'].Keys) { if (-not $skip.ContainsKey($k)) { $m5[$k] = $snap['s5'][$k] } }
+        }
+        $cmp = Compare-Maps $m1 $m5
         if (-not $cmp.Equal) { Add-Reason 'FAIL' "a failed begin changed the system ($($cmp.Count) differences): $($cmp.Diffs -join '; ')" }
         return (& $finish)
     }
@@ -179,7 +199,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     if ($lostByNative.Count) { Add-Reason 'ERROR' "control/userdoc object missing after the native uninstaller (test-app bug): $($lostByNative[0]) (+$($lostByNative.Count - 1))" }
 
     $op = Read-Json (& $f 'op-begin.json')
-    $nat = Read-Json (& $f 'op-native.json')
+    $nat = if ($sc.force -and -not $sc.force.run) { $op } else { Read-Json (& $f 'op-native.json') }
     $scan = Read-Json (& $f 'op-scan.json')
     $app = Read-Json (& $f 'op-apply.json')
     $rst = Read-Json (& $f 'op-restore.json')
@@ -368,6 +388,15 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         if ($tj -and $tj.changes) { $res['traceCreated'] = @($tj.changes | Where-Object { $_.change -eq 'created' -and -not $_.noise }).Count }
         $res['reverted'] = @($items | Where-Object { $_.status -eq 'reverted' }).Count
         $res['traceEvidence'] = @($offered | Where-Object { @($_.evidence | Where-Object { $_.code -eq 'traceCreated' }).Count }).Count
+    }
+
+    # Rule 16 (forced removal): the operation is marked forced, a forced plan preselects nothing (the identity is the user's word), and
+    # with no uninstaller chosen there is no native run. Rules 1-14 and 17 apply unchanged.
+    if ($sc.force) {
+        if (-not $op.forced) { Add-Reason 'ERROR' 'op-begin.json has no forced mark: the scenario did not exercise forced removal' }
+        foreach ($c in @($cands | Where-Object { $_.selected })) { Add-Reason 'FAIL' "a forced plan preselects a candidate: $($c.nid)" }
+        if (-not $app.forced) { Add-Reason 'FAIL' 'op-apply.json lost the forced mark' }
+        if ((-not $sc.force.run) -and $null -ne $app.native) { Add-Reason 'FAIL' 'a forced operation without a chosen uninstaller has a native run' }
     }
 
     # Rule 13: known gaps (never part of the verdict).

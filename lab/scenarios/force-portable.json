@@ -1,0 +1,7 @@
+{ "about": "Per-user drop with no uninstaller and no Uninstall entry, removed by path with nothing run: every reference is found by folder and name, nothing is preselected.",
+  "install": ["labportable.exe"], "after_install": [],
+  "force": { "path": "{LOCALAPPDATA}\\Programs\\Lab Portable\\labportable.exe", "name": "Lab Portable", "publisher": "Lab Vendor", "run": false },
+  "target": "Lab Portable", "select": "unblocked",
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Portable", "{DESKTOP}\\Lab Portable.lnk", "{PROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labportable", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labportable.exe"],
+  "userdoc": [], "control": ["{LOCALAPPDATA}\\Programs"], "gap": [] }

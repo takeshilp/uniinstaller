@@ -1,0 +1,6 @@
+{ "about": "Per-machine NSIS app with a service whose Uninstall entry was deleted: a Windows service runs from the folder, so a forced removal is refused.",
+  "install": ["labsvc.exe"],
+  "after_install": [ { "delkey": "hklm64:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LabServiceTool" } ],
+  "force": { "path": "{PF}\\Lab Vendor\\Lab Service Tool", "name": "Lab Service Tool" },
+  "expect_force": "refused:service", "target": "Lab Service Tool", "select": "default",
+  "owned": [], "userdoc": [], "control": [], "gap": [] }

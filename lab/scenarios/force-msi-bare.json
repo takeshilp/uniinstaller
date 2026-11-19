@@ -1,0 +1,5 @@
+{ "about": "Per-machine x86 MSI with an empty InstallLocation: only its Windows Installer components tie the folder to the program, so a forced removal is redirected to it.",
+  "install": ["labmsi-x86.msi"], "after_install": [],
+  "force": { "path": "{PF86}\\Lab Vendor\\Lab Msi Bare", "name": "Lab Msi Bare" },
+  "expect_force": "listed:installer", "target": "Lab Msi Bare", "select": "default",
+  "owned": [], "userdoc": [], "control": [], "gap": [] }

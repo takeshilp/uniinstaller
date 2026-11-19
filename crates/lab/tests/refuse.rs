@@ -6,7 +6,7 @@ use std::process::Command;
 fn refuses_outside_the_guest_even_with_a_forged_environment() {
     let lab = tempfile::tempdir().unwrap();
     std::fs::write(lab.path().join(".uniinstaller-lab"), b"").unwrap();
-    let cmds: [&[&str]; 7] = [&["list"], &["begin", "HKCU64:X"], &["native", "op-1"], &["scan", "op-1"],
+    let cmds: [&[&str]; 8] = [&["list"], &["begin", "HKCU64:X"], &["force", r"C:\x", "X"], &["native", "op-1"], &["scan", "op-1"],
         &["apply", "op-1", "default"], &["restore", "op-1"], &["show", "op-1"]];
     for args in cmds {
         let out = Command::new(env!("CARGO_BIN_EXE_uni-lab")).args(args)

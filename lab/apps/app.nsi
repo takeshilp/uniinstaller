@@ -63,6 +63,8 @@ Section
   !insertmacro Context
   SetOutPath "$INSTDIR"
   File "/oname=${EXE}" "${PAYLOAD}"
+!ifndef NOARP
+  ; NOARP: a portable-style drop with no uninstaller and no Uninstall entry (forced-removal scenarios).
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr ${HIVE} "${ARP}" "DisplayName" "${NAME}"
   WriteRegStr ${HIVE} "${ARP}" "DisplayVersion" "${VERSION}"
@@ -75,6 +77,7 @@ Section
 !ifdef HIDDEN
   ; Hides the entry from Apps & Features, as runtime components and unwanted software do.
   WriteRegDWORD ${HIVE} "${ARP}" "SystemComponent" 1
+!endif
 !endif
   WriteRegStr ${HIVE} "${RUNKEY}" "${KEY}" '"$INSTDIR\${EXE}" /tray'
   WriteRegStr ${HIVE} "${APPPATHS}" "" "$INSTDIR\${EXE}"
@@ -146,6 +149,7 @@ Section
 !endif
 SectionEnd
 
+!ifndef NOARP
 Section "Uninstall"
   ; Deliberately incomplete like many real uninstallers: leaves the desktop shortcut, Run value, App Paths,
   ; vendor key, settings and every flag-specific object (service, task, association, documents, links).
@@ -162,3 +166,4 @@ Section "Uninstall"
   DeleteRegKey ${HIVE} "${ARP}"
   RMDir "$INSTDIR"
 SectionEnd
+!endif

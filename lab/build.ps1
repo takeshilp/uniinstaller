@@ -22,6 +22,7 @@ $nsis = @(
     @{ Out = 'labnotes.exe';   D = @('NAME=Lab Notes', 'KEY=LabNotes', 'EXE=labnotes.exe', 'USER', 'DOCS', 'JUNCTION') },
     @{ Out = 'labmany.exe';    D = @('NAME=Lab Many', 'KEY=LabMany', 'EXE=labmany.exe', 'USER', 'LINKS') },
     @{ Out = 'labbroken.exe';  D = @('NAME=Lab Broken', 'KEY=LabBroken', 'EXE=labbroken.exe', 'USER') },
+    @{ Out = 'labportable.exe'; D = @('NAME=Lab Portable', 'KEY=LabPortable', 'EXE=labportable.exe', 'USER', 'NOARP') },
     @{ Out = 'labsvc.exe';     D = @('NAME=Lab Service Tool', 'KEY=LabServiceTool', 'EXE=labsvc.exe', 'SERVICE') },
     @{ Out = 'labsuite.exe';   D = @('NAME=Lab Suite', 'KEY=LabSuite', 'EXE=labsuite.exe', 'SHARED_DLL') },
     @{ Out = 'labplugin.exe';  D = @('NAME=Lab Suite Plugin', 'KEY=LabSuitePlugin', 'EXE=labplugin.exe', 'SHARED_DLL',

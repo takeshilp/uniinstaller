@@ -1,0 +1,8 @@
+{ "about": "Per-user NSIS app whose Uninstall entry was deleted: removed by path, the uninstaller found in its folder is run, then the leftovers are found by folder and name.",
+  "install": ["labbroken.exe"],
+  "after_install": [ { "delkey": "hkcu64:Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\LabBroken" } ],
+  "force": { "path": "{LOCALAPPDATA}\\Programs\\Lab Broken", "name": "Lab Broken", "publisher": "Lab Vendor", "run": true },
+  "target": "Lab Broken", "select": "unblocked",
+  "owned": ["{LOCALAPPDATA}\\Programs\\Lab Broken", "{DESKTOP}\\Lab Broken.lnk", "{PROGRAMS}\\Lab Vendor", "{APPDATA}\\Lab Vendor",
+    "key:hkcu64:software\\lab vendor", "value:hkcu64:software\\microsoft\\windows\\currentversion\\run|labbroken", "key:hkcu64:software\\microsoft\\windows\\currentversion\\app paths\\labbroken.exe"],
+  "userdoc": [], "control": ["{LOCALAPPDATA}\\Programs"], "gap": [] }
