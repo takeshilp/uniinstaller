@@ -7,6 +7,7 @@ use crate::model::*;
 use crate::native::{RunOptions, alive, run_uninstaller};
 use crate::paths::{self, io_status, is_canonical, is_inside, norm, restore_path};
 use crate::registry;
+use crate::rm;
 use crate::safety::{Anchors, path_blocks, program_protected, real_folders, registry_blocks, service_blocks, task_blocks, zone_root_of};
 use crate::scan::{Ctx, anchors_of, data_volume, evaluate};
 use crate::sysobj;
@@ -305,8 +306,36 @@ pub fn run_native(env: &Env, op_id: &str, opts: &RunOptions) -> Result<Operation
     op.entry_after = Some(entry_state(&op.app, &op.launch, run.exit_code, &env.folders.windows_dir));
     op.native = Some(run);
     (op.status, op.status_detail) = overall_status(&op);
+    mark_native_reboot(&mut op);
     save(env, &op)?;
     Ok(op)
+}
+
+/// Start time of this boot as Unix ms, from uptime.
+// shortcut: restarts are detected from uptime, so a shutdown with Fast Startup is not a restart; upgrade to `PrefetchParameters\BootId`
+// once it is measured to change on hybrid boots.
+pub fn boot_ms() -> u64 {
+    // SAFETY: no arguments, no state.
+    now_ms().saturating_sub(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() })
+}
+
+/// A native run that ended `PendingReboot` starts waiting for a restart: the banner offers to continue after one.
+// shortcut: operations from older builds have no marker and never show the banner; open them from History.
+fn mark_native_reboot(op: &mut Operation) {
+    if op.status == OpStatus::PendingReboot && op.items.is_empty() {
+        op.continue_after_reboot = op.native.as_ref().map(|n| n.ended_ms);
+    }
+}
+
+/// Whether a restart happened since the operation started waiting for one.
+pub fn continues_after_reboot(op: &Operation, boot: u64) -> bool {
+    op.continue_after_reboot.is_some_and(|t| boot > t)
+}
+
+/// Operations that were waiting for a restart which has happened since (the banner on the next start).
+pub fn reboot_continuations(env: &Env) -> Result<Vec<Operation>> {
+    let boot = boot_ms();
+    Ok(history(env)?.into_iter().filter_map(|h| if let HistoryEntry::Ok { op } = h { Some(*op) } else { None }).filter(|op| continues_after_reboot(op, boot)).collect())
 }
 
 /// Finds leftovers with live preconditions; stores the plan.
@@ -321,12 +350,8 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
             if let Some(e) = &n.launch_error {
                 return Err(Error(format!("the uninstaller did not start: {e}")));
             }
-            if n.reboot_required {
-                // shortcut: "rebooted since" comes from uptime only; there is no automatic continuation, add resume in stage 2.
-                let boot_ms = now_ms().saturating_sub(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() });
-                if boot_ms <= n.ended_ms {
-                    return Err(Error("a reboot is required before leftovers can be searched".into()));
-                }
+            if n.reboot_required && boot_ms() <= n.ended_ms {
+                return Err(Error("a reboot is required before leftovers can be searched".into()));
             }
         }
         None if skips_native(&op) => {}
@@ -344,12 +369,15 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     plan.trace = tr.map(|(_, u)| u);
     plan.still_running = native.iter().flat_map(|n| &n.processes).filter(|p| alive(p)).map(|p| p.image.clone()).collect();
     op.plan = Some(plan);
+    // The search is the continuation of a native run that asked for a restart; a locked-retry operation that is rescanned keeps its marker.
+    if op.items.is_empty() {
+        op.continue_after_reboot = None;
+    }
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
     Ok(op)
 }
 
-// shortcut: a locked file is reported as Locked and retried by hand, there is no Restart Manager; add it in stage 2.
 fn is_final(s: ItemStatus) -> bool {
     matches!(s, ItemStatus::Removed | ItemStatus::NotFound | ItemStatus::Reverted)
 }
@@ -409,6 +437,11 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     guard(env)?;
     valid_op_id(op_id)?;
     let _g = lock();
+    apply_locked(env, op_id, candidate_ids)
+}
+
+/// `apply` for a caller that already holds `OP_LOCK`.
+fn apply_locked(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operation> {
     let mut op = load(env, op_id)?;
     forced_in_scope(env, &op)?;
     let plan = op.plan.clone().ok_or_else(|| Error("no plan: search for leftovers first".into()))?;
@@ -546,6 +579,11 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
         }
     }
 
+    // The restart reminder is done once nothing waits any more.
+    if !op.items.iter().any(|i| matches!(i.status, ItemStatus::Locked | ItemStatus::AccessDenied)) {
+        op.continue_after_reboot = None;
+    }
+
     // Verify.
     let listed = list_apps(env, true)?;
     let app_still_listed = listed.iter().any(|a| a.id == op.app.id || a.sources.iter().any(|s| op.app.sources.iter().any(|x| x.same(s))));
@@ -554,6 +592,107 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     if let Some(n) = &op.native {
         op.entry_after = Some(entry_state(&op.app, &op.launch, n.exit_code, &env.folders.windows_dir));
     }
+    (op.status, op.status_detail) = overall_status(&op);
+    save(env, &op)?;
+    Ok(op)
+}
+
+/// The path items that are still `Locked` or `AccessDenied`.
+fn locked_paths(op: &Operation) -> impl Iterator<Item = (&ItemRecord, &Path, PathKind)> {
+    op.items.iter().filter(|i| matches!(i.status, ItemStatus::Locked | ItemStatus::AccessDenied)).filter_map(|i| match &i.target {
+        Target::Path { path, kind } => Some((i, path.as_path(), *kind)),
+        _ => None,
+    })
+}
+
+/// Who holds each locked path item right now: probe for the blocking files, ask the Restart Manager about those, and mark what cannot be closed.
+// shortcut: one Restart Manager query per item (about 0.5 s per held file, about 240 ms per registered file under Program Files);
+// batch the queries if operations with many locked items appear.
+fn holders_of(op: &Operation) -> Vec<ItemHolders> {
+    let uninstaller: &[ProcInfo] = op.native.as_ref().map(|n| n.processes.as_slice()).unwrap_or(&[]);
+    locked_paths(op)
+        .map(|(i, path, kind)| {
+            let b = rm::blockers(path, kind, rm::MAX_PROBE);
+            let mut out = ItemHolders { candidate_id: i.candidate_id.clone(), files: 0, folders: b.folders, truncated: b.truncated, holders: vec![], reasons: 0, error: None };
+            if b.files.is_empty() {
+                return out;
+            }
+            out.files = b.files.len();
+            out.truncated |= b.files.len() > rm::MAX_FILES;
+            match rm::holders(&b.files) {
+                Ok((mut hs, reasons)) => {
+                    for h in &mut hs {
+                        h.block = rm::block(h, std::process::id(), uninstaller);
+                    }
+                    (out.holders, out.reasons) = (hs, reasons);
+                }
+                Err(e) => out.error = Some(e.to_string()),
+            }
+            out
+        })
+        .collect()
+}
+
+/// Read-only: which programs hold the files of the locked items. Not guarded, like `preview`.
+pub fn lock_holders(env: &Env, op_id: &str) -> Result<Vec<ItemHolders>> {
+    valid_op_id(op_id)?;
+    let op = load(env, op_id)?;
+    forced_in_scope(env, &op)?;
+    Ok(holders_of(&op))
+}
+
+/// Closes the programs the user confirmed (only those: a fresh look at the holders must be a subset of `confirmed`, and nothing blocked, nothing
+/// that needs a restart) with a graceful Restart Manager shutdown, retries the locked items through the journalled `apply`, then lets the
+/// Restart Manager restart what it can. `OP_LOCK` is held throughout, so an update install is refused meanwhile.
+// shortcut: `RmShutdown` waits as long as the Restart Manager does, there is no cancel button; add `RmCancelCurrentTask` behind a stop button.
+// shortcut: `RmRestart` restarts only programs registered for restart, and closing is not journalled: a crash between the shutdown and the
+// restart leaves the programs closed (they closed gracefully).
+pub fn close_and_retry(env: &Env, op_id: &str, confirmed: &[Holder]) -> Result<Closed> {
+    guard(env)?;
+    valid_op_id(op_id)?;
+    let _g = lock();
+    let op = load(env, op_id)?;
+    forced_in_scope(env, &op)?;
+    if matches!(op.status, OpStatus::Restored | OpStatus::PartiallyRestored) {
+        return Err(Error("this operation was restored".into()));
+    }
+    let live = holders_of(&op);
+    if live.is_empty() {
+        return Err(Error("this operation has no locked files".into()));
+    }
+    let close = rm::to_close(&live, confirmed).map_err(Error)?;
+    let ids: Vec<String> = live.iter().map(|i| i.candidate_id.clone()).collect();
+    let (closing, shutdown_error) = if close.is_empty() {
+        (None, None)
+    } else {
+        let (c, e) = rm::close(&close)?;
+        (Some(c), e)
+    };
+    // Who is still running is read before the retry and the restart: a restarted program is a new process anyway.
+    let (still_running, closed): (Vec<Holder>, Vec<Holder>) =
+        close.into_iter().partition(|h| alive(&ProcInfo { pid: h.pid, image: String::new(), created: h.started, exit_code: None }));
+    let applied = apply_locked(env, op_id, &ids);
+    let restart_error = closing.as_ref().and_then(|c| c.restart().err()).map(|e| e.to_string());
+    drop(closing);
+    Ok(Closed { op: applied?, closed, still_running, shutdown_error, restart_error })
+}
+
+/// "Retry after a restart": sets or clears the marker that the banner on the next start offers to continue from. Manifest only.
+// shortcut: no boot-time moves (`MoveFileEx` DELAY_UNTIL_REBOOT, which needs admin and skips every check) and no RunOnce key (an autostart
+// entry): the user starts Uniinstaller after the restart and the banner offers to continue.
+pub fn remind_after_reboot(env: &Env, op_id: &str, on: bool) -> Result<Operation> {
+    valid_op_id(op_id)?;
+    let _g = lock();
+    let mut op = load(env, op_id)?;
+    if on {
+        if matches!(op.status, OpStatus::Restored | OpStatus::PartiallyRestored) {
+            return Err(Error("this operation was restored".into()));
+        }
+        if !op.items.iter().any(|i| matches!(i.status, ItemStatus::Locked | ItemStatus::AccessDenied)) {
+            return Err(Error("nothing in this operation waits for a restart".into()));
+        }
+    }
+    op.continue_after_reboot = on.then(now_ms);
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
     Ok(op)
@@ -633,6 +772,7 @@ pub fn restore(env: &Env, op_id: &str) -> Result<Operation> {
             op.items[idx].restore_detail = detail;
         }
     }
+    op.continue_after_reboot = None;
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
     Ok(op)
@@ -726,6 +866,9 @@ pub fn overall_status(op: &Operation) -> (OpStatus, Option<String>) {
         if n.reboot_required && op.items.is_empty() {
             return (OpStatus::PendingReboot, None);
         }
+    }
+    if op.continue_after_reboot.is_some() && op.items.iter().any(|i| matches!(i.status, ItemStatus::Locked | ItemStatus::AccessDenied)) {
+        return (OpStatus::PendingReboot, Some("waits for a restart to retry the locked items".into()));
     }
     if op.items.is_empty() {
         return (OpStatus::AwaitingReview, None);
@@ -883,6 +1026,51 @@ mod tests {
         assert_eq!(st(&o), OpStatus::Failed);
         // not forced and no native run: still Running even with an empty launch
         assert_eq!(st(&op(None, None, vec![item(Removed)])), OpStatus::Running);
+    }
+
+    #[test]
+    fn restart_marker_status_rows() {
+        use EntryState::*;
+        use ItemStatus::*;
+        let marked = |items: Vec<ItemRecord>| {
+            let mut o = op(Some(run()), Some(Gone), items);
+            o.continue_after_reboot = Some(5);
+            o
+        };
+        assert_eq!(st(&marked(vec![item(Removed), item(Locked)])), OpStatus::PendingReboot);
+        assert_eq!(st(&marked(vec![item(Removed), item(AccessDenied)])), OpStatus::PendingReboot);
+        assert_ne!(st(&marked(vec![item(Removed)])), OpStatus::PendingReboot);
+        assert_eq!(st(&marked(vec![item(Removed), item(Blocked)])), OpStatus::PartiallyCompleted, "only a locked item waits for a restart");
+        // restored items win over the marker
+        let mut a = item(Removed);
+        a.quarantine = Some(PathBuf::from(r"C:\q\1_a"));
+        a.restore = Some(RestoreStatus::Restored);
+        let o = marked(vec![a]);
+        assert_eq!(st(&o), OpStatus::Restored);
+    }
+
+    #[test]
+    fn continues_after_reboot_table() {
+        let mut o = op(None, None, vec![]);
+        assert!(!continues_after_reboot(&o, 1_000_000));
+        o.continue_after_reboot = Some(100);
+        assert!(continues_after_reboot(&o, 101));
+        assert!(!continues_after_reboot(&o, 100));
+        assert!(!continues_after_reboot(&o, 50));
+    }
+
+    #[test]
+    fn mark_native_reboot_table() {
+        use EntryState::*;
+        let reboot = NativeRun { exit_code: Some(3010), reboot_required: true, ended_ms: 7, ..run() };
+        let marked = |mut o: Operation| {
+            (o.status, o.status_detail) = overall_status(&o);
+            mark_native_reboot(&mut o);
+            o.continue_after_reboot
+        };
+        assert_eq!(marked(op(Some(reboot.clone()), Some(Gone), vec![])), Some(7));
+        assert_eq!(marked(op(Some(reboot), Some(Present), vec![])), None, "the entry is still there: the run failed");
+        assert_eq!(marked(op(Some(run()), Some(Gone), vec![])), None);
     }
 
     #[test]

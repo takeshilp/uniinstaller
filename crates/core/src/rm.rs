@@ -1,6 +1,6 @@
 //! Restart Manager: which processes hold a locked item's files (read-only) and a graceful close of exactly the processes the user saw.
 //! Never `RmForceShutdown`, never `TerminateProcess`.
-use crate::model::{Holder, HolderBlock, HolderKind, PathKind, ProcInfo};
+use crate::model::{Holder, HolderBlock, HolderKind, ItemHolders, PathKind, ProcInfo};
 use crate::native::{ft, processes};
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +9,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use windows::Win32::System::RestartManager::*;
+use windows::Win32::Foundation::FILETIME;
 use windows::core::{PCWSTR, PWSTR};
 
 // shortcut: at most 64 blocking files per item are registered with the Restart Manager (about 0.5 s per held file, about 240 ms per
@@ -83,6 +84,7 @@ pub fn blockers(path: &Path, kind: PathKind, cap: usize) -> Blocked {
 }
 
 /// A Restart Manager session, ended on drop.
+#[derive(Debug)]
 struct Session(u32);
 
 impl Session {
@@ -204,6 +206,95 @@ pub fn block(h: &Holder, own_pid: u32, uninstaller: &[ProcInfo]) -> Option<Holde
     }
 }
 
+/// The guard that only the programs the user saw are closed. `live` is the fresh answer, `confirmed` the list the user confirmed.
+/// Refuses when only a restart frees an item, when any live holder is blocked, or when a live holder (pid plus start time) was not in the
+/// confirmed list. Otherwise the live holders (deduplicated), which may be none: every confirmed holder exited meanwhile.
+pub fn to_close(live: &[ItemHolders], confirmed: &[Holder]) -> Result<Vec<Holder>, String> {
+    if let Some(i) = live.iter().find(|i| i.reasons != 0) {
+        return Err(format!("Restart Manager says only a restart frees {} (reasons {:#x})", i.candidate_id, i.reasons));
+    }
+    let mut out: Vec<Holder> = Vec::new();
+    for h in live.iter().flat_map(|i| &i.holders) {
+        if let Some(b) = h.block {
+            return Err(format!("{} (PID {}) cannot be closed from here: {b:?}", h.name, h.pid));
+        }
+        if !confirmed.iter().any(|c| c.pid == h.pid && c.started == h.started) {
+            return Err(format!("{} (PID {}) holds the files but was not in the list you confirmed; look at the list again", h.name, h.pid));
+        }
+        if !out.iter().any(|c| c.pid == h.pid && c.started == h.started) {
+            out.push(h.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// A session whose registered programs were shut down; `restart` asks the Restart Manager to start them again. Ends the session on drop.
+#[derive(Debug)]
+pub(crate) struct Closing(Session);
+
+impl Closing {
+    pub(crate) fn restart(&self) -> io::Result<()> {
+        // SAFETY: a live session; no callback.
+        let rc = unsafe { RmRestart(self.0.0, None, None) };
+        if rc.0 != 0 {
+            return Err(os_err(rc.0));
+        }
+        Ok(())
+    }
+}
+
+fn refuse(msg: impl Into<String>) -> io::Error {
+    io::Error::other(msg.into())
+}
+
+/// Asks exactly `hs` to close, gracefully (`RmShutdown` with flags 0: a program that asks to save or refuses stays open; there is no force
+/// flag anywhere). Everything is re-checked before any shutdown: no program of ours, none blocked, only window programs, and the Restart
+/// Manager's own view of the registered processes must be exactly `hs`' kinds, identities and no reboot reasons. The second value is the
+/// shutdown error text if some program did not close (351) or nothing was done (350).
+pub(crate) fn close(hs: &[Holder]) -> io::Result<(Closing, Option<String>)> {
+    if hs.is_empty() {
+        return Err(refuse("nothing to close"));
+    }
+    for h in hs {
+        if h.pid == std::process::id() {
+            return Err(refuse("refusing to close Uniinstaller itself"));
+        }
+        if let Some(b) = h.block {
+            return Err(refuse(format!("{} (PID {}) cannot be closed from here: {b:?}", h.name, h.pid)));
+        }
+        if !matches!(h.kind, HolderKind::MainWindow | HolderKind::OtherWindow) {
+            return Err(refuse(format!("{} (PID {}) cannot be closed from here: {:?}", h.name, h.pid, h.kind)));
+        }
+    }
+    let s = Session::start()?;
+    let procs: Vec<RM_UNIQUE_PROCESS> = hs
+        .iter()
+        .map(|h| RM_UNIQUE_PROCESS { dwProcessId: h.pid, ProcessStartTime: FILETIME { dwLowDateTime: h.started as u32, dwHighDateTime: (h.started >> 32) as u32 } })
+        .collect();
+    // SAFETY: `procs` outlives the call.
+    let rc = unsafe { RmRegisterResources(s.0, None, Some(&procs), None) };
+    if rc.0 != 0 {
+        return Err(os_err(rc.0));
+    }
+    let (infos, reasons) = list(&s)?;
+    if reasons != 0 {
+        return Err(refuse(format!("Restart Manager reports reboot reasons {reasons:#x}; nothing was closed")));
+    }
+    for e in &infos {
+        let started = ft(e.Process.ProcessStartTime);
+        if !hs.iter().any(|h| h.pid == e.Process.dwProcessId && h.started == started) || !matches!(e.ApplicationType.0, 1 | 2) {
+            return Err(refuse(format!("Restart Manager lists a program that was not confirmed (PID {}, type {}); nothing was closed", e.Process.dwProcessId, e.ApplicationType.0)));
+        }
+    }
+    if infos.is_empty() {
+        return Ok((Closing(s), None));
+    }
+    // SAFETY: a live session with registered processes; flags 0 = graceful, no callback.
+    let rc = unsafe { RmShutdown(s.0, 0, None) };
+    let err = (rc.0 != 0).then(|| format!("{} ({})", os_err(rc.0), rc.0));
+    Ok((Closing(s), err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +333,42 @@ mod tests {
         ] {
             assert_eq!(b(&holder(9, 1, "x.exe", k), &[]), want, "{k:?}");
         }
+    }
+
+    fn item(id: &str, reasons: u32, holders: Vec<Holder>) -> ItemHolders {
+        ItemHolders { candidate_id: id.into(), files: holders.len(), folders: 0, truncated: false, holders, reasons, error: None }
+    }
+
+    #[test]
+    fn to_close_guard() {
+        let a = holder(10, 100, "a.exe", HolderKind::MainWindow);
+        let b = holder(11, 101, "b.exe", HolderKind::OtherWindow);
+        assert_eq!(to_close(&[], &[]), Ok(vec![]));
+        assert_eq!(to_close(&[item("x", 0, vec![])], std::slice::from_ref(&a)), Ok(vec![]), "nothing holds the file any more");
+        assert!(to_close(&[item("x", 3, vec![a.clone()])], std::slice::from_ref(&a)).unwrap_err().contains("only a restart"));
+        let blocked = Holder { block: Some(HolderBlock::Explorer), ..a.clone() };
+        assert!(to_close(&[item("x", 0, vec![blocked.clone()])], &[blocked]).unwrap_err().contains("cannot be closed"));
+        assert!(to_close(&[item("x", 0, vec![a.clone()])], &[]).unwrap_err().contains("confirmed"));
+        assert!(to_close(&[item("x", 0, vec![a.clone()])], std::slice::from_ref(&b)).unwrap_err().contains("confirmed"));
+        let other_start = Holder { started: 101, ..a.clone() };
+        assert!(to_close(&[item("x", 0, vec![a.clone()])], &[other_start]).unwrap_err().contains("confirmed"), "the same pid with another start time is another process");
+        // the confirmed list may be longer: a program that exited meanwhile is simply not closed
+        assert_eq!(to_close(&[item("x", 0, vec![a.clone()])], &[a.clone(), b.clone()]), Ok(vec![a.clone()]));
+        // one program holding two items is listed once
+        assert_eq!(to_close(&[item("x", 0, vec![a.clone()]), item("y", 0, vec![a.clone(), b.clone()])], &[a.clone(), b.clone()]), Ok(vec![a, b]));
+    }
+
+    #[test]
+    fn close_refuses_self_and_nothing() {
+        // every one of these returns before any Restart Manager call
+        assert!(close(&[]).is_err());
+        let me = holder(std::process::id(), 1, "me.exe", HolderKind::MainWindow);
+        assert!(close(&[me]).unwrap_err().to_string().contains("itself"));
+        assert!(close(&[holder(1, 1, "c.exe", HolderKind::Console)]).is_err());
+        assert!(close(&[holder(1, 1, "s.exe", HolderKind::Service)]).is_err());
+        assert!(close(&[Holder { block: Some(HolderBlock::Explorer), ..holder(1, 1, "w.exe", HolderKind::MainWindow) }]).is_err());
+        // one bad holder among good ones refuses all
+        assert!(close(&[holder(1, 1, "a.exe", HolderKind::MainWindow), holder(2, 1, "c.exe", HolderKind::Console)]).is_err());
     }
 
     fn open(p: &Path, share: u32) -> fs::File {

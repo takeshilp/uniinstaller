@@ -405,6 +405,8 @@ fn debug_guard_refuses_system_env() {
     assert!(e.0.contains("sandbox"), "{e}");
     let e = ops::run_native(&env, "op-1", &opts()).unwrap_err();
     assert!(e.0.contains("sandbox"), "{e}");
+    let e = ops::close_and_retry(&env, "op-1", &[]).unwrap_err();
+    assert!(e.0.contains("sandbox"), "{e}");
     let e = ops::begin_forced(&env, std::path::Path::new(r"C:\x"), "X", None, None).unwrap_err();
     assert!(e.0.contains("sandbox"), "{e}");
 }
@@ -616,6 +618,7 @@ fn stage1_manifest_loads_and_restores() {
     assert!(op.plan.as_ref().unwrap().trace.is_none());
     assert!(op.app.hidden.is_none(), "the old format has no hidden mark");
     assert!(op.forced.is_none(), "the old format has no forced mark");
+    assert!(op.continue_after_reboot.is_none(), "the old format has no restart marker");
     assert!(matches!(&ops::history(&f.env).unwrap()[0], HistoryEntry::Ok { op } if op.id == "op-1"));
     let restored = ops::restore(&f.env, "op-1").unwrap();
     assert_eq!(restored.status, OpStatus::Restored, "{:#?}", restored.items.iter().map(|i| (&i.candidate_id, i.restore, &i.restore_detail)).collect::<Vec<_>>());
@@ -687,4 +690,39 @@ fn hidden_program_roundtrip() {
     let g = Fixture::new();
     let visible = uninstalled(&g, NOTES);
     assert_eq!(shape(&f, &op), shape(&g, &visible), "a hidden program gets the same plan as a visible one");
+}
+
+/// A search is the continuation of a native run that asked for a restart: it clears the marker.
+#[test]
+fn scan_clears_the_restart_marker() {
+    let f = Fixture::new();
+    let op = ops::begin(&f.env, NOTES, false).unwrap();
+    ops::run_native(&f.env, &op.id, &opts()).unwrap();
+    let mut o = ops::load(&f.env, &op.id).unwrap();
+    o.continue_after_reboot = Some(1);
+    ops::save(&f.env, &o).unwrap();
+    let scanned = ops::scan_leftovers(&f.env, &op.id).unwrap();
+    assert_eq!(scanned.continue_after_reboot, None);
+    assert_eq!(ops::load(&f.env, &op.id).unwrap().continue_after_reboot, None);
+}
+
+/// An item that ended `Changed` (the program rewrote its file) is found again by a rescan, applied, and restored.
+#[test]
+fn rescan_after_changed_item_then_apply_and_restore() {
+    let f = Fixture::new();
+    let op = uninstalled(&f, NOTES);
+    let ini = notes_dir(&f.env).join("config.ini");
+    fs::remove_file(&ini).unwrap();
+    fs::write(&ini, b"a completely different file").unwrap();
+    let applied = ops::apply(&f.env, &op.id, &selectable(&op)).unwrap();
+    assert_eq!(item(&applied, "config.ini").status, ItemStatus::Changed);
+    let id = item(&applied, "config.ini").candidate_id.clone();
+    let rescanned = ops::scan_leftovers(&f.env, &op.id).unwrap();
+    assert!(plan(&rescanned).candidates.iter().any(|c| c.id == id), "the rescan offers config.ini again with the same id");
+    let done = ops::apply(&f.env, &op.id, &[id]).unwrap();
+    assert_eq!(item(&done, "config.ini").status, ItemStatus::Removed);
+    assert!(!ini.exists());
+    let restored = ops::restore(&f.env, &op.id).unwrap();
+    assert_eq!(restored.status, OpStatus::Restored);
+    assert_eq!(fs::read(&ini).unwrap(), b"a completely different file");
 }

@@ -340,8 +340,8 @@ fn real_guard() -> io::Result<()> {
 }
 
 /// How long a running service is given to stop.
-// shortcut: the stop waits 30 s with no stop button and never kills; a service that does not stop ends Locked. Add Restart Manager or a
-// "stop waiting" button when users meet one.
+// shortcut: the stop waits 30 s with no stop button and never kills; services are not registered with the Restart Manager, so a service that
+// does not stop ends Locked and can be retried by hand or after a restart (docs/locked.md); add a "stop waiting" button when users meet one.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Stops the service if it runs (never kills it: after `STOP_WAIT` the call fails with 1053 and nothing is deleted) and deletes it
