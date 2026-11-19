@@ -332,7 +332,7 @@ fn version_info(exe: &Path) -> (Option<String>, Option<String>, Option<String>) 
 }
 
 /// Decides, read-only, whether `picked` (a program file or a folder) may be removed by force. Every refusal is `Ok(Refused)`;
-/// `Err` is only for an unexpected read failure. The rules run in this order (see `docs/architecture.md`).
+/// `Err` is only for an unexpected read failure. The rules run in this order (see `docs/force.md`).
 pub fn check(env: &Env, picked: &Path) -> Result<ForceCheck> {
     use ForceRefusal::*;
     // Rule 1: sanity.

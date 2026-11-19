@@ -28,5 +28,9 @@ Stage 1 plus install tracing (stage 2): core crate (`uni-core`), read-only CLI (
 
 ## Docs
 - `docs/development.md`: setup, commands, sandbox, lab, screenshots, release and key management, manual checks.
-- `docs/architecture.md`: crates, pipeline, data model, safety tables, scoring, storage, statuses, shortcuts.
+- `docs/architecture.md`: crates, pipeline, data model, storage, statuses, known shortcuts.
+- `docs/safety.md`: hard blocks, shared-with-other-app rules, scoring weights, hidden programs.
+- `docs/tracing.md`: install tracing: capture, diff, trusted journals, reverts, budget.
+- `docs/force.md`: forced removal by path: checks, scan rules, GUI, lab scenarios.
+- `docs/lab.md`: Windows Sandbox lab: commands, guard, snapshots, trace and hidden-entry scenarios.
 - `docs/bugs.md`: verified pitfalls and fixed bugs.

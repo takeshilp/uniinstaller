@@ -1,5 +1,5 @@
 //! Safety rules: protected paths, registry shapes, hard blocks, tiers. Single source of truth;
-//! `docs/architecture.md` mirrors these tables. Pure functions, no side effects.
+//! `docs/safety.md` mirrors these tables. Pure functions, no side effects.
 use crate::env::{Env, Folders};
 use crate::model::*;
 use crate::paths::{canonical, is_canonical, is_drive_root, is_inside, is_local_abs, norm, same_or_inside};

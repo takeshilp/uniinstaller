@@ -89,7 +89,7 @@ result with an independent inventory (recall, false deletions, restore, resume a
   deletions, restore ok); `force-broken` deletes the Uninstall key after the install and runs the found `uninstall.exe` (PASS, 5 found); `force-msi-bare` expects `listed:installer` and
   `force-service` `refused:service` (rule 16e). A RISK or FAIL is a product finding, never fixed by editing the manifest.
 - Trace scenarios (`trace-machine`): the app is installed by `uni-lab trace` between two product snapshots, so the journal and the inventory are compared
-  independently (rules 15a-15f and 17 in `docs/architecture.md`). Expected: PASS, 3 reverted values, 0 false deletions, `{PF86}\Other Updater` offered at
+  independently (rules 15a-15f and 17 in `docs/lab.md`). Expected: PASS, 3 reverted values, 0 false deletions, `{PF86}\Other Updater` offered at
   Review and not selected, no revert for the unrelated `LastCheck` value. A RISK or FAIL is a product finding, never fixed by editing the manifest.
 
 ## Screenshots

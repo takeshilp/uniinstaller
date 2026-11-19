@@ -1,5 +1,5 @@
 //! Install tracing: a read-only snapshot of the places a removal can ever be offered from, taken before and after an installer
-//! runs. The difference is the trace journal (see `docs/architecture.md`, "Install tracing").
+//! runs. The difference is the trace journal (see `docs/tracing.md`).
 //!
 //! Capturing is read-only and may run against the real system: directory listings, file metadata and `KEY_READ` registry opens.
 // shortcut: no per-process attribution (no ETW or driver): every change in scope between the two snapshots enters the journal,

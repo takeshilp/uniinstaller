@@ -54,7 +54,7 @@ fn real_system_preview_dump() {
 }
 
 /// Read-only: two captures of the real machine (the second streamed through a `Differ`, as `trace::finish` does). Prints the
-/// object counts, the milliseconds and the peak working-set growth that the budget in `docs/architecture.md` is measured by.
+/// object counts, the milliseconds and the peak working-set growth that the budget in `docs/tracing.md` is measured by.
 /// Run it alone: `cargo test -p uni-core --test real_system real_system_snapshot_cost -- --ignored --nocapture`.
 #[test]
 #[ignore = "reads the real registry and file system"]
