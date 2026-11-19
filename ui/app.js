@@ -70,6 +70,7 @@ const state = {
   trace: null,
   showHidden: false, hiddenOk: false,
   force: null,
+  locks: null, closeList: null, closeInfo: null, continuations: [], contHidden: false,
 };
 
 function set(patch) { Object.assign(state, patch); render(); }
@@ -120,6 +121,49 @@ const selectedCands = () => (state.plan?.candidates || []).filter((c) => state.s
 const initialSelection = (plan) => new Set(plan.candidates.filter((c) => c.selected && c.blocks.length === 0).map((c) => c.id));
 const restorable = (op) => op.items.filter((i) => (i.quarantine || i.regBackup) && i.restore !== 'restored');
 const retryable = (op) => op.items.filter((i) => ['accessDenied', 'locked', 'failed', 'changed'].includes(i.status));
+// Locked files: `state.locks` is {opId, loading} | {opId, items} | {opId, error}; the holders come from the core, never from here.
+const lockedPath = (i) => i.target.type === 'path' && ['locked', 'accessDenied'].includes(i.status);
+const lockOf = (id) => (state.locks?.opId === state.op?.id ? (state.locks.items || []).find((l) => l.candidateId === id) : null);
+const lockFound = (i) => { const l = lockOf(i.candidateId); return !!l && (l.files > 0 || l.folders > 0); };
+const uniqueHolders = (items) => { const seen = new Set(); return items.flatMap((l) => l.holders).filter((h) => !seen.has(h.pid) && seen.add(h.pid)); };
+const holderName = (h) => h.name || h.image;
+const lockLines = (i) => {
+  if (i.target.type === 'service') return i.status === 'locked' ? [S.serviceLocked] : [];
+  const l = lockOf(i.candidateId);
+  if (!l) return [];
+  const out = [];
+  if (l.error) out.push(S.heldUnknown(l.error));
+  l.holders.forEach((h) => out.push(S.heldBy(holderName(h), h.pid, S.holderKind[h.kind]) + (h.block ? ` — ${S.holderBlock[h.block]}` : '')));
+  if (l.folders && !l.holders.length) out.push(S.heldFolder);
+  if (!l.error && !l.holders.length && !l.folders && i.status === 'locked') out.push(S.heldNobody);
+  if (l.reasons) out.push(S.rebootReasons(l.reasons));
+  if (l.truncated) out.push(S.heldTruncated);
+  return out;
+};
+const strip = (kind, text, btn = '') => `<div class="strip ${kind}"><span>${esc(text)}</span>${btn}</div>`;
+const locksStrip = (op) => {
+  const out = [];
+  const L = state.locks?.opId === op.id ? state.locks : null;
+  if (L?.loading) out.push(strip('info', S.locksLoading));
+  else if (L?.error) out.push(strip('warn', S.locksError(L.error)));
+  else if (L?.items && uniqueHolders(L.items).length) {
+    const hs = uniqueHolders(L.items);
+    const closable = L.items.every((l) => !l.reasons && l.holders.every((h) => !h.block));
+    out.push(closable ? strip('warn', S.locksStrip(hs.map(holderName).join(', ')), `<button class="btn secondary" data-act="close-ask" ${dis()}>${S.closeRetry}</button>`) : strip('warn', S.locksBlocked));
+  }
+  const ci = state.closeInfo?.op.id === op.id ? state.closeInfo : null;
+  if (ci) {
+    if (ci.closed.length) out.push(strip('info', S.closedSummary(ci.closed.map(holderName).join(', '))));
+    if (ci.stillRunning.length) out.push(strip('warn', S.notClosed(ci.stillRunning.map(holderName).join(', '))));
+    if (ci.restartError) out.push(strip('warn', S.restartFailed));
+  }
+  if (op.continueAfterReboot) {
+    out.push(strip('info', state.info.bootMs > op.continueAfterReboot ? S.afterRebootStrip : S.retryAfterRebootSet, `<button class="link" data-act="remind-off">${S.retryAfterRebootOff}</button>`));
+  } else if (op.items.some((i) => ['locked', 'accessDenied'].includes(i.status)) && !['restored', 'partiallyRestored'].includes(op.status)) {
+    out.push(strip('info', S.rebootHint, `<button class="btn secondary" data-act="remind-on" ${dis()}>${S.retryAfterReboot}</button>`));
+  }
+  return out.join('');
+};
 const itemGroup = (op, i) => {
   const c = op.plan?.candidates.find((x) => x.id === i.candidateId);
   if (c) return c.group;
@@ -522,7 +566,7 @@ views.result = () => {
     ? [verify.appStillListed ? S.verifyListed : S.verifyGone, verify.reappeared.length ? S.verifyReappeared(verify.reappeared.length) : S.verifyClean].slice(op.forced ? 1 : 0) : [];
   const forcedStrip = op.forced ? `<div class="strip info"><span>${esc(op.native ? S.forceResultRan(op.launch.exe) : S.forceResultSkipped)}</span></div>` : '';
   const verCard = vLines.length ? `<div class="card"><h3 style="margin-bottom:8px">${S.verification}</h3>${vLines.map((l) => `<div class="muted">${esc(l)}</div>`).join('')}</div>` : '';
-  const denied = op.items.some((i) => i.status === 'accessDenied') && !state.info.elevated
+  const denied = op.items.some((i) => i.status === 'accessDenied' && !lockFound(i)) && !state.info.elevated
     ? `<div class="strip warn"><span>${S.deniedStrip}</span>${state.info.sandbox ? '' : `<button class="btn secondary" data-act="admin">${S.restartAdmin}</button>`}</div>` : '';
   const sysRestored = op.items.some((i) => isSystem(i.target) && i.restore === 'restored') ? `<div class="strip info"><span>${S.systemRestoredNote}</span></div>` : '';
   const rowsFor = (g) => op.items.filter((i) => itemGroup(op, i) === g).map((i) => {
@@ -530,14 +574,14 @@ views.result = () => {
     const name = candName({ target: i.target, ident: i.regBackup });
     const where = candWhere({ target: i.target, ident: i.regBackup });
     const note = i.restoreDetail || i.detail;
-    return `<div class="child"><span class="grow"><div class="t">${esc(name)}</div><div class="s">${esc(where)}</div>${note ? `<div class="s">${esc(note)}</div>` : ''}</span>${pill(p || ['muted', i.status])}</div>`;
+    return `<div class="child"><span class="grow"><div class="t">${esc(name)}</div><div class="s">${esc(where)}</div>${note ? `<div class="s">${esc(note)}</div>` : ''}${lockLines(i).map((t) => `<div class="s">${esc(t)}</div>`).join('')}</span>${pill(p || ['muted', i.status])}</div>`;
   }).join('');
   const groups = GROUPS.map((g) => {
     const r = rowsFor(g);
     return r ? `<div class="card"><h3 style="margin-bottom:6px">${esc(S.groups[g][0])}</h3>${r}</div>` : '';
   }).join('');
   const nRest = restorable(op).length, nRetry = retryable(op).length;
-  const scanLabel = ['awaitingReview', 'pendingReboot', 'running'].includes(op.status);
+  const scanLabel = ['awaitingReview', 'running'].includes(op.status) || (op.status === 'pendingReboot' && !op.items.length) || op.items.some((i) => i.status === 'changed');
   const bar = `<div><div class="lbl">${S.canRestore(nRest)}</div></div>
     <div class="acts">${nRest ? `<button class="btn secondary" data-act="restore" ${dis()}>${S.restoreAll}</button>` : ''}
     ${nRetry ? `<button class="btn secondary" data-act="retry" ${dis()}>${S.retryFailed}</button>` : ''}
@@ -546,7 +590,7 @@ views.result = () => {
     <h1 class="display" style="font-size:44px">${esc(S.opStatus[op.status] || op.status)}</h1>
     <p class="subtitle">${esc(S.resultCounts(failed, op.items.length))}${op.statusDetail ? ` · ${esc(op.statusDetail)}` : ''}</p></div>
     <button class="link" data-act="export-report">${S.exportReport}</button></div>
-    ${denied}${sysRestored}${forcedStrip}${verCard}${groups}</div>`;
+    ${locksStrip(op)}${denied}${sysRestored}${forcedStrip}${verCard}${groups}</div>`;
   return { html, bar };
 };
 
@@ -588,6 +632,17 @@ function renderModal() {
     $('#mcancel').focus();
     return;
   }
+  if (state.modal === 'close') {
+    const hs = state.closeList || [];
+    m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
+      <h2 id="mt">${esc(S.confirmCloseTitle(hs.length))}</h2>
+      <div class="cmd">${hs.map((h) => esc(`${holderName(h)} — ${h.image}, PID ${h.pid}`)).join('<br>')}</div>
+      <div class="muted">${S.confirmCloseNote}</div>
+      <div class="acts"><button class="btn secondary" id="mcancel" data-act="modal-cancel">${S.cancel}</button>
+      <button class="btn primary" data-act="modal-close-go">${S.closeGo}</button></div></div></div>`;
+    $('#mcancel').focus();
+    return;
+  }
   const d = state.details;
   const cmd = d.launch ? [d.launch.exe, d.launch.args].filter(Boolean).join(' ') : '';
   m.innerHTML = `<div class="overlay" data-act="modal-cancel-overlay"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="mt">
@@ -618,6 +673,10 @@ function renderBanner() {
     const off = state.busy || state.op?.status === 'running' ? 'disabled' : '';
     b.innerHTML = `<div class="strip info"><span>${esc(S.updateAvailable(state.update))}</span><span><button class="btn secondary" data-act="update-install" ${off}>${S.updateNow}</button>
       <button class="link" data-act="update-later" style="margin-left:10px">${S.later}</button></span></div>`;
+  } else if (state.continuations.length && !state.contHidden) {
+    const c = state.continuations;
+    b.innerHTML = `<div class="strip info"><span>${esc(S.rebootBanner(c[0].app.displayName, c.length - 1))}</span><span><button class="btn secondary" data-act="continue-op" ${dis()}>${S.continueOp}</button>
+      <button class="link" data-act="continue-later" style="margin-left:10px">${S.later}</button><button class="link" data-act="continue-off" style="margin-left:10px">${S.retryAfterRebootOff}</button></span></div>`;
   } else b.innerHTML = '';
 }
 
@@ -706,7 +765,42 @@ async function scanOp(opId) {
 
 async function runOp(cmd, args) {
   set({ busy: true });
-  try { set({ op: await invoke(cmd, args), view: 'result', busy: false }); } catch (e) { fail(e); }
+  try {
+    const op = await invoke(cmd, args);
+    set({ op, view: 'result', busy: false, closeInfo: null });
+    loadLocks(op);
+  } catch (e) { fail(e); }
+}
+
+// Who holds the files of the locked items. An answer (or an error) that is not the latest request, or is for another operation, is dropped.
+let locksSeq = 0;
+function loadLocks(op) {
+  const seq = ++locksSeq;
+  if (!op || ['restored', 'partiallyRestored'].includes(op.status) || !op.items.some(lockedPath)) { set({ locks: null }); return; }
+  set({ locks: { opId: op.id, loading: true } });
+  const keep = () => seq === locksSeq && state.op?.id === op.id;
+  invoke('lock_holders', { opId: op.id }).then(
+    (items) => { if (keep()) set({ locks: { opId: op.id, items } }); },
+    (e) => { if (keep()) set({ locks: { opId: op.id, error: String(e) } }); },
+  );
+}
+
+// The modal froze the list it showed; the core closes exactly those PIDs, or refuses.
+async function closeRetry() {
+  const pids = (state.closeList || []).map((h) => h.pid);
+  set({ modal: null, view: 'loading', loading: S.closing, busy: true });
+  try {
+    const r = await invoke('close_and_retry', { opId: state.op.id, pids });
+    set({ op: r.op, plan: r.op.plan, view: 'result', busy: false, loading: null, closeInfo: r });
+    loadLocks(r.op);
+  } catch (e) {
+    set({ view: 'result', busy: false, loading: null, error: String(e) });
+    loadLocks(state.op);
+  }
+}
+
+async function remind(on) {
+  try { set({ op: await invoke('remind_after_reboot', { opId: state.op.id, on }) }); } catch (e) { fail(e); }
 }
 
 function applySelected() { return runOp('apply', { opId: state.op.id, ids: selectedCands().map((c) => c.id) }); }
@@ -774,7 +868,7 @@ const actions = {
   open: (el) => openCard(el.dataset.id),
   'open-op': (el) => {
     const h = state.history.find((x) => x.type === 'ok' && x.op.id === el.dataset.id);
-    if (h) set({ op: h.op, plan: h.op.plan, view: 'result' });
+    if (h) { set({ op: h.op, plan: h.op.plan, view: 'result', closeInfo: null }); loadLocks(h.op); }
   },
   folder: (el) => invoke('open_in_explorer', { path: el.dataset.path }).catch(() => {}),
   admin: () => invoke('restart_as_admin').catch(fail),
@@ -815,6 +909,20 @@ const actions = {
   apply: () => (selectedCands().some((c) => isSystem(c.target)) ? set({ modal: 'system' }) : selectedCands().some(isRevert) ? set({ modal: 'revert' }) : applySelected()),
   'modal-system-go': () => { if (selectedCands().some(isRevert)) set({ modal: 'revert' }); else { set({ modal: null }); applySelected(); } },
   'modal-revert-go': () => { set({ modal: null }); applySelected(); },
+  'close-ask': () => set({ modal: 'close', closeList: uniqueHolders(state.locks.items) }),
+  'modal-close-go': () => closeRetry(),
+  'remind-on': () => remind(true),
+  'remind-off': () => remind(false),
+  'continue-later': () => set({ contHidden: true }),
+  'continue-off': () => {
+    const first = state.continuations[0];
+    invoke('remind_after_reboot', { opId: first.id, on: false }).then(() => set({ continuations: state.continuations.slice(1) })).catch(fail);
+  },
+  'continue-op': () => {
+    const [op, ...rest] = state.continuations;
+    if (op.status === 'pendingReboot' && !op.items.length) { set({ continuations: rest, op }); scanOp(op.id); }
+    else { set({ continuations: rest, op, plan: op.plan, view: 'result', closeInfo: null }); loadLocks(op); }
+  },
   restore: () => runOp('restore', { opId: state.op.id }),
   retry: () => runOp('apply', { opId: state.op.id, ids: retryable(state.op).map((i) => i.candidateId) }),
   'dismiss-error': () => set({ error: null }),
@@ -876,4 +984,5 @@ appWindow.onResized?.(async () => {
   render();
   loadApps();
   checkUpdate(false);
+  invoke('reboot_continuations').then((c) => set({ continuations: c })).catch(() => {});
 })();

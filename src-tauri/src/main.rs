@@ -35,6 +35,31 @@ impl ForceSlot {
     }
 }
 
+/// The last answer of `lock_holders`: the operation id and the holders shown for it. A close needs the PIDs the modal showed to equal it.
+struct HolderSlot(Mutex<Option<(String, Vec<ItemHolders>)>>);
+
+impl HolderSlot {
+    fn get(&self) -> MutexGuard<'_, Option<(String, Vec<ItemHolders>)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The holders a close may act on: the stored list for `op_id`, and only if the PIDs the UI confirmed (the modal's) are exactly its PIDs.
+// shortcut: the close needs the PIDs the modal showed to equal the last list stored; a list that changed in between needs another look.
+fn confirmed_holders(shown: Option<(String, Vec<ItemHolders>)>, op_id: &str, pids: Vec<u32>) -> Res<Vec<Holder>> {
+    let Some((_, items)) = shown.filter(|(id, _)| id == op_id) else { return Err("look at the programs that hold the files again".into()) };
+    let mut a: Vec<u32> = items.iter().flat_map(|i| i.holders.iter().map(|h| h.pid)).collect();
+    a.sort_unstable();
+    a.dedup();
+    let mut b = pids;
+    b.sort_unstable();
+    b.dedup();
+    if a != b {
+        return Err("the list of programs changed; look at it again".into());
+    }
+    Ok(items.into_iter().flat_map(|i| i.holders).collect())
+}
+
 /// Program icons: the apps of every `list_apps` answer by id (the UI sends only ids), and PNG data URLs by icon file and index
 /// (many hidden entries share one); None means no usable icon and the UI keeps the letter tile.
 // shortcut: the cache lives for the session, so an updated program shows its old icon until the app restarts; key it by file time if that matters.
@@ -73,6 +98,8 @@ struct AppInfo {
     elevated: bool,
     sandbox: bool,
     data_dir: PathBuf,
+    /// When this boot started (Unix ms), to compare with `continueAfterReboot`.
+    boot_ms: u64,
 }
 
 type Res<T> = Result<T, String>;
@@ -87,7 +114,7 @@ fn s<T>(r: uni_core::Result<T>) -> Res<T> {
 
 #[tauri::command]
 fn app_info(env: State<Env>) -> AppInfo {
-    AppInfo { version: env!("CARGO_PKG_VERSION").into(), elevated: elevation::is_elevated(), sandbox: env.sandbox, data_dir: env.data_dir.clone() }
+    AppInfo { version: env!("CARGO_PKG_VERSION").into(), elevated: elevation::is_elevated(), sandbox: env.sandbox, data_dir: env.data_dir.clone(), boot_ms: ops::boot_ms() }
 }
 
 #[tauri::command]
@@ -181,6 +208,36 @@ async fn scan_leftovers(env: State<'_, Env>, op_id: String) -> Res<Operation> {
 async fn apply(env: State<'_, Env>, op_id: String, ids: Vec<String>) -> Res<Operation> {
     let env = env.inner().clone();
     blocking(move || s(ops::apply(&env, &op_id, &ids))).await
+}
+
+/// Who holds the files of the locked items (read-only). The answer is kept: a close acts only on what was shown.
+#[tauri::command]
+async fn lock_holders(env: State<'_, Env>, slot: State<'_, HolderSlot>, op_id: String) -> Res<Vec<ItemHolders>> {
+    let env = env.inner().clone();
+    let id = op_id.clone();
+    let list = blocking(move || s(ops::lock_holders(&env, &id))).await?;
+    *slot.get() = Some((op_id, list.clone()));
+    Ok(list)
+}
+
+/// Closes the programs the modal listed and retries. The stored list is consumed: after a close the holders are looked up again.
+#[tauri::command]
+async fn close_and_retry(env: State<'_, Env>, slot: State<'_, HolderSlot>, op_id: String, pids: Vec<u32>) -> Res<Closed> {
+    let env = env.inner().clone();
+    let confirmed = confirmed_holders(slot.get().take(), &op_id, pids)?;
+    blocking(move || s(ops::close_and_retry(&env, &op_id, &confirmed))).await
+}
+
+#[tauri::command]
+async fn remind_after_reboot(env: State<'_, Env>, op_id: String, on: bool) -> Res<Operation> {
+    let env = env.inner().clone();
+    blocking(move || s(ops::remind_after_reboot(&env, &op_id, on))).await
+}
+
+#[tauri::command]
+async fn reboot_continuations(env: State<'_, Env>) -> Res<Vec<Operation>> {
+    let env = env.inner().clone();
+    blocking(move || s(ops::reboot_continuations(&env))).await
 }
 
 #[tauri::command]
@@ -406,6 +463,7 @@ fn main() {
         .manage(StopFlag(Arc::new(AtomicBool::new(false))))
         .manage(TraceSlot(Mutex::new(TraceState::default())))
         .manage(ForceSlot(Mutex::new(None)))
+        .manage(HolderSlot(Mutex::new(None)))
         .manage(IconSlot::default())
         .invoke_handler(tauri::generate_handler![
             app_info,
@@ -419,6 +477,10 @@ fn main() {
             stop_waiting,
             scan_leftovers,
             apply,
+            lock_holders,
+            close_and_retry,
+            remind_after_reboot,
+            reboot_continuations,
             restore,
             history,
             open_in_explorer,
@@ -440,6 +502,30 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn holder(pid: u32) -> Holder {
+        Holder { pid, started: 1, name: "x".into(), image: "x.exe".into(), service: None, kind: HolderKind::MainWindow, block: None }
+    }
+
+    fn item(pids: &[u32]) -> ItemHolders {
+        ItemHolders { candidate_id: "c".into(), files: 1, folders: 0, truncated: false, holders: pids.iter().map(|p| holder(*p)).collect(), reasons: 0, error: None }
+    }
+
+    /// The close acts only on the stored list for this operation, and only if the confirmed PIDs are exactly its PIDs.
+    #[test]
+    fn close_needs_the_pids_that_were_shown() {
+        let shown = || Some(("op-1".to_string(), vec![item(&[10, 11]), item(&[11])]));
+        assert!(confirmed_holders(None, "op-1", vec![10, 11]).is_err(), "nothing was shown");
+        assert!(confirmed_holders(shown(), "op-2", vec![10, 11]).is_err(), "another operation");
+        assert!(confirmed_holders(shown(), "op-1", vec![]).is_err(), "nothing confirmed");
+        assert!(confirmed_holders(shown(), "op-1", vec![10]).is_err(), "fewer than shown");
+        assert!(confirmed_holders(shown(), "op-1", vec![10, 11, 12]).is_err(), "more than shown");
+        assert!(confirmed_holders(shown(), "op-1", vec![10, 12]).is_err(), "other pid");
+        let ok = confirmed_holders(shown(), "op-1", vec![11, 10, 10]).unwrap();
+        assert_eq!(ok.iter().map(|h| h.pid).collect::<Vec<_>>(), vec![10, 11, 11]);
+    }
+
     /// The core protects the WebView2 profile folder named after the Tauri identifier; keep both equal.
     #[test]
     fn identifier_matches_core() {
