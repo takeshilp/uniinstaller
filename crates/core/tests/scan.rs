@@ -124,7 +124,7 @@ fn outside_zone_children_are_weak() {
     fs::create_dir_all(&tool).unwrap();
     fs::write(tool.join("a.dll"), b"x").unwrap();
     fs::write(tool.join("Tool.exe"), b"x").unwrap();
-    let plan = scan::scan(&f.env, &bogus_app(&tool), None, &[], true, None).unwrap();
+    let plan = scan::scan(&f.env, &bogus_app(&tool), None, &[], true, None, None).unwrap();
     assert!(matches!(plan.install_dir_status, DirStatus::Confirmed {}), "{:?}", plan.install_dir_status);
     for n in ["a.dll", "Tool.exe"] {
         check(find_path(&plan, &tool.join(n)), 25, Tier::Weak, false);
@@ -156,7 +156,7 @@ fn rejects_bogus_install_dirs() {
         _ => println!("skipped 8.3 case: no short name"),
     }
     for (what, dir) in cases {
-        let plan = scan::scan(&f.env, &bogus_app(&dir), None, &[], true, None).unwrap();
+        let plan = scan::scan(&f.env, &bogus_app(&dir), None, &[], true, None, None).unwrap();
         assert!(matches!(plan.install_dir_status, DirStatus::Rejected { .. }), "{what}: {:?}", plan.install_dir_status);
         assert!(plan.candidates.iter().all(|c| !matches!(c.group, Group::ProgramFiles | Group::Shortcuts)), "{what}: no file candidates from a rejected dir");
     }
@@ -388,9 +388,85 @@ fn broad_install_location_does_not_claim_references() {
         o.display_name = format!("Broad {i}");
         others.push(o);
     }
-    let plan = scan::scan(&f.env, &target, None, &others, true, None).unwrap();
+    let plan = scan::scan(&f.env, &target, None, &others, true, None, None).unwrap();
     assert!(matches!(plan.install_dir_status, DirStatus::Rejected { .. }), "{:?}", plan.install_dir_status);
     let key = find_key(&plan, |k| k.path.ends_with(r"Sandbox Soft\Sandbox Notes"));
     assert_eq!(key.len(), 1);
     assert!(key[0].blocks.iter().all(|b| b.code != BlockCode::SharedWithOtherApp), "{:?}", key[0].blocks);
+}
+
+fn forced_of(picked: &Path, folder: Option<&Path>, names: &[&str]) -> Forced {
+    Forced { picked: picked.to_path_buf(), folder: folder.map(Path::to_path_buf), search_names: names.iter().map(|n| n.to_string()).collect() }
+}
+
+/// A forced target is never corroborated and never preselected; its settings are looked for only by the names it carries (spec 1.5).
+#[test]
+fn forced_target_rules() {
+    let f = Fixture::new();
+    let dir = user_programs(&f.env).join("Forced Tool");
+    let exe = dir.join("tool.exe");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(&exe, b"MZ fake").unwrap();
+    fs::write(dir.join("data.bin"), b"bin").unwrap();
+    let lnk = start_menu(&f.env).join("Forced Tool.lnk");
+    uni_core::shortcuts::create(&lnk, &exe).unwrap();
+    set(&f.env.run_roots[0], "ForcedTool", &format!("\"{}\" --tray", exe.display()));
+    let settings = roaming(&f.env).join("Forced Tool");
+    fs::create_dir_all(&settings).unwrap();
+    fs::write(settings.join("s.ini"), b"[x]").unwrap();
+    fs::create_dir_all(roaming(&f.env).join("Abc")).unwrap();
+    fs::create_dir_all(roaming(&f.env).join("Abc 2")).unwrap();
+
+    let forced = forced_of(&dir, Some(&dir), &["Forced Tool"]);
+    let mut app = uni_core::force::app_for(&forced, "Forced Tool", None, None);
+    // The icon sits in the folder: a listed program with this icon is corroborated (b), a forced target never is (a).
+    app.display_icon = Some(exe.to_string_lossy().to_string());
+    let plan = scan::scan(&f.env, &app, None, &[], true, None, Some(&forced)).unwrap();
+    assert!(matches!(plan.install_dir_status, DirStatus::Confirmed {}), "{:?}", plan.install_dir_status);
+    assert!(!plan.corroborated);
+    assert!(plan.candidates.iter().all(|c| !c.selected), "a forced plan preselects nothing");
+    check(find_path(&plan, &exe), 45, Tier::Review, false);
+    check(find_path(&plan, &dir.join("data.bin")), 45, Tier::Review, false);
+    check(find_path(&plan, &lnk), 50, Tier::Review, false);
+    check(find_value(&plan, "ForcedTool"), 30, Tier::Weak, false);
+    let s = find_path(&plan, &settings);
+    check(s, 20, Tier::Weak, false);
+    assert_eq!(s.group, Group::Data);
+    assert!(!plan.candidates.iter().any(|c| path_of(c).is_some_and(|p| p.ends_with("Abc"))));
+
+    // (b) the same app as a listed program: corroborated, the shortcut is preselected.
+    let plan = scan::scan(&f.env, &app, None, &[], true, None, None).unwrap();
+    assert!(plan.corroborated);
+    check(find_path(&plan, &lnk), 85, Tier::Safe, true);
+
+    // (c) no search names: no settings folder by name.
+    let none = forced_of(&dir, Some(&dir), &[]);
+    let plan = scan::scan(&f.env, &app, None, &[], true, None, Some(&none)).unwrap();
+    assert!(plan.candidates.iter().all(|c| c.group != Group::Data), "{:?}", plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>());
+    check(find_path(&plan, &lnk), 50, Tier::Review, false);
+
+    // (e) only the names it carries: `Abc 2`, not the version-free `Abc`.
+    let abc = forced_of(&dir, Some(&dir), &["Abc 2"]);
+    let mut app2 = uni_core::force::app_for(&abc, "Abc 2", None, None);
+    app2.display_icon = None;
+    let plan = scan::scan(&f.env, &app2, None, &[], true, None, Some(&abc)).unwrap();
+    check(find_path(&plan, &roaming(&f.env).join("Abc 2")), 20, Tier::Weak, false);
+    assert!(!plan.candidates.iter().any(|c| path_of(c).is_some_and(|p| paths::norm(p) == paths::norm(&roaming(&f.env).join("Abc")))));
+
+    // (d) file-only: no folder, the picked file is the anchor of the references.
+    let lonely = pf(&f.env).join("lonely.exe");
+    fs::write(&lonely, b"MZ fake").unwrap();
+    fs::write(pf(&f.env).join("neighbour.dll"), b"x").unwrap();
+    let dlnk = desktop(&f.env).join("Lonely.lnk");
+    uni_core::shortcuts::create(&dlnk, &lonely).unwrap();
+    let file_only = forced_of(&lonely, None, &["Lonely"]);
+    let app3 = uni_core::force::app_for(&file_only, "Lonely", None, None);
+    let plan = scan::scan(&f.env, &app3, None, &[], true, None, Some(&file_only)).unwrap();
+    assert!(matches!(plan.install_dir_status, DirStatus::NotSet {}), "{:?}", plan.install_dir_status);
+    let c = find_path(&plan, &lonely);
+    check(c, 60, Tier::Review, false);
+    assert_eq!(c.group, Group::ProgramFiles);
+    check(find_path(&plan, &dlnk), 50, Tier::Review, false);
+    assert!(!plan.candidates.iter().any(|c| path_of(c).is_some_and(|p| p.ends_with("neighbour.dll"))), "files next to the picked one are not offered");
+    assert!(plan.candidates.iter().all(|c| !c.selected));
 }

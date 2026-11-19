@@ -112,7 +112,7 @@ pub fn preview(env: &Env, app_id: &str) -> Result<Plan> {
     let d = describe(env, app_id)?;
     let others = others(env, &d.app)?;
     let tr = trace::find_for(env, &d.app, false);
-    let mut plan = crate::scan::scan(env, &d.app, d.launch.as_ref(), &others, true, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j))?;
+    let mut plan = crate::scan::scan(env, &d.app, d.launch.as_ref(), &others, true, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j), None)?;
     plan.trace = tr.map(|(_, u)| u);
     Ok(plan)
 }
@@ -206,15 +206,20 @@ pub fn begin(env: &Env, app_id: &str, hidden_ok: bool) -> Result<Operation> {
     {
         return Err(Error("refusing to uninstall Uniinstaller itself".into()));
     }
+    create(env, d.app, launch, None)
+}
+
+/// Writes the operation record; the id is the first free `op-<ms>`.
+fn create(env: &Env, app: InstalledApp, launch: Launch, forced: Option<Forced>) -> Result<Operation> {
     let mut ms = now_ms();
     while op_dir(env, &format!("op-{ms}")).exists() {
         ms += 1;
     }
-    let op = Operation {
+    let mut op = Operation {
         schema: SCHEMA,
         id: format!("op-{ms}"),
         created_ms: ms,
-        app: d.app,
+        app,
         launch,
         native: None,
         entry_after: None,
@@ -224,9 +229,16 @@ pub fn begin(env: &Env, app_id: &str, hidden_ok: bool) -> Result<Operation> {
         verify: None,
         status: OpStatus::Running,
         status_detail: None,
+        forced,
     };
+    (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
     Ok(op)
+}
+
+/// A forced operation without an uninstaller to run (`launch` is the empty placeholder): it goes straight to the leftover search.
+fn skips_native(op: &Operation) -> bool {
+    op.forced.is_some() && op.launch.exe.as_os_str().is_empty()
 }
 
 pub fn run_native(env: &Env, op_id: &str, opts: &RunOptions) -> Result<Operation> {
@@ -236,6 +248,9 @@ pub fn run_native(env: &Env, op_id: &str, opts: &RunOptions) -> Result<Operation
     let mut op = load(env, op_id)?;
     if op.native.is_some() {
         return Err(Error("the uninstaller was already run for this operation".into()));
+    }
+    if op.launch.exe.as_os_str().is_empty() {
+        return Err(Error("no uninstaller was chosen for this operation".into()));
     }
     let run = run_uninstaller(&op.launch, opts);
     op.entry_after = Some(entry_state(&op.app, &op.launch, run.exit_code, &env.folders.windows_dir));
@@ -250,18 +265,24 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     valid_op_id(op_id)?;
     let _g = lock();
     let mut op = load(env, op_id)?;
-    let native = op.native.clone().ok_or_else(|| Error("the uninstaller has not run yet".into()))?;
-    if let Some(e) = &native.launch_error {
-        return Err(Error(format!("the uninstaller did not start: {e}")));
-    }
-    if native.reboot_required {
-        // shortcut: "rebooted since" comes from uptime only; there is no automatic continuation, add resume in stage 2.
-        let boot_ms = now_ms().saturating_sub(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() });
-        if boot_ms <= native.ended_ms {
-            return Err(Error("a reboot is required before leftovers can be searched".into()));
+    let native = op.native.clone();
+    match &native {
+        Some(n) => {
+            if let Some(e) = &n.launch_error {
+                return Err(Error(format!("the uninstaller did not start: {e}")));
+            }
+            if n.reboot_required {
+                // shortcut: "rebooted since" comes from uptime only; there is no automatic continuation, add resume in stage 2.
+                let boot_ms = now_ms().saturating_sub(unsafe { windows::Win32::System::SystemInformation::GetTickCount64() });
+                if boot_ms <= n.ended_ms {
+                    return Err(Error("a reboot is required before leftovers can be searched".into()));
+                }
+            }
         }
+        None if skips_native(&op) => {}
+        None => return Err(Error("the uninstaller has not run yet".into())),
     }
-    let live = entry_state(&op.app, &op.launch, native.exit_code, &env.folders.windows_dir);
+    let live = entry_state(&op.app, &op.launch, native.as_ref().and_then(|n| n.exit_code), &env.folders.windows_dir);
     if live == EntryState::Present {
         return Err(Error("the program is still installed".into()));
     }
@@ -269,9 +290,9 @@ pub fn scan_leftovers(env: &Env, op_id: &str) -> Result<Operation> {
     let others = others(env, &op.app)?;
     // The program's own uninstaller has run: a hidden component it left installed makes the journal untrusted.
     let tr = trace::find_for(env, &op.app, true);
-    let mut plan = crate::scan::scan(env, &op.app, Some(&op.launch), &others, false, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j))?;
+    let mut plan = crate::scan::scan(env, &op.app, Some(&op.launch), &others, false, tr.as_ref().filter(|(_, u)| u.trusted).map(|(j, _)| j), op.forced.as_ref())?;
     plan.trace = tr.map(|(_, u)| u);
-    plan.still_running = native.processes.iter().filter(|p| alive(p)).map(|p| p.image.clone()).collect();
+    plan.still_running = native.iter().flat_map(|n| &n.processes).filter(|p| alive(p)).map(|p| p.image.clone()).collect();
     op.plan = Some(plan);
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
@@ -585,19 +606,26 @@ pub fn overall_status(op: &Operation) -> (OpStatus, Option<String>) {
             (OpStatus::PartiallyRestored, Some("some items could not be restored".into()))
         };
     }
-    let Some(n) = &op.native else { return (OpStatus::Running, None) };
-    if let Some(e) = &n.launch_error {
-        return (OpStatus::Failed, Some(format!("launch: {e}")));
-    }
-    let present = op.entry_after == Some(EntryState::Present);
-    if (n.timed_out || n.stopped_by_user) && present {
-        return (OpStatus::Running, Some("uninstaller may still be running".into()));
-    }
-    if present {
-        return (OpStatus::Failed, Some("program still installed".into()));
-    }
-    if n.reboot_required && op.items.is_empty() {
-        return (OpStatus::PendingReboot, None);
+    // A forced operation may have no native run at all (nothing was chosen to run): then only the items decide.
+    let n = match &op.native {
+        Some(n) => Some(n),
+        None if skips_native(op) => None,
+        None => return (OpStatus::Running, None),
+    };
+    if let Some(n) = n {
+        if let Some(e) = &n.launch_error {
+            return (OpStatus::Failed, Some(format!("launch: {e}")));
+        }
+        let present = op.entry_after == Some(EntryState::Present);
+        if (n.timed_out || n.stopped_by_user) && present {
+            return (OpStatus::Running, Some("uninstaller may still be running".into()));
+        }
+        if present {
+            return (OpStatus::Failed, Some("program still installed".into()));
+        }
+        if n.reboot_required && op.items.is_empty() {
+            return (OpStatus::PendingReboot, None);
+        }
     }
     if op.items.is_empty() {
         return (OpStatus::AwaitingReview, None);
@@ -611,13 +639,9 @@ pub fn overall_status(op: &Operation) -> (OpStatus, Option<String>) {
             (OpStatus::Failed, Some("nothing could be removed".into()))
         };
     }
-    let bad_exit = !matches!(n.exit_code, Some(0) | Some(3010) | Some(1641));
-    if op.verify.as_ref().is_some_and(|v| v.app_still_listed || !v.reappeared.is_empty())
-        || op.entry_after == Some(EntryState::Orphaned)
-        || bad_exit
-        || n.timed_out
-        || n.stopped_by_user
-    {
+    let bad_exit = n.is_some_and(|n| !matches!(n.exit_code, Some(0) | Some(3010) | Some(1641)));
+    let unfinished = n.is_some_and(|n| n.timed_out || n.stopped_by_user);
+    if op.verify.as_ref().is_some_and(|v| v.app_still_listed || !v.reappeared.is_empty()) || op.entry_after == Some(EntryState::Orphaned) || bad_exit || unfinished {
         return (OpStatus::CompletedWithWarnings, Some("verification found something to look at".into()));
     }
     (OpStatus::Completed, None)
@@ -672,12 +696,19 @@ mod tests {
         Operation {
             schema: 1, id: "op-1".into(), created_ms: 1, app: app(),
             launch: Launch { raw: String::new(), exe: PathBuf::new(), args: String::new(), argv: vec![], msi_product: None },
-            native, entry_after: entry, plan: None, items, empty_dirs_removed: vec![], verify: None, status: OpStatus::Running, status_detail: None,
+            native, entry_after: entry, plan: None, items, empty_dirs_removed: vec![], verify: None, status: OpStatus::Running, status_detail: None, forced: None,
         }
     }
 
     fn run() -> NativeRun {
         NativeRun { exit_code: Some(0), ..Default::default() }
+    }
+
+    /// A forced operation with no uninstaller (`launch.exe` is empty, as `op()` builds it).
+    fn forced(native: Option<NativeRun>, items: Vec<ItemRecord>) -> Operation {
+        let mut o = op(native, None, items);
+        o.forced = Some(Forced { picked: PathBuf::from(r"C:\x"), folder: None, search_names: vec![] });
+        o
     }
 
     fn st(o: &Operation) -> OpStatus {
@@ -736,6 +767,21 @@ mod tests {
         assert_ne!(st(&op(Some(run()), Some(Gone), vec![a, b])), OpStatus::Restored);
         // no restorable items and a launch failure stays Failed
         assert_eq!(st(&op(Some(NativeRun { launch_error: Some("x".into()), ..run() }), None, vec![item(Failed)])), OpStatus::Failed);
+        // forced, nothing to run: the items decide
+        assert_eq!(st(&forced(None, vec![])), OpStatus::AwaitingReview);
+        let mut o = forced(None, vec![item(Removed)]);
+        o.verify = Some(Verify { app_still_listed: false, reappeared: vec![] });
+        assert_eq!(st(&o), OpStatus::Completed);
+        assert_eq!(st(&forced(None, vec![item(Removed), item(Locked)])), OpStatus::PartiallyCompleted);
+        assert_eq!(st(&forced(None, vec![item(Blocked)])), OpStatus::Failed);
+        // forced with a chosen uninstaller (exe set) and no native run yet: Running; a launch error: Failed
+        let mut o = forced(None, vec![]);
+        o.launch.exe = PathBuf::from(r"C:\x\unins000.exe");
+        assert_eq!(st(&o), OpStatus::Running);
+        o.native = Some(NativeRun { launch_error: Some("x".into()), ..run() });
+        assert_eq!(st(&o), OpStatus::Failed);
+        // not forced and no native run: still Running even with an empty launch
+        assert_eq!(st(&op(None, None, vec![item(Removed)])), OpStatus::Running);
     }
 
     #[test]

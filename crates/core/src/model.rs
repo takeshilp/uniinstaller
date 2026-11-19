@@ -391,6 +391,67 @@ pub struct Operation {
     pub verify: Option<Verify>,
     pub status: OpStatus,
     pub status_detail: Option<String>,
+    /// Only on a forced removal ("remove by path"); absent in every other manifest, so those stay byte-identical and older builds
+    /// (0.2.0, hidden-apps) ignore it and list the operation as a normal one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<Forced>,
+}
+
+/// What is stored on a forced operation: only what the scan needs again. Absent on every other operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Forced {
+    /// The program file or folder the user picked, canonical.
+    pub picked: PathBuf,
+    /// The folder treated as the install folder; None = file-only identity.
+    pub folder: Option<PathBuf>,
+    /// Name variants that settings folders and keys may be looked for by (`force::search_names`); empty = no name search.
+    pub search_names: Vec<String>,
+}
+
+/// How a picked path belongs to a listed program (hidden ones included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ListedHow {
+    Folder,
+    Inside,
+    Installer,
+    Shortcut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForceRefusal {
+    BadPath,
+    OutsideSandbox,
+    NotAllowed,
+    OtherPrograms,
+    Installed,
+    Service,
+}
+
+/// What `force::check` found for a usable path: shown on the confirm screen, never stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceFound {
+    /// `search_names` here are for the suggested name; `begin_forced` recomputes them for the confirmed one.
+    pub forced: Forced,
+    pub name: String,
+    pub publisher: Option<String>,
+    pub product: Option<String>,
+    pub file_version: Option<String>,
+    pub uninstallers: Vec<PathBuf>,
+    pub shortcuts: Vec<PathBuf>,
+    pub other_volume: bool,
+    pub outside_zones: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ForceCheck {
+    Ok { found: Box<ForceFound> },
+    Listed { app: Box<InstalledApp>, how: ListedHow },
+    Refused { code: ForceRefusal, detail: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -95,8 +95,12 @@ fn eq_any(s: &str, variants: &[String]) -> bool {
 /// (publisher, name) pairs for settings locations `<root>\<name>` and `<root>\<publisher>\<name>`, every name variant.
 /// The same pairs name the target's candidates and other apps' anchors.
 fn name_pairs(app: &InstalledApp) -> Vec<(Option<String>, String)> {
-    let names = name_variants(&app.display_name);
-    let pubs = app.publisher.as_deref().map(publisher_variants).unwrap_or_default();
+    pairs_of(&name_variants(&app.display_name), app.publisher.as_deref())
+}
+
+/// The pairs for explicit name variants (a forced target carries its own, see `force::search_names`).
+fn pairs_of(names: &[String], publisher: Option<&str>) -> Vec<(Option<String>, String)> {
+    let pubs = publisher.map(publisher_variants).unwrap_or_default();
     let mut v: Vec<(Option<String>, String)> = names.iter().map(|n| (None, n.clone())).collect();
     v.extend(pubs.iter().flat_map(|p| names.iter().map(move |n| (Some(p.clone()), n.clone()))));
     v
@@ -162,6 +166,41 @@ fn rejected(dir: &Path, reason: impl Into<String>) -> Anchor {
     Anchor { dir: Some(dir.to_path_buf()), status: DirStatus::Rejected { reason: reason.into() }, corroborated: false }
 }
 
+/// Why `d` cannot be taken as a program's install folder, if it cannot (the gate of a registry InstallLocation, also used by
+/// `force::check`).
+pub(crate) fn dir_problem(env: &Env, d: &Path, anchors: &Anchors) -> Option<String> {
+    if !is_local_abs(d) {
+        return Some("not a local absolute path".into());
+    }
+    if is_drive_root(d) {
+        return Some("drive root".into());
+    }
+    match real_folders() {
+        Err(e) => return Some(format!("cannot verify: {e}")),
+        Ok(real) => {
+            if let Some(why) = protected_reason(real, d, Group::ProgramFiles) {
+                return Some(why);
+            }
+        }
+    }
+    if let Some(why) = protected_reason(&env.folders, d, Group::ProgramFiles) {
+        return Some(why);
+    }
+    if !is_canonical(d) {
+        return Some("alias: 8.3 name, trailing dot or space, junction, symlink or SUBST in the path".into());
+    }
+    if is_reparse(d).unwrap_or(false) {
+        return Some("reparse point".into());
+    }
+    if anchors.dirs.iter().any(|o| norm(o) == norm(d)) {
+        return Some("another program has the same install folder".into());
+    }
+    if std::env::current_exe().ok().is_some_and(|e| same_or_inside(&e, d)) {
+        return Some("contains Uniinstaller itself".into());
+    }
+    None
+}
+
 fn find_anchor(env: &Env, app: &InstalledApp, launch: Option<&Launch>, anchors: &Anchors) -> Anchor {
     let icon = icon_path(app);
     let dir = match app.install_location.as_deref().filter(|d| !d.as_os_str().is_empty()) {
@@ -175,37 +214,29 @@ fn find_anchor(env: &Env, app: &InstalledApp, launch: Option<&Launch>, anchors: 
         }
     };
     let d = dir.as_path();
-    if !is_local_abs(d) {
-        return rejected(d, "not a local absolute path");
-    }
-    if is_drive_root(d) {
-        return rejected(d, "drive root");
-    }
-    match real_folders() {
-        Err(e) => return rejected(d, format!("cannot verify: {e}")),
-        Ok(real) => {
-            if let Some(why) = protected_reason(real, d, Group::ProgramFiles) {
-                return rejected(d, why);
-            }
-        }
-    }
-    if let Some(why) = protected_reason(&env.folders, d, Group::ProgramFiles) {
+    if let Some(why) = dir_problem(env, d, anchors) {
         return rejected(d, why);
-    }
-    if !is_canonical(d) {
-        return rejected(d, "alias: 8.3 name, trailing dot or space, junction, symlink or SUBST in the path");
-    }
-    if is_reparse(d).unwrap_or(false) {
-        return rejected(d, "reparse point");
-    }
-    if anchors.dirs.iter().any(|o| norm(o) == norm(d)) {
-        return rejected(d, "another program has the same install folder");
-    }
-    if std::env::current_exe().ok().is_some_and(|e| same_or_inside(&e, d)) {
-        return rejected(d, "contains Uniinstaller itself");
     }
     let corroborated = launch.and_then(|l| l.exe.parent()).is_some_and(|p| norm(p) == norm(d)) || icon.as_deref().and_then(Path::parent).is_some_and(|p| norm(p) == norm(d));
     Anchor { dir: Some(d.to_path_buf()), status: DirStatus::Confirmed {}, corroborated }
+}
+
+/// Shortcuts (Start Menu to depth 4, desktops to depth 1) whose target is, or lies inside, `d`: (the `.lnk`, its target).
+pub(crate) fn links_into(env: &Env, d: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut links = shortcuts::list_links(&env.folders.start_menu, 4);
+    links.extend(shortcuts::list_links(&env.folders.desktops, 1));
+    let mut out = Vec::new();
+    for lnk in links {
+        if lnk.to_str().is_none() {
+            continue;
+        }
+        let Some(target) = shortcuts::resolve(&lnk) else { continue };
+        if !(same_or_inside(&target, d) || same_or_inside(&canon_if_exists(&target), d)) {
+            continue;
+        }
+        out.push((lnk, target));
+    }
+    out
 }
 
 /// Evaluation context shared by scan and apply, so both apply identical rules.
@@ -511,11 +542,14 @@ impl TraceScan<'_> {
     }
 }
 
-pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[InstalledApp], dry_run: bool, trace: Option<&TraceJournal>) -> Result<Plan> {
+pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[InstalledApp], dry_run: bool, trace: Option<&TraceJournal>, forced: Option<&Forced>) -> Result<Plan> {
     let anchors = anchors_of(env, others);
     let anchor = find_anchor(env, app, launch, &anchors);
     let confirmed: Option<PathBuf> = matches!(anchor.status, DirStatus::Confirmed {}).then(|| anchor.dir.clone()).flatten();
-    let corroborated = anchor.corroborated;
+    // A forced target's folder and name are the user's word, not the registry's (spec 1.5): never corroborated, never preselected.
+    let corroborated = anchor.corroborated && forced.is_none();
+    // References point into the confirmed folder, or at the picked file itself for a file-only forced target.
+    let refs: Option<PathBuf> = confirmed.clone().or_else(|| forced.filter(|f| f.folder.is_none()).map(|f| f.picked.clone()));
     let names = name_variants(&app.display_name);
     let pubs = app.publisher.as_deref().map(publisher_variants).unwrap_or_default();
     let mut raw: Vec<Raw> = Vec::new();
@@ -563,18 +597,9 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
         });
     }
 
-    // C. Shortcuts that point into the install dir.
-    if let Some(d) = &confirmed {
-        let mut links = shortcuts::list_links(&env.folders.start_menu, 4);
-        links.extend(shortcuts::list_links(&env.folders.desktops, 1));
-        for lnk in links {
-            if lnk.to_str().is_none() {
-                continue;
-            }
-            let Some(target) = shortcuts::resolve(&lnk) else { continue };
-            if !(same_or_inside(&target, d) || same_or_inside(&canon_if_exists(&target), d)) {
-                continue;
-            }
+    // C. Shortcuts that point into the install dir (or at the picked file of a file-only forced target).
+    if let Some(d) = &refs {
+        for (lnk, target) in links_into(env, d) {
             let mut evidence = refers(format!("shortcut points to {}", target.display()), !target.exists());
             let stem = lnk.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             if eq_any(&stem, &names) {
@@ -589,7 +614,7 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
     }
 
     // D. Registry: Run values, App Paths keys, the program's own uninstall keys.
-    if let Some(d) = &confirmed {
+    if let Some(d) = &refs {
         let needle = format!("{}\\", norm(d));
         for root in &env.run_roots {
             let Ok(k) = registry::open(root, KEY_READ) else { continue };
@@ -645,7 +670,10 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
     }
 
     // E and F. Settings and user data by exact name (Data group, never preselected).
-    let pairs = name_pairs(app);
+    let pairs = match forced {
+        Some(f) => pairs_of(&f.search_names, app.publisher.as_deref()),
+        None => name_pairs(app),
+    };
     for root in &env.folders.app_data {
         for (p, n) in &pairs {
             let path = data_dir(root, p.as_deref(), n);
@@ -771,7 +799,7 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
                 blocks: e.blocks,
                 score,
                 tier,
-                selected: default_selected(tier, r.group, e.user_data),
+                selected: forced.is_none() && default_selected(tier, r.group, e.user_data),
                 ident: e.ident,
             }
         })
