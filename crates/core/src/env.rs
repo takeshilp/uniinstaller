@@ -180,8 +180,11 @@ pub struct Env {
     pub software_roots: Vec<RegPath>,
     /// `...\Installer\UserData`: Windows Installer's per-user component registrations (read by `force::check`).
     pub installer_data: RegPath,
-    /// `...\Services` (read by `force::check`).
+    /// `...\Services` (read by `force::check` and `sysobj`).
     pub services: RegPath,
+    /// The sandbox's stand-in for the Task Scheduler (`sysobj`): a key per task folder and task. `None` on the real system, where
+    /// tasks are read and changed through the Task Scheduler API.
+    pub tasks: Option<RegPath>,
     pub data_dir: PathBuf,
     pub sandbox: bool,
 }
@@ -203,6 +206,7 @@ impl Env {
             software_roots: vec![RegPath::new(Hkcu, V64, "Software"), RegPath::new(Hklm, V64, "SOFTWARE"), RegPath::new(Hklm, V32, "SOFTWARE")],
             installer_data: RegPath::new(Hklm, V64, INSTALLER_DATA),
             services: RegPath::new(Hklm, V64, SERVICES),
+            tasks: None,
             data_dir,
             sandbox: false,
         })
@@ -264,6 +268,7 @@ impl Env {
             software_roots: vec![k("Software", View::V64)],
             installer_data: k("InstallerUserData", View::V64),
             services: k("Services", View::V64),
+            tasks: Some(k("Tasks", View::V64)),
             data_dir,
             sandbox: true,
         }

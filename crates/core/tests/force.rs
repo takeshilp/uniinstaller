@@ -286,6 +286,14 @@ fn refusals() {
     let (code, detail) = c(&svc);
     assert_eq!(code, ForceRefusal::Service);
     assert!(detail.starts_with("FakeSvc:"), "{detail}");
+    // A svchost service whose ServiceDll lies in the folder (its image is Windows').
+    let host = f.root.join("svchost-app");
+    put(&host.join("w.dll"), b"MZ");
+    set(&f.env.services.child("FakeHostSvc"), "ImagePath", r"%SystemRoot%\System32\svchost.exe -k FakeGrp");
+    set(&f.env.services.child("FakeHostSvc").child("Parameters"), "ServiceDll", &host.join("w.dll").to_string_lossy());
+    let (code, detail) = c(&host);
+    assert_eq!(code, ForceRefusal::Service);
+    assert!(detail.starts_with("FakeHostSvc:"), "{detail}");
 }
 
 /// Windows Installer components tie a folder to a product, downward and upward.

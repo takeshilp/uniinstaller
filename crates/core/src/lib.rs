@@ -14,6 +14,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod safety;
 pub mod shortcuts;
+pub mod sysobj;
 pub mod trace;
 
 use std::time::{SystemTime, UNIX_EPOCH};

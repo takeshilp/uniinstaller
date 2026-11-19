@@ -21,7 +21,7 @@ pub const ID_PREFIX: &str = "force:";
 /// A name shorter than this is used to look for settings only when it is exact evidence (spec 1.5).
 pub const MIN_NAME: usize = 4;
 /// `NT SERVICE\TrustedInstaller`, the owner of Windows' own files and folders.
-const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+pub(crate) const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
 /// Name variants usable to look for settings (spec 1.5: a short inexact name matches too much): each variant of
 /// `scan::name_variants(name)` with at least MIN_NAME characters, or equal (any case) to exact evidence: the product name, the
@@ -72,7 +72,7 @@ fn listed(app: &InstalledApp, how: ListedHow) -> Result<ForceCheck> {
 }
 
 /// Whether registry text names the folder (a folder pick) or the file (file-only).
-fn names(text: &str, folder: Option<&Path>, anchor: &Path) -> bool {
+pub(crate) fn names(text: &str, folder: Option<&Path>, anchor: &Path) -> bool {
     match folder {
         Some(f) => text_refers_to(text, f),
         None => text.replace('/', "\\").to_lowercase().contains(&norm(anchor)),
@@ -241,31 +241,20 @@ fn unlisted_owner(env: &Env, apps: &[InstalledApp], folder: Option<&Path>, ancho
     None
 }
 
-/// A registered Windows service whose command line runs from the pick.
-// shortcut: `ServiceDll` (svchost) services, drivers given as `\SystemRoot\...` and scheduled tasks are not checked; the services
-// feature will offer removal instead of a refusal.
+/// A registered Windows service (a driver too) whose command line or `ServiceDll` runs from the pick.
+// shortcut: scheduled tasks are not checked: the scan offers them (never Safe, never preselected) instead of refusing the pick.
 fn service_in(env: &Env, folder: Option<&Path>, anchor: &Path) -> Result<Option<String>> {
-    let root = match registry::open(&env.services, KEY_READ) {
-        Ok(k) => k,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error(format!("cannot read the services: {e}"))),
-    };
-    for name in root.enum_keys().flatten() {
-        let Ok(k) = root.open_subkey_with_flags(&name, KEY_READ) else { continue };
-        let Some(image) = read_string(&k, "ImagePath", true) else { continue };
-        let image = image.trim();
-        let image = image.strip_prefix(r"\??\").unwrap_or(image);
-        if names(image, folder, anchor) {
-            return Ok(Some(format!("{name}: {image}")));
-        }
-    }
-    Ok(None)
+    let all = crate::sysobj::services(env).map_err(|e| Error(e.to_string()))?;
+    Ok(all.iter().find_map(|s| {
+        let hit = s.dll.as_deref().into_iter().chain(Some(s.image.as_str())).find(|t| names(t, folder, anchor))?;
+        Some(format!("{}: {}", s.name, hit.trim()))
+    }))
 }
 
 /// The owner of a file or folder as an SID string (GetNamedSecurityInfoW + ConvertSidToStringSidW, both freed with LocalFree).
 // shortcut: only the pick and its folder are checked; SYSTEM-owned tool folders that other installers manage (C:\Program Files\MSBuild)
 // pass, add their owners or names if users force-remove one by mistake.
-fn owner_sid(p: &Path) -> Option<String> {
+pub(crate) fn owner_sid(p: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{HLOCAL, LocalFree, WIN32_ERROR};
     use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT};
