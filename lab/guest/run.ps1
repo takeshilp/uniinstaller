@@ -119,14 +119,15 @@ try {
         Save-Inventory $out 's2' $T; Step 's2'
         if ((Lab 'op-scan.json' @('scan', $op)) -ne 0) { throw 'scan failed' }
         Save-Inventory $out 's3' $T; Step 's3'
-        $locker = $null
+        $locker = $null; $bystander = $null
         if ($sc.lock) {
-            $lockPath = X $sc.lock; $ready = "$out\lock-ready.txt"
-            $cmd = "`$f = [IO.File]::Open('$lockPath', 'Open', 'Read', 'None'); Set-Content '$ready' ok; Start-Sleep 3600"
-            $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
-            $locker = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-EncodedCommand', $enc
+            $lockPath = X $sc.lock; $ready = "$out\lock-ready.txt"; $ready2 = "$out\bystander-ready.txt"
+            # A window program holds the file; a second copy that holds nothing must survive the close (lab/apps/lockholder.cs).
+            $locker = Start-Process "$bin\lockholder.exe" -PassThru -ArgumentList "`"$lockPath`"", "`"$ready`"", '3600'
+            $bystander = Start-Process "$bin\lockholder.exe" -PassThru -ArgumentList '-', "`"$ready2`"", '3600'
+            $null = $locker.Handle; $null = $bystander.Handle   # keeps the handles so HasExited is available in PowerShell 5.1
             $waited = 0
-            while (-not (Test-Path $ready)) { Start-Sleep 1; $waited++; if ($waited -gt 30) { throw 'lock holder did not start' } }
+            while (-not ((Test-Path $ready) -and (Test-Path $ready2))) { Start-Sleep 1; $waited++; if ($waited -gt 30) { throw 'lock holder did not start' } }
         }
         try {
             if ($sc.crash) {
@@ -136,7 +137,15 @@ try {
                 $null = Lab 'op-after-crash.json' @('show', $op)
             }
             if ((Lab 'op-apply.json' @('apply', $op, $sc.select)) -ne 0) { throw 'apply failed' }
-        } finally { if ($locker) { Stop-Process -Id $locker.Id -Force -ErrorAction SilentlyContinue } }
+            if ($sc.close) {
+                if ((Lab 'op-holders.json' @('holders', $op)) -ne 0) { throw 'holders failed' }
+                if ((Lab 'op-close.json' @('close-retry', $op)) -ne 0) { throw 'close-retry failed' }
+                [ordered]@{ pid = $locker.Id; exited = $locker.HasExited; bystanderPid = $bystander.Id; bystanderExited = $bystander.HasExited } |
+                    ConvertTo-Json | Set-Content "$out\locker.json" -Encoding UTF8
+            }
+        } finally {
+            foreach ($held in @($locker, $bystander)) { if ($held -and -not $held.HasExited) { Stop-Process -Id $held.Id -Force -ErrorAction SilentlyContinue } }
+        }
         @(Get-ChildItem $q -Name -ErrorAction SilentlyContinue) | Set-Content "$out\q-list.txt"
         Save-Inventory $out 's4' $T; Step 's4'
         if ((Lab 'op-rescan.json' @('scan', $op)) -ne 0) { throw 'rescan failed' }

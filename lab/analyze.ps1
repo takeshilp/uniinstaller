@@ -118,6 +118,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         # A forced operation without a chosen uninstaller has no native step.
         if ((-not $sc.force) -or $sc.force.run) { $expect['op-native.json'] = 0 }
         $expect['op-scan.json'] = 0; $expect['op-apply.json'] = 0; $expect['op-rescan.json'] = 0; $expect['op-restore.json'] = 0
+        if ($sc.close) { $expect['op-holders.json'] = 0; $expect['op-close.json'] = 0 }
         if ($sc.crash) { $expect['op-apply-crash.json'] = 99; $expect['op-after-crash.json'] = 0 }
     }
     if ($sc.trace) { $expect['trace.json'] = 0 }
@@ -204,6 +205,9 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     $nat = if ($sc.force -and -not $sc.force.run) { $op } else { Read-Json (& $f 'op-native.json') }
     $scan = Read-Json (& $f 'op-scan.json')
     $app = Read-Json (& $f 'op-apply.json')
+    # A close scenario ends with the retry after the close: the final operation is the one the rules below look at.
+    $closeJ = $null
+    if ($sc.close) { $closeJ = Read-Json (& $f 'op-close.json'); $app = $closeJ.op }
     $rst = Read-Json (& $f 'op-restore.json')
     $plan = $scan.plan
     $natRun = $nat.native
@@ -260,7 +264,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
             }
             { $_ -eq 'locked' -or $_ -eq 'accessDenied' } {
                 # The locked file is inside the item's target (the product moves the folder that holds it, or the file itself).
-                if ($lockId -and (Test-Contains $i.nid $lockId)) { $gaps.Add('locked file (no Restart Manager)'); $problems.Add("$($i.nid) $($i.status): $($i.detail)") }
+                if ($lockId -and (Test-Contains $i.nid $lockId)) { $gaps.Add('locked file left in place'); $problems.Add("$($i.nid) $($i.status): $($i.detail)") }
                 else { Add-Reason 'RISK' "$($i.nid) ended $($i.status): $($i.detail)"; $problems.Add("$($i.nid) $($i.status): $($i.detail)") }
             }
             { $_ -eq 'changed' -or $_ -eq 'inProgress' } { Add-Reason 'FAIL' "$($i.nid) ended $($i.status)"; $problems.Add("$($i.nid) $($i.status)") }
@@ -406,6 +410,28 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     foreach ($c in @($cands | Where-Object { $_.group -eq 'services' -and $_.selected })) { Add-Reason 'FAIL' "a service or task is preselected: $($c.nid)" }
     $res['systemRemoved'] = @($R | Where-Object { $_.target.type -eq 'service' -or $_.target.type -eq 'task' }).Count
 
+    # Rule 19 (close scenarios): Restart Manager names the program that holds the file, only that program is closed (a second copy that holds
+    # nothing survives), and the retry removes the locked item.
+    if ($sc.close) {
+        $lk = if (Test-Path (& $f 'locker.json')) { Read-Json (& $f 'locker.json') } else { $null }
+        if (-not $lk) { Add-Reason 'ERROR' 'locker.json is missing' }
+        else {
+            $hold = @(Read-Json (& $f 'op-holders.json'))
+            $named = @($hold | Where-Object { Test-Contains (Norm-Id $_.candidateId) $lockId } | ForEach-Object { $_.holders } | Where-Object { $_ -and $_.pid -eq $lk.pid })
+            if (-not $named.Count) { Add-Reason 'FAIL' 'the Restart Manager did not report the lock holder' }
+            foreach ($c in @($closeJ.closed)) {
+                if ($c.pid -ne $lk.pid) { Add-Reason 'FAIL' "closed a process the scenario did not start: $($c.pid) $($c.image)" }
+                if ($c.pid -eq $lk.bystanderPid) { Add-Reason 'FAIL' 'closed the program that held nothing' }
+            }
+            if (-not $lk.exited) { Add-Reason 'FAIL' 'the lock holder is still running after close-retry' }
+            if ($lk.bystanderExited) { Add-Reason 'FAIL' 'a program that held nothing exited during close-retry' }
+            foreach ($i in @($items | Where-Object { Test-Contains $_.nid $lockId })) {
+                if ($i.status -ne 'removed') { Add-Reason 'FAIL' "the locked item is not removed after close-retry: $($i.nid) $($i.status)" }
+            }
+            $res['closed'] = @($closeJ.closed).Count
+        }
+    }
+
     # Rule 13: known gaps (never part of the verdict).
     foreach ($id in $s5.Keys) { if ((& $classOf $id) -eq 'gap') { $gaps.Add("left behind: $id") } }
     if ($res.installDirStatus -eq 'notSet' -and $op.app.windowsInstaller) { $gaps.Add('MSI with empty InstallLocation') }
@@ -437,7 +463,7 @@ foreach ($d in Get-ChildItem -LiteralPath $RunDir -Directory -Force) {
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# $($d.Name): $($r.verdict)"); $md.Add('')
     foreach ($x in @($r.reasons)) { $md.Add("- $x") }
-    foreach ($m in 'traceCreated', 'traceEvidence', 'reverted', 'systemRemoved') { if ($r.Contains($m)) { $md.Add("- ${m}: $($r[$m])") } }
+    foreach ($m in 'traceCreated', 'traceEvidence', 'reverted', 'systemRemoved', 'closed') { if ($r.Contains($m)) { $md.Add("- ${m}: $($r[$m])") } }
     if ($cands) {
         $md.Add(''); $md.Add('## Candidates'); $md.Add(''); $md.Add('| id | group | tier | score | blocks | selected | class |'); $md.Add('|---|---|---|---|---|---|---|')
         foreach ($c in $cands) { $md.Add("| ``$($c.nid)`` | $($c.group) | $($c.tier) | $($c.score) | $((@($c.blocks) | ForEach-Object { $_.code }) -join ',') | $($c.selected) | $(& $classOf $c.nid) |") }

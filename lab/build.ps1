@@ -14,6 +14,8 @@ New-Item "$build\payload" -ItemType Directory -Force | Out-Null
 $payload = "$build\payload\labapp.exe"
 Copy-Item "$env:SystemRoot\System32\whoami.exe" $payload
 Set-Content "$build\payload\readme.txt" 'Uniinstaller lab test program. Inert.' -Encoding ascii
+# The lab's lock holder: a window program (no console), so Restart Manager may close it (lab/apps/lockholder.cs).
+Add-Type -Path "$PSScriptRoot\apps\lockholder.cs" -OutputAssembly "$build\lockholder.exe" -OutputType WindowsApplication -ReferencedAssemblies System.Windows.Forms
 
 $makensis = @("$env:LOCALAPPDATA\tauri\NSIS\makensis.exe", (Get-Command makensis -ErrorAction SilentlyContinue).Source) |
     Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1

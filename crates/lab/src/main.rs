@@ -18,7 +18,7 @@ const REFUSED: i32 = 2;
 const CRASH_CODE: u32 = 99;
 /// `force` found the path Listed or Refused: the check result is printed instead of an operation.
 const CHECK_REFUSED: i32 = 3;
-const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | force <path> <name> [--publisher <p>] [--run] | native <op> | scan <op> | apply <op> default|default+reverts|default+system|unblocked [--crash-after-first-move] | restore <op> | show <op>";
+const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | force <path> <name> [--publisher <p>] [--run] | native <op> | scan <op> | apply <op> default|default+reverts|default+system|unblocked [--crash-after-first-move] | holders <op> | close-retry <op> | restore <op> | show <op>";
 
 /// Pure. The token user must be the Windows Sandbox account (it exists disabled on a normal host) and
 /// UNIINSTALLER_LAB must name a local folder with the lab marker (explicit intent, not a location proof).
@@ -167,6 +167,14 @@ fn run(args: &[String]) -> Result<i32, String> {
                 crash_after_first_move(&env, id);
             }
             pretty(&ops::apply(&env, id, &ids).map_err(core)?)
+        }
+        "holders" => pretty(&ops::lock_holders(&env, arg(1)?).map_err(core)?),
+        // The lab acts as a user who confirmed the list it was shown: every holder `holders` reports is confirmed, and the core still refuses
+        // anything blocked or any holder that changed in between.
+        "close-retry" => {
+            let id = arg(1)?;
+            let confirmed: Vec<_> = ops::lock_holders(&env, id).map_err(core)?.into_iter().flat_map(|i| i.holders).collect();
+            pretty(&ops::close_and_retry(&env, id, &confirmed).map_err(core)?)
         }
         "restore" => pretty(&ops::restore(&env, arg(1)?).map_err(core)?),
         "show" => pretty(&ops::load(&env, arg(1)?).map_err(core)?),
