@@ -15,8 +15,9 @@ function Read-Json([string]$Path) { Get-Content -LiteralPath $Path -Raw -Encodin
 # HKCU\Software is shared between views, and HKLM\...\CurrentVersion\App Paths mirrors the 64-bit view in the 32-bit view (observed in the
 # guest: removing the hklm32 key makes the hklm64 key vanish). Such ids are one physical object, so they are folded onto the 64 view.
 # A revert candidate (revert:<value id>) is the same object as the value it restores.
+# A service candidate (service:<name>) is the same object as its key under Services; a task id (task:<path>) is its own kind.
 function Norm-Id([string]$id) {
-    $x = ($id.ToLower() -replace '^revert:', 'value:') -replace '^(key|value):hkcu32:', '$1:hkcu64:'
+    $x = (($id.ToLower() -replace '^revert:', 'value:') -replace '^service:', 'key:hklm64:system\currentcontrolset\services\') -replace '^(key|value):hkcu32:', '$1:hkcu64:'
     return ($x -replace '^(key|value):hklm32:(software\\microsoft\\windows\\currentversion\\app paths\\)', '$1:hklm64:$2')
 }
 function New-Map { New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal) }
@@ -33,10 +34,10 @@ function Load-Tsv([string]$Path, $Errors) {
     return $map
 }
 
-# Containment as defined by the lab: equal; path:X contains path:X\..; key:K contains key:K\.., value:K|* and value:K\..|*.
+# Containment as defined by the lab: equal; path:X contains path:X\..; task:X contains task:X\..; key:K contains key:K\.., value:K|* and value:K\..|*.
 function Test-Contains([string]$Outer, [string]$Inner) {
     if ($Outer -ceq $Inner) { return $true }
-    if ($Outer.StartsWith('path:', 'Ordinal')) { return $Inner.StartsWith($Outer + '\', 'Ordinal') }
+    if ($Outer.StartsWith('path:', 'Ordinal') -or $Outer.StartsWith('task:', 'Ordinal')) { return $Inner.StartsWith($Outer + '\', 'Ordinal') }
     if ($Outer.StartsWith('key:', 'Ordinal')) {
         $k = $Outer.Substring(4)
         return $Inner.StartsWith("key:$k\", 'Ordinal') -or $Inner.StartsWith("value:$k|", 'Ordinal') -or $Inner.StartsWith("value:$k\", 'Ordinal')
@@ -64,6 +65,7 @@ function Get-Sel($Plan, [string]$Policy) {
         $free = (@($_.blocks).Count -eq 0)
         if ($Policy -eq 'default') { $_.selected }
         elseif ($Policy -eq 'default+reverts') { $_.selected -or ($_.group -eq 'revert' -and $free) }
+        elseif ($Policy -eq 'default+system') { $_.selected -or ($_.group -eq 'services' -and $free) }
         else { $free -and -not (@($_.evidence | Where-Object { $_.code -eq 'userDataLikely' }).Count) }
     } | ForEach-Object { Norm-Id $_.id })
 }
@@ -145,8 +147,8 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
             $t = [string]$raw
             foreach ($k in $tok.Keys) { $t = $t.Replace("{$k}", $tok[$k]) }
             $t = (Norm-Id $t.TrimEnd('\'))
-            if (-not ($t.StartsWith('key:') -or $t.StartsWith('value:'))) { $t = "path:$t" }
-            $isKey = $t.StartsWith('key:'); $isPath = $t.StartsWith('path:')
+            if (-not ($t.StartsWith('key:') -or $t.StartsWith('value:') -or $t.StartsWith('task:'))) { $t = "path:$t" }
+            $isKey = $t.StartsWith('key:'); $isPath = $t.StartsWith('path:') -or $t.StartsWith('task:')
             $k2 = if ($isKey) { $t.Substring(4) } else { '' }
             $pats.Add([pscustomobject]@{ Class = $cls; Text = $t; Path = $isPath; Key = $isKey; C1 = $(if ($isPath) { "$t\" } else { "key:$k2\" })
                 C2 = "value:$k2|"; C3 = "value:$k2\" })
@@ -212,7 +214,7 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
     $cands = @($plan.candidates | ForEach-Object { $_ | Add-Member -NotePropertyName nid -NotePropertyValue (Norm-Id $_.id) -PassThru -Force })
     $items = @($app.items | ForEach-Object { $_ | Add-Member -NotePropertyName nid -NotePropertyValue (Norm-Id $_.candidateId) -PassThru -Force })
     $sel = @(Get-Sel $plan $sc.select)
-    $L = @($s2.Keys | Where-Object { $k = $s2[$_].Split("`t")[0]; ($k -eq 'f' -or $k -eq 'l' -or $k -eq 'v') -and ((& $classOf $_) -eq 'owned') })
+    $L = @($s2.Keys | Where-Object { $k = $s2[$_].Split("`t")[0]; ($k -eq 'f' -or $k -eq 'l' -or $k -eq 'v' -or $k -eq 't') -and ((& $classOf $_) -eq 'owned') })
     $R = @($items | Where-Object { $_.status -eq 'removed' })
     $res.selected = $sel.Count; $res.leftovers = $L.Count; $res.removed = $R.Count
 
@@ -399,6 +401,11 @@ function Analyze-Scenario([string]$Dir, [string]$Name) {
         if ((-not $sc.force.run) -and $null -ne $app.native) { Add-Reason 'FAIL' 'a forced operation without a chosen uninstaller has a native run' }
     }
 
+    # Rule 18 (all scenarios): a Windows service or scheduled task is never preselected, whatever its tier (stopping and deleting a system
+    # object is the user's decision). The policy default+system ticks the unblocked ones, like a user who confirms the group.
+    foreach ($c in @($cands | Where-Object { $_.group -eq 'services' -and $_.selected })) { Add-Reason 'FAIL' "a service or task is preselected: $($c.nid)" }
+    $res['systemRemoved'] = @($R | Where-Object { $_.target.type -eq 'service' -or $_.target.type -eq 'task' }).Count
+
     # Rule 13: known gaps (never part of the verdict).
     foreach ($id in $s5.Keys) { if ((& $classOf $id) -eq 'gap') { $gaps.Add("left behind: $id") } }
     if ($res.installDirStatus -eq 'notSet' -and $op.app.windowsInstaller) { $gaps.Add('MSI with empty InstallLocation') }
@@ -430,7 +437,7 @@ foreach ($d in Get-ChildItem -LiteralPath $RunDir -Directory -Force) {
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("# $($d.Name): $($r.verdict)"); $md.Add('')
     foreach ($x in @($r.reasons)) { $md.Add("- $x") }
-    foreach ($m in 'traceCreated', 'traceEvidence', 'reverted') { if ($r.Contains($m)) { $md.Add("- ${m}: $($r[$m])") } }
+    foreach ($m in 'traceCreated', 'traceEvidence', 'reverted', 'systemRemoved') { if ($r.Contains($m)) { $md.Add("- ${m}: $($r[$m])") } }
     if ($cands) {
         $md.Add(''); $md.Add('## Candidates'); $md.Add(''); $md.Add('| id | group | tier | score | blocks | selected | class |'); $md.Add('|---|---|---|---|---|---|---|')
         foreach ($c in $cands) { $md.Add("| ``$($c.nid)`` | $($c.group) | $($c.tier) | $($c.score) | $((@($c.blocks) | ForEach-Object { $_.code }) -join ',') | $($c.selected) | $(& $classOf $c.nid) |") }

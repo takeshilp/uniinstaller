@@ -1,7 +1,9 @@
 # Independent inventory for the lab (does not use the product's scanner). Read-only. Keep this file ASCII-only.
 # One TSV line per object: <kind>`t<id>`t<fingerprint>. kind: d dir, f file, l link, k key, v value, e error.
 # Ids use the product's target_key form in lowercase: path:<full path>, key:<hive><view>:<path>, value:<key>|<name>.
-# shortcut: scoped roots, depth-1 names for Classes and Services, size|mtime for files; widen when a scenario needs more.
+# shortcut: scoped roots, depth-1 names for Classes and Services plus full keys of third-party services (image under {PF}/{PF86}/{PD}, no
+# Windows*/Microsoft* folder), tasks outside \Microsoft through the API, size|mtime for files; widen when a scenario needs more.
+# A running service, a custom security descriptor and password tasks are not exercised (the payload is not a service binary).
 $script:Sha = [Security.Cryptography.SHA256]::Create()
 function Get-Hash([string]$s) { -join ($script:Sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))[0..7] | ForEach-Object { $_.ToString('x2') }) }
 
@@ -66,6 +68,39 @@ function Add-Reg([string]$Hive, [string]$View, [string]$Path, [string[]]$Skip, [
     }
 }
 
+# Full keys (values and subkeys) of third-party services only: the image lies under {PF}, {PF86} or {PD} and in no folder named Windows* or
+# Microsoft* (Defender, Media Player, ATP and Edge are Windows'; their keys change with platform updates and would break unrelated scenarios).
+function Add-Services($T, $Lines) {
+    $roots = @("$($T.PF)\".ToLower(), "$($T.PF86)\".ToLower(), "$($T.PD)\".ToLower())
+    $root = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64').OpenSubKey('SYSTEM\CurrentControlSet\Services')
+    foreach ($n in $root.GetSubKeyNames()) {
+        $k = $null
+        try { $k = $root.OpenSubKey($n) } catch { continue }
+        if ($null -eq $k) { continue }
+        $img = [string]$k.GetValue('ImagePath', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $k.Close()
+        $x = [Environment]::ExpandEnvironmentVariables($img).Trim().TrimStart('"').ToLower()
+        $under = @($roots | Where-Object { $x.StartsWith($_) }).Count -gt 0
+        if ($under -and $x -notmatch '\\(windows|microsoft)[^\\]*\\') { Add-Reg 'hklm' '64' "SYSTEM\CurrentControlSet\Services\$n" @() $false $Lines }
+    }
+}
+
+# Scheduled tasks outside \Microsoft through the Task Scheduler API (not the product's code): every folder (n) and task (t, its XML hashed).
+# The task files under System32\Tasks are not listed: re-registering a task rewrites its file, the API view is the state.
+function Add-Tasks($Lines) {
+    $svc = New-Object -ComObject Schedule.Service
+    $svc.Connect()
+    $stack = New-Object 'System.Collections.Generic.Stack[object]'
+    $stack.Push($svc.GetFolder('\'))
+    while ($stack.Count -gt 0) {
+        $f = $stack.Pop()
+        if ($f.Path -ne '\') { $Lines.Add("n`ttask:$($f.Path.ToLower())`t") }
+        try { foreach ($t in $f.GetTasks(1)) { $Lines.Add("t`ttask:$($t.Path.ToLower())`t$(Get-Hash $t.Xml)") } }
+        catch { $Lines.Add("e`ttask:$($f.Path.ToLower())`t$($_.Exception.GetType().Name)") }
+        foreach ($sub in $f.GetFolders(0)) { if ($sub.Path -ne '\Microsoft') { $stack.Push($sub) } }
+    }
+}
+
 function Save-Inventory([string]$Dir, [string]$Name, $T) {
     $L = New-Object 'System.Collections.Generic.List[string]'
     $lp = $T.LOCALAPPDATA.ToLower(); $ap = $T.APPDATA.ToLower(); $pd = $T.PD.ToLower()
@@ -77,7 +112,7 @@ function Save-Inventory([string]$Dir, [string]$Name, $T) {
     Add-Files "$env:USERPROFILE\AppData\LocalLow" @() $L
     foreach ($r in 'PROGRAMS', 'COMMONPROGRAMS', 'DESKTOP', 'PUBDESKTOP', 'DOCS') { Add-Files $T[$r] @() $L }
     Add-Files 'C:\LabOutside' @() $L
-    Add-Files $T.TASKS @("$($T.TASKS.ToLower())\microsoft") $L
+    Add-Tasks $L
     $cv = 'SOFTWARE\Microsoft\Windows\CurrentVersion'
     foreach ($hv in 'hklm64', 'hklm32', 'hkcu64') {
         $h = $hv.Substring(0, 4); $v = $hv.Substring(4)
@@ -88,6 +123,7 @@ function Save-Inventory([string]$Dir, [string]$Name, $T) {
     Add-Reg 'hklm' '64' 'SOFTWARE\Classes' @() $true $L
     Add-Reg 'hkcu' '64' 'Software\Classes' @() $true $L
     Add-Reg 'hklm' '64' 'SYSTEM\CurrentControlSet\Services' @() $true $L
+    Add-Services $T $L
     $L.Sort([StringComparer]::Ordinal)
     [IO.File]::WriteAllLines((Join-Path $Dir "$Name.tsv"), $L)
 }
