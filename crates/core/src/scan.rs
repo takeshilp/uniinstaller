@@ -8,6 +8,7 @@ use crate::ops::target_key;
 use crate::paths::{self, file_id, has_doc_ext, is_canonical, is_drive_root, is_inside, is_local_abs, is_reparse, norm, same_or_inside};
 use crate::registry::{self, read_string};
 use crate::safety::*;
+use crate::sysobj;
 use crate::trace::{self, value_print};
 use crate::{Result, now_ms, shortcuts};
 use std::collections::HashSet;
@@ -324,7 +325,73 @@ pub fn evaluate(ctx: &Ctx, group: Group, target: &Target) -> Eval {
                 Err(e) => unverifiable(blocks, e),
             }
         }
+        Target::Service { name } => eval_service(ctx, name),
+        Target::Task { path } => eval_task(ctx, path),
     }
+}
+
+/// Blocks every service and task gets from its command lines (recomputed at apply): it must still refer to the program (a tampered plan
+/// cannot name another service), and it must not also name a Program Files place outside the program's folder.
+fn system_refs(ctx: &Ctx, text: &str) -> Vec<Block> {
+    let own = ctx.install_dir.map(Path::to_path_buf).or_else(|| icon_path(ctx.app));
+    let Some(own) = own.filter(|o| crate::force::names(text, ctx.install_dir, o)) else {
+        return vec![block(BlockCode::OutsideAllowedZone, "no longer refers to the program's folder")];
+    };
+    let real = match real_folders() {
+        Ok(r) => r,
+        Err(e) => return vec![block(BlockCode::Unverifiable, format!("real system folders unavailable: {e}"))],
+    };
+    let roots: Vec<&Path> = ctx.env.folders.program_files.iter().chain(&real.program_files).map(PathBuf::as_path).collect();
+    names_elsewhere(text, &roots, &own).map(|why| vec![block(BlockCode::SharedWithOtherApp, why)]).unwrap_or_default()
+}
+
+fn eval_service(ctx: &Ctx, name: &str) -> Eval {
+    let env = ctx.env;
+    let s = match sysobj::service(env, name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return unverifiable(vec![], "the service no longer exists"),
+        Err(e) => return unverifiable(vec![], e),
+    };
+    let text = s.dll.iter().fold(s.image.clone(), |t, d| format!("{t}\n{d}"));
+    let mut blocks = system_refs(ctx, &text);
+    let deps = match sysobj::dependents(env, &s) {
+        Ok(d) => d,
+        Err(e) => return unverifiable(blocks, format!("cannot check dependent services: {e}")),
+    };
+    let bin = sysobj::service_binary(&s, &env.folders.system_dir);
+    blocks.extend(service_blocks(&s, &deps, program_protected(env, &bin)));
+    let running = sysobj::running(env, name).ok();
+    match registry::capture(&env.services.child(name)) {
+        Ok(node) => {
+            if let Some(why) = tree_refers(ctx, &node) {
+                blocks.push(block(BlockCode::SharedWithOtherApp, why));
+            }
+            Eval { blocks, ident: Ident::Service { node, running }, size: 0, user_data: false }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+            blocks.push(block(BlockCode::TooLarge, "more than 5000 values and subkeys"));
+            Eval { blocks, ident: Ident::None {}, size: 0, user_data: false }
+        }
+        // shortcut: non-elevated, a service with an unreadable Security subkey is Unverifiable (9 of 38 third-party services on the owner's
+        // machine) and tasks the user cannot read are not seen. The fix is to restart as administrator before removing anything; after
+        // a first apply the operation offers no rescan.
+        Err(e) if e.raw_os_error() == Some(5) => unverifiable(blocks, "access denied: run as administrator to read the service's settings"),
+        Err(e) => unverifiable(blocks, e),
+    }
+}
+
+fn eval_task(ctx: &Ctx, path: &str) -> Eval {
+    let (t, xml) = match sysobj::task(ctx.env, path) {
+        Ok(Some(x)) => x,
+        Ok(None) => return unverifiable(vec![], "the task no longer exists"),
+        Err(e) => return unverifiable(vec![], e),
+    };
+    let mut blocks = system_refs(ctx, &t.actions.join("\n"));
+    blocks.extend(task_blocks(&t));
+    if let Some(why) = t.actions.iter().find_map(|a| ctx.anchors.referenced_in(&ctx.env.folders, a, ctx.install_dir)) {
+        blocks.push(block(BlockCode::SharedWithOtherApp, why));
+    }
+    Eval { blocks, ident: Ident::Task { xml, actions: t.actions, enabled: t.enabled }, size: 0, user_data: false }
 }
 
 fn eval_path(ctx: &Ctx, group: Group, path: &Path) -> Eval {
@@ -404,6 +471,8 @@ fn display_key(t: &Target) -> String {
         Target::Path { path, .. } => path.to_string_lossy().to_lowercase(),
         Target::RegKey { key } => key.display().to_lowercase(),
         Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => format!("{}\\{}", key.display(), name).to_lowercase(),
+        Target::Service { name } => format!("service:{}", name.to_lowercase()),
+        Target::Task { path } => path.to_lowercase(),
     }
 }
 
@@ -537,7 +606,7 @@ impl TraceScan<'_> {
                     self.out.push(Raw { group, target: c.target.clone(), evidence });
                 }
             }
-            Target::RegRevert { .. } => {}
+            Target::RegRevert { .. } | Target::Service { .. } | Target::Task { .. } => {}
         }
     }
 }
@@ -667,6 +736,33 @@ pub fn scan(env: &Env, app: &InstalledApp, launch: Option<&Launch>, others: &[In
             evidence.push(ev(EvidenceCode::TargetMissing, W_TARGET_MISSING, "the uninstaller no longer exists"));
         }
         raw.push(Raw { group: Group::Registry, target: Target::RegKey { key: src.clone() }, evidence });
+    }
+
+    // H. Windows services and scheduled tasks that run something from the install folder (or the picked file): by reference only
+    // (nothing is traced for them), never preselected (`default_selected`); drivers, per-user services and `\Microsoft` tasks are emitted
+    // as well and reported as Blocked. A read failure offers nothing, as for Run values.
+    // shortcut: detection is by reference only (image, ServiceDll or an exec action into the confirmed folder or picked file): no trace
+    // evidence, no name match, and an app without a confirmed folder gets none; capture service names and task paths in the trace
+    // when the budget allows.
+    if let Some(d) = &refs {
+        for s in sysobj::services(env).unwrap_or_default().into_iter().filter(|s| !s.marked) {
+            let text = s.dll.iter().fold(s.image.clone(), |t, x| format!("{t}\n{x}"));
+            if !crate::force::names(&text, confirmed.as_deref(), d) {
+                continue;
+            }
+            let bin = sysobj::service_binary(&s, &env.folders.system_dir);
+            let evidence = refers(format!("the service runs {}", bin.display()), !bin.exists());
+            raw.push(Raw { group: Group::Services, target: Target::Service { name: s.name }, evidence });
+        }
+        for t in sysobj::tasks(env).unwrap_or_default() {
+            let Some(action) = t.actions.iter().find(|a| crate::force::names(a, confirmed.as_deref(), d)) else { continue };
+            let missing = match split_command(action, &env.folders.system_dir, &|p| p.is_file()) {
+                Ok((exe, _)) => !exe.exists(),
+                Err(_) => true,
+            };
+            let evidence = refers(format!("the task runs {action}"), missing);
+            raw.push(Raw { group: Group::Services, target: Target::Task { path: t.path }, evidence });
+        }
     }
 
     // E and F. Settings and user data by exact name (Data group, never preselected).

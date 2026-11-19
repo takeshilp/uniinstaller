@@ -90,6 +90,8 @@ pub(crate) fn check_path(path: &str) -> io::Result<()> {
 
 /// The program text of a service as a path: environment expanded, `\??\` and `\\?\` prefixes dropped (also right after an opening
 /// quote), `\SystemRoot\...` and a relative `system32\...` turned into the Windows folder. Pure apart from the expansion.
+// shortcut: `%VAR%` expands in our environment, and another user's per-user paths are matched against ours; read each user's environment
+// in stage 2.
 pub fn image_text(raw: &str, windows_dir: &Path) -> String {
     let s = expand_env(raw);
     let s = s.trim();
@@ -199,11 +201,14 @@ fn read_services(env: &Env) -> io::Result<(Vec<Svc>, usize)> {
 }
 
 /// Lenient: detection and force rule 11 (a key we cannot open is not offered).
+// shortcut: each scan enumerates all services and tasks once; cache them per session if previews get slow (timings in docs/services.md).
 pub fn services(env: &Env) -> io::Result<Vec<Svc>> {
     read_services(env).map(|x| x.0)
 }
 
 /// Strict: a service is offered only when every other key could be read (fail closed).
+// shortcut: any dependent blocks, including one of the same program and a group dependency; remove the program that owns the dependent
+// first. After a first apply the operation offers no rescan.
 pub fn dependents(env: &Env, s: &Svc) -> io::Result<Vec<String>> {
     let (all, unreadable) = read_services(env)?;
     dependents_of(&all, unreadable, s)
@@ -309,14 +314,175 @@ fn stand_in_tasks(root: &RegPath) -> io::Result<Vec<Task>> {
 pub fn sandbox_task(env: &Env, path: &str, actions: &[String], other: u32) -> crate::Result<()> {
     let Some(root) = env.tasks.as_ref().filter(|_| env.sandbox) else { return Err("task stand-ins exist only in a sandbox".into()) };
     check_path(path)?;
+    Ok(write_stand_in(root, path, &format!("<Task><!-- sandbox stand-in: {path} --></Task>"), actions, other, true)?)
+}
+
+fn write_stand_in(root: &RegPath, path: &str, xml: &str, actions: &[String], other: u32, enabled: bool) -> io::Result<()> {
     let k = registry::create(&stand_in_key(root, path), KEY_ALL_ACCESS)?;
-    registry::set_string(&k, "Xml", &format!("<Task><!-- sandbox stand-in: {path} --></Task>"), false)?;
+    registry::set_string(&k, "Xml", xml, false)?;
     let mut bytes: Vec<u8> = actions.iter().flat_map(|a| a.encode_utf16().chain(Some(0))).flat_map(u16::to_le_bytes).collect();
     bytes.extend([0, 0]);
     k.set_raw_value("Actions", &RegValue { bytes: std::borrow::Cow::Owned(bytes), vtype: RegType::REG_MULTI_SZ })?;
     registry::set_dword(&k, "Other", other)?;
-    registry::set_dword(&k, "Enabled", 1)?;
+    registry::set_dword(&k, "Enabled", u32::from(enabled))
+}
+
+// ---------- removing and recreating ----------
+// Callers: `ops::apply` and `ops::restore` only, both behind `ops::guard`. The real branches never run in a debug build and, in a
+// release build, are exercised only inside Windows Sandbox through the lab (`lab/lab.ps1`).
+
+/// A real service or task is never changed by a debug build, whatever the caller does (tests and `tauri dev` run in debug).
+fn real_guard() -> io::Result<()> {
+    if cfg!(debug_assertions) {
+        return Err(io::Error::other("debug build: real services and tasks are never changed"));
+    }
     Ok(())
+}
+
+/// How long a running service is given to stop.
+// shortcut: the stop waits 30 s with no stop button and never kills; a service that does not stop ends Locked. Add Restart Manager or a
+// "stop waiting" button when users meet one.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Stops the service if it runs (never kills it: after `STOP_WAIT` the call fails with 1053 and nothing is deleted) and deletes it
+/// through the Service Control Manager. Returns true when the SCM only marked it for deletion and the key is still there.
+// shortcut: a service the SCM only marked for deletion ends `Removed` with the `DEFERRED` detail; there is no per-item PendingReboot status.
+pub fn remove_service(env: &Env, name: &str) -> io::Result<bool> {
+    check_name(name)?;
+    if env.sandbox {
+        registry::delete_key(&env.services.child(name))?;
+        return Ok(false);
+    }
+    real_guard()?;
+    real::remove_service(name, &env.services.child(name))
+}
+
+/// Deletes the task through the Task Scheduler (its emptied folder stays).
+// shortcut: emptied task folders, the TaskCache tree entry and the svchost group list entries stay.
+pub fn delete_task(env: &Env, path: &str) -> io::Result<()> {
+    check_path(path)?;
+    match &env.tasks {
+        Some(root) if env.sandbox => registry::delete_key(&stand_in_key(root, path)),
+        _ => {
+            real_guard()?;
+            real::delete_task(path).map_err(io_err)
+        }
+    }
+}
+
+type Restored = (RestoreStatus, Option<String>);
+
+/// Names of the values (and "subkeys") in which two captures of a service key differ.
+fn differs(a: &RegNode, b: &RegNode) -> Vec<String> {
+    let find = |n: &RegNode, name: &str| n.values.iter().find(|v| v.name.eq_ignore_ascii_case(name)).cloned();
+    let mut out: Vec<String> = a.values.iter().chain(&b.values).filter(|v| find(a, &v.name) != find(b, &v.name)).map(|v| v.name.clone()).collect();
+    out.dedup();
+    if a.keys != b.keys {
+        out.push("(subkeys)".into());
+    }
+    out
+}
+
+/// Recreates a service from its key backup: `CreateServiceW` for the fields the SCM owns, then the key's values and subkeys are merged
+/// back (existing values are kept, so the exact bytes land), then the key is compared with the backup. Nothing is started.
+// shortcut: restore sets only the CreateServiceW fields and delayed start through the API; the other values (description, failure
+// actions, triggers, parameters, security descriptor) are written into the key and apply at the latest after a restart. Account
+// passwords are not restored.
+pub fn recreate_service(env: &Env, name: &str, node: &RegNode) -> Restored {
+    let fail = |m: String| (RestoreStatus::Failed, Some(m));
+    if let Err(e) = check_name(name) {
+        return fail(e.to_string());
+    }
+    let key = env.services.child(name);
+    match registry::open(&key, KEY_READ) {
+        Ok(k) => {
+            if read_dword(&k, "DeleteFlag") == Some(1) {
+                return fail("the removed service is still marked for deletion; restart Windows and restore again".into());
+            }
+            return match registry::capture(&key) {
+                Ok(now) if &now == node => (RestoreStatus::Restored, None),
+                Ok(_) => (RestoreStatus::Conflict, Some("a service with this name exists again; it was not changed".into())),
+                Err(e) => fail(e.to_string()),
+            };
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return fail(e.to_string()),
+    }
+    let made = if env.sandbox {
+        Ok(())
+    } else {
+        real_guard().and_then(|()| real::create_service(name, node))
+    };
+    match made {
+        Ok(()) => {}
+        Err(e) if matches!(e.raw_os_error(), Some(1073 | 1078)) => return (RestoreStatus::Conflict, Some("a service with this name exists again; it was not changed".into())),
+        Err(e) if e.raw_os_error() == Some(1072) => return fail("the removed service is still marked for deletion; restart Windows and restore again".into()),
+        Err(e) => return fail(e.to_string()),
+    }
+    if let Err(e) = registry::restore_node(&key, node) {
+        return fail(e.to_string());
+    }
+    match registry::capture(&key) {
+        Ok(now) if &now == node => {
+            let account = node_text(node, "ObjectName").filter(|a| !a.eq_ignore_ascii_case("LocalSystem") && !a.to_uppercase().starts_with("NT AUTHORITY\\") && !a.to_uppercase().starts_with("NT SERVICE\\"));
+            (RestoreStatus::Restored, account.map(|a| format!("recreated; set the password of account {a} again")))
+        }
+        // shortcut: a recreated service or task that differs from its backup ends Conflict although it exists again.
+        Ok(now) => {
+            let d: Vec<String> = differs(node, &now).into_iter().take(3).collect();
+            (RestoreStatus::Conflict, Some(format!("recreated, but it differs from the backup in: {}", d.join(", "))))
+        }
+        Err(e) => fail(e.to_string()),
+    }
+}
+
+/// The first differing line of two task definitions, each cut to 120 characters.
+fn first_diff(a: &str, b: &str) -> String {
+    let cut = |s: &str| s.chars().take(120).collect::<String>();
+    let (mut x, mut y) = (a.lines(), b.lines());
+    loop {
+        match (x.next(), y.next()) {
+            (Some(p), Some(q)) if p == q => {}
+            (None, None) => return "(line endings or trailing text)".into(),
+            (p, q) => return format!("backup `{}` now `{}`", cut(p.unwrap_or("")), cut(q.unwrap_or(""))),
+        }
+    }
+}
+
+/// Recreates a task from its backup XML through `RegisterTask` (the XML is registered as it is). A task that ran with a stored
+/// password cannot be recreated. The live definition is compared with the backup afterwards.
+// shortcut: tasks with a stored password cannot be recreated, and a task's security descriptor is not backed up.
+pub fn recreate_task(env: &Env, path: &str, xml: &str, actions: &[String], enabled: bool) -> Restored {
+    let fail = |m: String| (RestoreStatus::Failed, Some(m));
+    if let Err(e) = check_path(path) {
+        return fail(e.to_string());
+    }
+    match task(env, path) {
+        Ok(Some((_, live))) if live == xml => return (RestoreStatus::Restored, None),
+        Ok(Some(_)) => return (RestoreStatus::Conflict, Some("a task with this name exists again; it was not changed".into())),
+        Ok(None) => {}
+        Err(e) => return fail(e.to_string()),
+    }
+    let conflict = || (RestoreStatus::Conflict, Some("a task with this name exists again; it was not changed".into()));
+    match &env.tasks {
+        Some(root) if env.sandbox => {
+            if let Err(e) = write_stand_in(root, path, xml, actions, 0, enabled) {
+                return fail(e.to_string());
+            }
+        }
+        _ => match real_guard().and_then(|()| real::create_task(path, xml).map_err(io_err)) {
+            Ok(real::Made::Done) => {}
+            Ok(real::Made::Password) => return fail("the task runs with a stored password; recreate it by hand from the backup in the operation's manifest".into()),
+            Ok(real::Made::Exists) => return conflict(),
+            Err(e) => return fail(e.to_string()),
+        },
+    }
+    match task(env, path) {
+        Ok(Some((_, live))) if live == xml => (RestoreStatus::Restored, None),
+        Ok(Some((_, live))) => (RestoreStatus::Conflict, Some(format!("recreated, but its definition differs from the backup: {}", first_diff(xml, &live)))),
+        Ok(None) => fail("the task was not found after it was created".into()),
+        Err(e) => fail(e.to_string()),
+    }
 }
 
 // ---------- the real system ----------
@@ -417,6 +583,142 @@ mod real {
             }
         }
         Ok(out)
+    }
+
+    pub fn remove_service(name: &str, key: &RegPath) -> io::Result<bool> {
+        use std::time::{Duration, Instant};
+        let n = wide(name);
+        // SAFETY: `n` is NUL-terminated and outlives the calls; the handles are closed by `Sc`. Nothing is killed: a service that
+        // does not stop within STOP_WAIT is left alone and the call fails.
+        unsafe {
+            let scm = Sc(OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT).map_err(io_err)?);
+            let svc = match OpenServiceW(scm.0, PCWSTR(n.as_ptr()), SERVICE_STOP | SERVICE_QUERY_STATUS | 0x0001_0000 /* DELETE */) {
+                Ok(h) => Sc(h),
+                Err(e) => {
+                    let e = io_err(e);
+                    // 1060: the SCM does not know it. Gone for real only when its key is gone too.
+                    return Err(if e.raw_os_error() == Some(1060) && !registry::exists(key) { io::Error::from_raw_os_error(2) } else { e });
+                }
+            };
+            let mut st = SERVICE_STATUS::default();
+            QueryServiceStatus(svc.0, &mut st).map_err(io_err)?;
+            if st.dwCurrentState != SERVICE_STOPPED {
+                if let Err(e) = ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st) {
+                    let e = io_err(e);
+                    if e.raw_os_error() != Some(1062) {
+                        return Err(e);
+                    }
+                }
+                let deadline = Instant::now() + super::STOP_WAIT;
+                loop {
+                    QueryServiceStatus(svc.0, &mut st).map_err(io_err)?;
+                    if st.dwCurrentState == SERVICE_STOPPED {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::from_raw_os_error(1053));
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            DeleteService(svc.0).map_err(io_err)?;
+            drop(svc);
+            drop(scm);
+        }
+        for _ in 0..10 {
+            if !registry::exists(key) {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(true)
+    }
+
+    pub fn create_service(name: &str, node: &RegNode) -> io::Result<()> {
+        let val = |n: &str| node.values.iter().find(|v| v.name.eq_ignore_ascii_case(n));
+        let num = |n: &str, default: u32| val(n).and_then(super::dword).unwrap_or(default);
+        let text = |n: &str| node_text(node, n).filter(|t| !t.is_empty());
+        let list = |n: &str| val(n).and_then(|v| registry::to_regtype(v.kind).map(|t| multi_text(t, &v.data))).unwrap_or_default();
+        let image = text("ImagePath").ok_or_else(|| io::Error::other("the backup has no ImagePath"))?;
+        let (n, img) = (wide(name), wide(&image));
+        let display = text("DisplayName").map(|d| wide(&d));
+        let group = text("Group").map(|g| wide(&g));
+        let account = text("ObjectName").map(|a| wide(&a));
+        let mut deps: Vec<u16> = list("DependOnService").into_iter().chain(list("DependOnGroup").into_iter().map(|g| format!("+{g}"))).flat_map(|d| d.encode_utf16().chain(Some(0)).collect::<Vec<u16>>()).collect();
+        if !deps.is_empty() {
+            deps.push(0);
+        }
+        let opt = |v: &Option<Vec<u16>>| v.as_ref().map_or(PCWSTR::null(), |w| PCWSTR(w.as_ptr()));
+        // SAFETY: every buffer is NUL-terminated (the dependency list is double-NUL-terminated) and outlives the call; the handles are
+        // closed by `Sc`. The password is None: an account other than a built-in one needs it set again by hand.
+        unsafe {
+            let scm = Sc(OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE).map_err(io_err)?);
+            let svc = Sc(CreateServiceW(
+                scm.0,
+                PCWSTR(n.as_ptr()),
+                opt(&display),
+                SERVICE_ALL_ACCESS,
+                ENUM_SERVICE_TYPE(num("Type", 0x10)),
+                SERVICE_START_TYPE(num("Start", 3)),
+                SERVICE_ERROR(num("ErrorControl", 1)),
+                PCWSTR(img.as_ptr()),
+                opt(&group),
+                None,
+                if deps.is_empty() { PCWSTR::null() } else { PCWSTR(deps.as_ptr()) },
+                opt(&account),
+                PCWSTR::null(),
+            )
+            .map_err(io_err)?);
+            if num("DelayedAutostart", 0) == 1 {
+                let info = SERVICE_DELAYED_AUTO_START_INFO { fDelayedAutostart: windows::core::BOOL(1) };
+                ChangeServiceConfig2W(svc.0, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, Some(&info as *const _ as *const core::ffi::c_void)).map_err(io_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_task(path: &str) -> windows::core::Result<()> {
+        let _com = ComGuard::new();
+        let svc = scheduler()?;
+        let (parent, leaf) = path.rsplit_once('\\').unwrap_or(("", path));
+        let parent = if parent.is_empty() { "\\" } else { parent };
+        // SAFETY: COM calls on live interfaces owned by this thread's apartment.
+        unsafe { svc.GetFolder(&BSTR::from(parent))?.DeleteTask(&BSTR::from(leaf), 0) }
+    }
+
+    pub enum Made {
+        Done,
+        /// The task runs with a stored password (logon type 1 or 6): it cannot be recreated without it.
+        Password,
+        Exists,
+    }
+
+    /// Registers the XML as it is (`TASK_CREATE`: never overwrites). `NewTask` + `SetXmlText` are used only to read the logon type.
+    pub fn create_task(path: &str, xml: &str) -> windows::core::Result<Made> {
+        let _com = ComGuard::new();
+        let svc = scheduler()?;
+        let (parent, leaf) = path.rsplit_once('\\').unwrap_or(("", path));
+        let parent = if parent.is_empty() { "\\" } else { parent };
+        // SAFETY: COM calls on live interfaces owned by this thread's apartment.
+        unsafe {
+            let def = svc.NewTask(0)?;
+            def.SetXmlText(&BSTR::from(xml))?;
+            let mut lt = TASK_LOGON_TYPE(0);
+            def.Principal()?.LogonType(&mut lt)?;
+            if lt == TASK_LOGON_PASSWORD || lt == TASK_LOGON_INTERACTIVE_TOKEN_OR_PASSWORD {
+                return Ok(Made::Password);
+            }
+            let folder = match svc.GetFolder(&BSTR::from(parent)) {
+                Ok(f) => f,
+                Err(e) if e.code().0 as u32 == 0x8007_0002 => svc.GetFolder(&BSTR::from("\\"))?.CreateFolder(&BSTR::from(parent.trim_start_matches('\\')), &VARIANT::default())?,
+                Err(e) => return Err(e),
+            };
+            match folder.RegisterTask(&BSTR::from(leaf), &BSTR::from(xml), TASK_CREATE.0, &VARIANT::default(), &VARIANT::default(), lt, &VARIANT::default()) {
+                Ok(_) => Ok(Made::Done),
+                Err(e) if e.code().0 as u32 == 0x8007_00B7 => Ok(Made::Exists),
+                Err(e) => Err(e),
+            }
+        }
     }
 
     pub fn task(path: &str) -> windows::core::Result<Option<(Task, String)>> {
@@ -550,6 +852,8 @@ mod tests {
         let dll = s.dll.as_deref().expect("a ServiceDll");
         assert!(dll.to_lowercase().contains(r"\system32\"), "{dll}");
         assert!(!s.marked);
+        let bin = service_binary(&s, &env.folders.system_dir);
+        assert!(crate::safety::program_protected(&env, &bin).is_some(), "Windows' own program is protected: {bin:?}");
         assert!(running(&env, "EventLog").unwrap());
         assert!(service(&env, "No Such Service 4711").unwrap().is_none());
         assert!(services(&env).unwrap().len() > 100);

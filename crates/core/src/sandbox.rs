@@ -5,6 +5,7 @@ use crate::model::RegPath;
 use crate::paths::{canonical, is_local_abs, make_junction};
 use crate::registry::{self, set_dword, set_string};
 use crate::shortcuts;
+use crate::sysobj;
 use crate::{Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,6 +126,16 @@ pub fn seed(root: &Path, tag: &str) -> Result<Env> {
     shortcuts::create(&desktop(&env).join("Sandbox Notes.lnk"), &exe)?;
     let run = registry::create(&env.run_roots[0], KEY_ALL_ACCESS)?;
     set_string(&run, "SandboxNotes", &format!("\"{}\" --tray", exe.display()), false)?;
+    // Its Windows service and scheduled task: stand-ins under the sandbox keys (`sysobj`), so the flow can be walked and tested without
+    // touching the real Service Control Manager or Task Scheduler.
+    let svc = registry::create(&env.services.child("SandboxNotesSvc"), KEY_ALL_ACCESS)?;
+    set_dword(&svc, "Type", 0x10)?;
+    set_dword(&svc, "Start", 3)?;
+    set_dword(&svc, "ErrorControl", 1)?;
+    set_string(&svc, "ImagePath", &format!("\"{}\" --service", exe.display()), true)?;
+    set_string(&svc, "ObjectName", "LocalSystem", false)?;
+    set_string(&svc, "DisplayName", "Sandbox Notes Service", false)?;
+    sysobj::sandbox_task(&env, r"\Sandbox Soft\Sandbox Notes Update", &[format!("\"{}\" --update", exe.display())], 0)?;
     let ap = registry::create(&env.app_paths_roots[0].child("Sandbox Notes.exe"), KEY_ALL_ACCESS)?;
     set_string(&ap, "", &exe.to_string_lossy(), false)?;
     let sw = registry::create(&env.software_roots[0].child("Sandbox Soft").child("Sandbox Notes"), KEY_ALL_ACCESS)?;

@@ -4,6 +4,7 @@ use crate::env::{Env, Folders};
 use crate::model::*;
 use crate::paths::{canonical, is_canonical, is_drive_root, is_inside, is_local_abs, norm, same_or_inside};
 use crate::registry;
+use crate::sysobj::{Svc, TYPE_DRIVERS, TYPE_USER, TYPE_WIN32, Task, is_windows_task};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -52,11 +53,12 @@ pub fn tier(score: i32, has_blocks: bool) -> Tier {
     }
 }
 
-/// The settings and user-data group, previous-value reverts and anything that looks like user data are never preselected.
+/// The settings and user-data group, previous-value reverts, services and tasks, and anything that looks like user data are never
+/// preselected: stopping and deleting a system object has effects beyond files, and nothing is traced for it (spec 7, stage 3).
 // shortcut: install-dir leftovers are never preselected unless a trace journal confirms them (they score at most Review otherwise),
 // the user ticks them.
 pub fn default_selected(tier: Tier, group: Group, user_data: bool) -> bool {
-    tier == Tier::Safe && !matches!(group, Group::Data | Group::Revert) && !user_data
+    tier == Tier::Safe && !matches!(group, Group::Data | Group::Revert | Group::Services) && !user_data
 }
 
 /// Folders of the real system, canonicalized, computed once. An `Err` makes every path `Unverifiable`.
@@ -212,7 +214,9 @@ pub fn path_blocks(env: &Env, path: &Path, group: Group, install_dir: Option<&Pa
 pub fn registry_blocks(env: &Env, target: &Target) -> Vec<Block> {
     let block = |code, d: &str| vec![Block { code, detail: d.to_string() }];
     match target {
-        Target::Path { .. } => block(BlockCode::OutsideAllowedZone, "not a registry target"),
+        // Services and tasks are removed only through the Service Control Manager and the Task Scheduler, never as registry keys (spec 9.7):
+        // their Services keys stay `ProtectedRegistry` below, and nothing routes these targets here.
+        Target::Path { .. } | Target::Service { .. } | Target::Task { .. } => block(BlockCode::OutsideAllowedZone, "not a registry target"),
         Target::RegKey { key } => {
             for r in env.uninstall_roots.iter().chain(&env.app_paths_roots) {
                 if let Some(c) = key.below(r) {
@@ -266,6 +270,92 @@ pub fn registry_blocks(env: &Env, target: &Target) -> Vec<Block> {
             }
         }
     }
+}
+
+/// Why a command line also names a place under a Program Files root (env or real) outside `own` (the confirmed folder, or the picked
+/// file of a file-only forced target), if it does: such a place belongs to a program the list may not know (an unregistered vendor
+/// folder, measured: NvDriverUpdateCheckDaily runs NvContainer with `-d "...\NVIDIA App\..."`). ProgramData and other drives are not checked.
+// shortcut: Program Files roots only, fail closed: the program's own second folder (its x86 half, the vendor's Common Files) blocks too;
+// widen `own` to the program's other registered folders if users report blocked services of their own program.
+pub fn names_elsewhere(text: &str, roots: &[&Path], own: &Path) -> Option<String> {
+    let low = text.replace('/', "\\").to_lowercase();
+    let own = norm(own);
+    for r in roots {
+        let needle = format!("{}\\", norm(r).trim_end_matches('\\'));
+        let mut from = 0;
+        while let Some(i) = low[from..].find(&needle) {
+            let at = &low[from + i..];
+            let inside = at.starts_with(&own) && at[own.len()..].chars().next().is_none_or(|c| matches!(c, '\\' | '"' | ' ' | ',' | ';' | '\n'));
+            if !inside {
+                let end = at.find(['"', ',', ';', '\n']).unwrap_or(at.len());
+                return Some(format!("also refers to {} outside the program's folder", at[..end].trim_end()));
+            }
+            from += i + needle.len();
+        }
+    }
+    None
+}
+
+/// Why a service's program belongs to Windows, if it does: it lies in a protected tree of the env or the real folders (Windows, Common
+/// Files, `ProgramData\Microsoft`, WindowsApps, Package Cache, ...), or it exists and is owned by TrustedInstaller, or its owner cannot be
+/// read. A missing program (the usual leftover) is judged by its path only.
+// shortcut: an existing program whose owner cannot be read blocks the service (fail closed); measure on real data before relaxing.
+pub fn program_protected(env: &Env, bin: &Path) -> Option<String> {
+    let real = match real_folders() {
+        Ok(r) => r,
+        Err(e) => return Some(format!("cannot verify: {e}")),
+    };
+    let canon = canon_if_exists(bin);
+    for f in [&env.folders, real] {
+        // The canonical spelling too: an 8.3 name or a junction in the path must not hide a protected tree.
+        if let Some(why) = protected_reason(f, bin, Group::ProgramFiles).or_else(|| protected_reason(f, &canon, Group::ProgramFiles)) {
+            return Some(format!("its program is in a protected Windows folder ({why})"));
+        }
+    }
+    if bin.exists() {
+        match crate::force::owner_sid(bin) {
+            None => return Some("the owner of its program cannot be read".into()),
+            Some(s) if s == crate::force::TRUSTED_INSTALLER => return Some("its program belongs to Windows (owned by TrustedInstaller)".into()),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Hard blocks of a Windows service, pure: drivers and per-user services are not supported, a program that belongs to Windows
+/// (`program_protected`) is Windows' own, and a service another service depends on stays.
+// shortcut: drivers and per-user services are report-only (Unsupported); add their removal with its own safety rules if users need it.
+pub fn service_blocks(s: &Svc, dependents: &[String], protected: Option<String>) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut add = |code, d: String| out.push(Block { code, detail: d });
+    if s.kind & TYPE_DRIVERS != 0 {
+        add(BlockCode::Unsupported, "a driver: drivers are not removed".into());
+    } else if s.kind & TYPE_USER != 0 {
+        add(BlockCode::Unsupported, "a per-user service".into());
+    } else if s.kind & TYPE_WIN32 == 0 {
+        add(BlockCode::Unsupported, format!("not a service process (Type {:#x})", s.kind));
+    }
+    if let Some(why) = protected {
+        add(BlockCode::ProtectedPath, why);
+    }
+    if !dependents.is_empty() {
+        add(BlockCode::SharedWithOtherApp, format!("other services depend on it: {}", dependents.join(", ")));
+    }
+    out
+}
+
+/// Hard blocks of a scheduled task, pure: Windows' own tasks (the `\Microsoft` folder) and tasks with an action other than a program.
+// shortcut: a task's other actions (COM handlers, e-mail, message boxes) are not matched, so such a task is Unsupported; its working
+// directory is not matched either.
+pub fn task_blocks(t: &Task) -> Vec<Block> {
+    let mut out = Vec::new();
+    if is_windows_task(&t.path) {
+        out.push(Block { code: BlockCode::ProtectedPath, detail: "a Windows task (the \\Microsoft folder)".into() });
+    }
+    if t.other > 0 {
+        out.push(Block { code: BlockCode::Unsupported, detail: "it also runs actions other than a program".into() });
+    }
+    out
 }
 
 /// The zone root (or install dir) that contains `path`, used to stop empty-folder cleanup.
@@ -365,6 +455,86 @@ mod tests {
         assert!(!default_selected(Tier::Safe, Group::ProgramFiles, true));
         assert!(!default_selected(Tier::Safe, Group::Shortcuts, true));
         assert!(!default_selected(Tier::Safe, Group::Revert, false));
+        // Windows services and scheduled tasks are never preselected, whatever their tier.
+        assert!(!default_selected(Tier::Safe, Group::Services, false));
+        assert!(!default_selected(Tier::Review, Group::Services, false));
+    }
+
+    fn svc(kind: u32) -> Svc {
+        Svc { name: "S".into(), kind, image: r"C:\x\a.exe".into(), dll: None, group: None, depends: vec![], marked: false }
+    }
+
+    #[test]
+    fn service_block_rules() {
+        let codes = |s: &Svc, deps: &[&str], prot: Option<&str>| -> Vec<(BlockCode, String)> {
+            let d: Vec<String> = deps.iter().map(|d| d.to_string()).collect();
+            service_blocks(s, &d, prot.map(str::to_string)).into_iter().map(|b| (b.code, b.detail)).collect()
+        };
+        assert!(codes(&svc(0x10), &[], None).is_empty(), "a clean own-process service");
+        assert!(codes(&svc(0x20), &[], None).is_empty(), "a clean share-process service");
+        assert!(codes(&svc(0x110), &[], None).is_empty(), "interactive own-process");
+        let drv = codes(&svc(0x01), &[], None);
+        assert_eq!((drv[0].0, drv.len()), (BlockCode::Unsupported, 1));
+        assert!(drv[0].1.contains("driver"));
+        assert_eq!(codes(&svc(0x02), &[], None)[0].0, BlockCode::Unsupported, "a file-system driver");
+        assert!(codes(&svc(0x50), &[], None)[0].1.contains("per-user"), "user-own process");
+        assert!(codes(&svc(0xD0), &[], None)[0].1.contains("per-user"));
+        assert!(codes(&svc(0), &[], None)[0].1.contains("not a service process"), "a missing Type");
+        let p = codes(&svc(0x10), &[], Some("its program is in a protected Windows folder (x)"));
+        assert_eq!((p[0].0, p.len()), (BlockCode::ProtectedPath, 1));
+        let d = codes(&svc(0x10), &["A", "B"], None);
+        assert_eq!((d[0].0, d[0].1.as_str()), (BlockCode::SharedWithOtherApp, "other services depend on it: A, B"));
+        assert_eq!(codes(&svc(0x01), &["A"], Some("w")).len(), 3, "every rule adds its own block");
+    }
+
+    #[test]
+    fn task_block_rules() {
+        let t = |path: &str, other: u32| Task { path: path.into(), actions: vec![r"C:\x\a.exe".into()], other, enabled: true };
+        assert!(task_blocks(&t(r"\Lab Vendor\Update", 0)).is_empty());
+        assert!(task_blocks(&t(r"\Microsoft Office\Update", 0)).is_empty(), "compared by component");
+        let w = task_blocks(&t(r"\Microsoft\Windows\X", 0));
+        assert_eq!((w[0].code, w.len()), (BlockCode::ProtectedPath, 1));
+        let o = task_blocks(&t(r"\Lab\X", 1));
+        assert_eq!((o[0].code, o.len()), (BlockCode::Unsupported, 1));
+        assert_eq!(task_blocks(&t(r"\MICROSOFT\X", 2)).len(), 2);
+    }
+
+    #[test]
+    fn names_elsewhere_rule() {
+        let roots = [Path::new(r"C:\PF"), Path::new(r"C:\PF86")];
+        let own = Path::new(r"C:\PF\App");
+        let r = |text: &str, own: &Path| names_elsewhere(text, &roots, own);
+        assert!(r(r#""C:\PF\App\a.exe" --run"#, own).is_none(), "inside the own folder");
+        assert!(r(r"C:\PF\App", own).is_none(), "the folder itself");
+        assert!(r(r#""C:\PF\App\a.exe" --data "C:\PF\App2\x""#, own).unwrap().contains(r"c:\pf\app2\x"), "a sibling folder with the same prefix");
+        assert!(r(r"C:\PF86\App\a.exe", own).is_some(), "the x86 root");
+        assert!(r(r#""C:\PF\App\a.exe" -d "C:\PF\NVIDIA App\x""#, own).unwrap().ends_with("outside the program's folder"));
+        assert!(r(r"C:\ProgramData\V\x.log", own).is_none(), "ProgramData is not a Program Files root");
+        assert!(r(r"D:\Tools\x.exe", own).is_none(), "other drives are not checked");
+        assert!(r("C:/PF/App/a.exe", own).is_none(), "slashes");
+        let file = Path::new(r"C:\PF\App\app.exe");
+        assert!(r(r#""C:\PF\App\app.exe" --x"#, file).is_none(), "a file-only pick with the exe itself");
+        assert!(r(r"C:\PF\App\app.exe", file).is_none(), "the exe at the end of the text");
+        assert!(r(r#""C:\PF\App\app.exe" --cfg "C:\PF\App\app.ini""#, file).is_some(), "a sibling file of a file-only pick");
+        assert!(r(r"C:\PF\App\a.exe;C:\PF\Other\b.exe", own).is_some(), "one inside and one outside");
+        assert!(r("C:\\PF\\App\\a.exe\nC:\\PF\\Other\\b.dll", own).is_some(), "a second line");
+    }
+
+    /// Read-only: the real Windows folders and the owner of real files.
+    #[test]
+    fn program_protected_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::sandbox(dir.path(), "prot1");
+        let var = |n: &str| PathBuf::from(std::env::var(n).unwrap());
+        let sys = var("SystemRoot").join(r"System32\cmd.exe");
+        assert!(program_protected(&env, &sys).unwrap().contains("protected Windows folder"), "the Windows tree");
+        assert!(program_protected(&env, &var("CommonProgramFiles").join(r"x\y.exe")).is_some(), "Common Files, a missing file");
+        assert!(program_protected(&env, &var("ProgramData").join(r"Microsoft\Windows Defender\x.exe")).is_some(), "ProgramData\\Microsoft");
+        let f = dir.path().join("own.exe");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(program_protected(&env, &f).is_none(), "an existing file of ours");
+        assert!(program_protected(&env, &dir.path().join("missing.exe")).is_none(), "a missing path outside every protected tree");
+        assert!(program_protected(&env, Path::new(r"relative\x.exe")).unwrap().contains("not a local absolute path"));
     }
 
     #[test]

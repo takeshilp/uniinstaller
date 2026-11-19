@@ -343,6 +343,8 @@ fn parent_target(t: &Target) -> Option<Target> {
         Target::Path { path, .. } => path.parent().map(|p| Target::Path { path: p.to_path_buf(), kind: PathKind::Dir }),
         Target::RegValue { key, .. } | Target::RegRevert { key, .. } => Some(Target::RegKey { key: key.clone() }),
         Target::RegKey { key } => key.path.rsplit_once('\\').map(|(up, _)| Target::RegKey { key: RegPath::new(key.hive, key.view, up) }),
+        // Services and tasks are not traced (shortcut 4 in docs/architecture.md), so they have no parent in a journal.
+        Target::Service { .. } | Target::Task { .. } => None,
     }
 }
 
@@ -644,6 +646,8 @@ fn display(t: &Target) -> String {
         Target::Path { path, .. } => path.display().to_string(),
         Target::RegKey { key } => key.display(),
         Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => format!("{}\\{}", key.display(), if name.is_empty() { "@" } else { name }),
+        Target::Service { name } => format!("service {name}"),
+        Target::Task { path } => format!("task {path}"),
     }
 }
 

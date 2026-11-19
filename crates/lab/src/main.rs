@@ -18,7 +18,7 @@ const REFUSED: i32 = 2;
 const CRASH_CODE: u32 = 99;
 /// `force` found the path Listed or Refused: the check result is printed instead of an operation.
 const CHECK_REFUSED: i32 = 3;
-const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | force <path> <name> [--publisher <p>] [--run] | native <op> | scan <op> | apply <op> default|default+reverts|unblocked [--crash-after-first-move] | restore <op> | show <op>";
+const USAGE: &str = "usage: uni-lab check | list | trace <installer> | begin <app-id> | force <path> <name> [--publisher <p>] [--run] | native <op> | scan <op> | apply <op> default|default+reverts|default+system|unblocked [--crash-after-first-move] | restore <op> | show <op>";
 
 /// Pure. The token user must be the Windows Sandbox account (it exists disabled on a normal host) and
 /// UNIINSTALLER_LAB must name a local folder with the lab marker (explicit intent, not a location proof).
@@ -58,7 +58,7 @@ fn lab_env() -> Result<Env, String> {
 /// confirms the "previous values" group. `unblocked`: every candidate without a hard block and without a user-data warning, i.e. a
 /// user who ticks everything the product does not warn about.
 fn select(plan: &Plan, policy: &str) -> Result<Vec<String>, String> {
-    if !matches!(policy, "default" | "default+reverts" | "unblocked") {
+    if !matches!(policy, "default" | "default+reverts" | "default+system" | "unblocked") {
         return Err(format!("unknown policy '{policy}'"));
     }
     Ok(plan
@@ -67,6 +67,7 @@ fn select(plan: &Plan, policy: &str) -> Result<Vec<String>, String> {
         .filter(|c| match policy {
             "default" => c.selected,
             "default+reverts" => c.selected || (c.group == Group::Revert && c.blocks.is_empty()),
+            "default+system" => c.selected || (c.group == Group::Services && c.blocks.is_empty()),
             _ => c.blocks.is_empty() && !c.evidence.iter().any(|e| e.code == EvidenceCode::UserDataLikely),
         })
         .map(|c| c.id.clone())
@@ -268,5 +269,28 @@ mod tests {
         assert_eq!(select(&plan, "default+reverts").unwrap(), ["safe", "revert"], "only an unblocked revert is added");
         assert_eq!(select(&plan, "unblocked").unwrap(), ["safe", "review", "revert"]);
         assert!(select(&plan, "all").is_err());
+    }
+
+    #[test]
+    fn system_policy() {
+        let block = Block { code: BlockCode::ProtectedPath, detail: String::new() };
+        let mut svc = cand("service", false, vec![], vec![]);
+        svc.group = Group::Services;
+        let mut blocked_svc = cand("blocked-service", false, vec![block], vec![]);
+        blocked_svc.group = Group::Services;
+        let plan = Plan {
+            schema: SCHEMA,
+            created_ms: 0,
+            app_id: "x".into(),
+            dry_run: false,
+            install_dir: None,
+            install_dir_status: DirStatus::NotSet {},
+            corroborated: false,
+            still_running: vec![],
+            trace: None,
+            candidates: vec![cand("safe", true, vec![], vec![]), cand("review", false, vec![], vec![]), svc, blocked_svc],
+        };
+        assert_eq!(select(&plan, "default").unwrap(), ["safe"], "a service is never preselected");
+        assert_eq!(select(&plan, "default+system").unwrap(), ["safe", "service"], "only an unblocked service or task is added");
     }
 }

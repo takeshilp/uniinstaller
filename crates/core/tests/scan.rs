@@ -68,13 +68,24 @@ fn sandbox_notes_plan() {
     assert_eq!(own.len(), 2, "both views' keys");
     assert!(own.iter().all(|c| c.tier == Tier::Safe && c.blocks.is_empty()));
 
-    // Nothing else: 5 children (the exe is gone), 2 lnk, Run, App Paths, 2 own keys, AppData dir, Software key.
-    assert_eq!(plan.candidates.len(), 13, "{:#?}", plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>());
+    // The program's Windows service and scheduled task (sandbox stand-ins): found by reference, the program file is gone (80, Safe), and
+    // never preselected whatever the tier (group Services).
+    let svc = plan.candidates.iter().find(|c| c.id == "service:sandboxnotessvc").expect("the service");
+    check(svc, 80, Tier::Safe, false);
+    assert_eq!(svc.group, Group::Services);
+    assert!(svc.blocks.is_empty() && matches!(svc.ident, Ident::Service { .. }), "{:?}", svc.blocks);
+    let task = plan.candidates.iter().find(|c| c.id == r"task:\sandbox soft\sandbox notes update").expect("the task");
+    check(task, 80, Tier::Safe, false);
+    assert_eq!(task.group, Group::Services);
+    assert!(task.blocks.is_empty() && matches!(task.ident, Ident::Task { .. }), "{:?}", task.blocks);
+
+    // Nothing else: 5 children (the exe is gone), 2 lnk, Run, App Paths, 2 own keys, AppData dir, Software key, the service, the task.
+    assert_eq!(plan.candidates.len(), 15, "{:#?}", plan.candidates.iter().map(|c| &c.id).collect::<Vec<_>>());
     assert!(plan.candidates.iter().all(|c| !path_of(c).is_some_and(|p| p.ends_with("keep.txt"))), "outside keep.txt is not listed");
     assert!(plan.candidates.iter().all(|c| !path_of(c).is_some_and(|p| paths::is_inside(p, &documents(&f.env)))));
     assert!(!plan.candidates.iter().any(|c| matches!(&c.target, Target::RegValue { name, .. } if name == "SandboxSuite")), "another app's Run value");
     for c in &plan.candidates {
-        assert!(c.id.starts_with("path:") || c.id.starts_with("key:") || c.id.starts_with("value:"));
+        assert!(["path:", "key:", "value:", "service:", "task:"].iter().any(|p| c.id.starts_with(p)), "{}", c.id);
         assert_ne!(c.ident, Ident::None {}, "Ident::None only with a block");
     }
 }

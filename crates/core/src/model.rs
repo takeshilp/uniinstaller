@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Operations and plans. Schema-1 (0.1.x) manifests still load; a newer one is refused (`ops::load`).
-// shortcut: there is no downgrade path: 0.1.x lists a schema-2 manifest that uses the new variants as Broken; keep new variants additive.
+// shortcut: there is no downgrade path: 0.1.x lists a schema-2 manifest that uses the new variants as Broken; keep new variants additive
+// (the service and task variants are additive too: an older build lists an operation whose plan holds one as Broken).
 pub const SCHEMA: u32 = 2;
 /// Trace journals (`trace::load` refuses a newer one).
 pub const TRACE_SCHEMA: u32 = 1;
@@ -158,6 +159,8 @@ pub enum Group {
     Data,
     /// Previous values of registry values an install changed (trace only), never preselected.
     Revert,
+    /// Windows services and scheduled tasks that run the program, never preselected. Appended last: it sorts after every other group.
+    Services,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +188,10 @@ pub enum Target {
     RegValue { key: RegPath, name: String },
     /// Write `previous` back into an existing value that a traced install changed.
     RegRevert { key: RegPath, name: String, previous: RegVal },
+    /// A Windows service, removed through the Service Control Manager.
+    Service { name: String },
+    /// A scheduled task (`\Vendor\Name`), removed through the Task Scheduler.
+    Task { path: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +235,11 @@ pub enum Ident {
     Link { id: FileId },
     Key { node: RegNode },
     Value { val: RegVal },
+    /// The whole service key (everything `QueryServiceConfig` returns, plus parameters and security) and the running state at the scan
+    /// (display only: `running` is not part of the identity, see `ops::same_ident`).
+    Service { node: RegNode, running: Option<bool> },
+    /// The task definition as the scheduler returns it, its exec action command lines and whether it was enabled.
+    Task { xml: String, actions: Vec<String>, enabled: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +279,8 @@ pub enum BlockCode {
     TooLarge,
     Unverifiable,
     OtherVolume,
+    /// A driver, a per-user service, an unknown service type or a task with actions other than a program: report only.
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -347,6 +361,7 @@ pub struct ItemRecord {
     pub status: ItemStatus,
     pub detail: Option<String>,
     pub quarantine: Option<PathBuf>,
+    /// A registry, service or task backup.
     pub reg_backup: Option<Ident>,
     pub restore: Option<RestoreStatus>,
     pub restore_detail: Option<String>,

@@ -242,7 +242,11 @@ pub fn io_status(e: &io::Error) -> ItemStatus {
     match e.raw_os_error() {
         Some(5) => ItemStatus::AccessDenied,
         Some(32) | Some(33) => ItemStatus::Locked,
-        Some(2) | Some(3) => ItemStatus::NotFound,
+        // Service control: cannot stop (invalid control, timeout, cannot accept a control) is Locked; already marked for deletion is
+        // gone. 1060 (the SCM does not know a service whose key exists) is not mapped: it stays a failure. File operations never
+        // return these codes.
+        Some(1052) | Some(1053) | Some(1061) => ItemStatus::Locked,
+        Some(2) | Some(3) | Some(1072) => ItemStatus::NotFound,
         _ => ItemStatus::Failed,
     }
 }
@@ -350,5 +354,17 @@ mod tests {
         assert_eq!(w.files, 4); // a.exe, unins000.exe, Saves, link
         assert!(!w.truncated);
         assert!(walk(&r.join("app"), 2).unwrap().truncated);
+    }
+
+    #[test]
+    fn io_status_codes() {
+        let st = |c: i32| io_status(&io::Error::from_raw_os_error(c));
+        assert_eq!((st(5), st(32), st(33), st(2), st(3)), (ItemStatus::AccessDenied, ItemStatus::Locked, ItemStatus::Locked, ItemStatus::NotFound, ItemStatus::NotFound));
+        // Service control: cannot stop (invalid control, timeout, cannot accept a control) is Locked; already marked for deletion is gone.
+        assert_eq!((st(1052), st(1053), st(1061)), (ItemStatus::Locked, ItemStatus::Locked, ItemStatus::Locked));
+        assert_eq!(st(1072), ItemStatus::NotFound);
+        // 1060 (the SCM does not know a service whose key exists) stays a failure.
+        assert_eq!(st(1060), ItemStatus::Failed);
+        assert_eq!(st(87), ItemStatus::Failed);
     }
 }

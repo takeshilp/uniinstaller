@@ -7,8 +7,9 @@ use crate::model::*;
 use crate::native::{RunOptions, alive, run_uninstaller};
 use crate::paths::{self, io_status, is_canonical, is_inside, norm, restore_path};
 use crate::registry;
-use crate::safety::{Anchors, path_blocks, real_folders, registry_blocks, zone_root_of};
+use crate::safety::{Anchors, path_blocks, program_protected, real_folders, registry_blocks, service_blocks, task_blocks, zone_root_of};
 use crate::scan::{Ctx, anchors_of, data_volume, evaluate};
+use crate::sysobj;
 use crate::trace;
 use crate::{Error, Result, now_ms};
 use std::fs;
@@ -60,8 +61,9 @@ fn manifest_path(env: &Env, id: &str) -> PathBuf {
 // shortcut: quarantine, manifests, plans and reports are never purged; add a "delete backup" action and a retention
 // policy before 1.0.
 // shortcut: quarantine and HKLM backups made while elevated live in the user-writable profile, and the app is a
-// per-user install, so same-user malware could tamper with them before an elevated restore; upgrade to a
-// per-machine install, a helper and a protected ProgramData store in stage 2.
+// per-user install, so same-user malware could tamper with them before an elevated restore (a service or task backup could make it create
+// a LocalSystem service or a SYSTEM task; `restore_system` re-checks the blocks); upgrade to a per-machine install, a helper and a
+// protected ProgramData store in stage 2.
 pub fn save(env: &Env, op: &Operation) -> Result<()> {
     valid_op_id(&op.id)?;
     let dir = op_dir(env, &op.id);
@@ -129,6 +131,8 @@ pub fn target_key(t: &Target) -> String {
         Target::RegKey { key } => format!("key:{}", rp(key)),
         Target::RegValue { key, name } => format!("value:{}|{}", rp(key), name.to_lowercase()),
         Target::RegRevert { key, name, .. } => format!("revert:{}|{}", rp(key), name.to_lowercase()),
+        Target::Service { name } => format!("service:{}", name.to_lowercase()),
+        Target::Task { path } => format!("task:{}", path.to_lowercase()),
     }
 }
 
@@ -138,7 +142,7 @@ pub fn safe_file_name(s: &str) -> String {
 
 fn strip_payloads(i: &Ident) -> Ident {
     match i {
-        Ident::Key { .. } | Ident::Value { .. } => Ident::None {},
+        Ident::Key { .. } | Ident::Value { .. } | Ident::Service { .. } | Ident::Task { .. } => Ident::None {},
         other => other.clone(),
     }
 }
@@ -349,31 +353,45 @@ fn is_final(s: ItemStatus) -> bool {
     matches!(s, ItemStatus::Removed | ItemStatus::NotFound | ItemStatus::Reverted)
 }
 
-fn target_exists(t: &Target) -> bool {
+/// A service or task that cannot be read counts as existing (fail closed): nothing is then reported as "already gone".
+fn target_exists(env: &Env, t: &Target) -> bool {
     match t {
         Target::Path { path, .. } => fs::symlink_metadata(path).is_ok(),
         Target::RegKey { key } => registry::exists(key),
         Target::RegValue { key, name } | Target::RegRevert { key, name, .. } => registry::read_value(key, name).is_ok(),
+        Target::Service { name } => sysobj::service(env, name).map(|s| s.is_some()).unwrap_or(true),
+        Target::Task { path } => sysobj::task(env, path).map(|t| t.is_some()).unwrap_or(true),
     }
 }
 
-/// Reverts first (a revert and a delete of the same value cannot both apply), then values, then keys shallow first, then paths deep first.
+/// Services and tasks first (a running service holds its files and a task could start the program during the apply), then reverts
+/// (a revert and a delete of the same value cannot both apply), then values, then keys shallow first, then paths deep first.
 fn target_rank(t: &Target) -> (u8, usize) {
     match t {
-        Target::RegRevert { .. } => (0, 0),
-        Target::RegValue { .. } => (0, 1),
-        Target::RegKey { key } => (1, key.path.matches('\\').count()),
-        Target::Path { path, .. } => (2, usize::MAX - norm(path).matches('\\').count()),
+        Target::Service { .. } | Target::Task { .. } => (0, 0),
+        Target::RegRevert { .. } => (1, 0),
+        Target::RegValue { .. } => (1, 1),
+        Target::RegKey { key } => (2, key.path.matches('\\').count()),
+        Target::Path { path, .. } => (3, usize::MAX - norm(path).matches('\\').count()),
+    }
+}
+
+/// Identity for revalidation: a service's running state is display-only (a stop that timed out, a demand start or a crash between the
+/// stop and DeleteService change it); its whole registry key is what must be unchanged.
+fn same_ident(a: &Ident, b: &Ident) -> bool {
+    match (a, b) {
+        (Ident::Service { node: x, .. }, Ident::Service { node: y, .. }) => x == y,
+        _ => a == b,
     }
 }
 
 /// An interrupted apply leaves `InProgress` records: if the action completed, close the record.
-fn recover_in_progress(op: &mut Operation) {
+fn recover_in_progress(env: &Env, op: &mut Operation) {
     for i in op.items.iter_mut().filter(|i| i.status == ItemStatus::InProgress) {
         let done = match &i.target {
             Target::Path { .. } => i.quarantine.as_deref().is_some_and(Path::exists),
             Target::RegRevert { key, name, previous } => registry::read_value(key, name).is_ok_and(|v| registry::same_data(&v, previous)),
-            t => !target_exists(t),
+            t => !target_exists(env, t),
         };
         if done {
             i.status = if matches!(i.target, Target::RegRevert { .. }) { ItemStatus::Reverted } else { ItemStatus::Removed };
@@ -398,7 +416,7 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     let confirmed: Option<PathBuf> = if matches!(plan.install_dir_status, DirStatus::Confirmed {}) { plan.install_dir.clone() } else { None };
     let (app, launch) = (op.app.clone(), op.launch.clone());
     let ctx = Ctx { env, app: &app, launch: Some(&launch), install_dir: confirmed.as_deref(), anchors: &anchors, data_volume: data_volume(env) };
-    recover_in_progress(&mut op);
+    recover_in_progress(env, &mut op);
 
     let mut chosen: Vec<&Candidate> = Vec::new();
     for id in candidate_ids {
@@ -434,16 +452,16 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
         };
         if c.ident == (Ident::None {}) {
             refuse(&mut rec, ItemStatus::Blocked, "identity could not be verified".into());
-        } else if matches!(c.target, Target::RegRevert { .. }) && !target_exists(&c.target) {
+        } else if matches!(c.target, Target::RegRevert { .. }) && !target_exists(env, &c.target) {
             // A vanished value is a change, not "already gone": the previous value is never written into a missing value.
             refuse(&mut rec, ItemStatus::Changed, "the value no longer exists; the previous value was not written".into());
-        } else if !target_exists(&c.target) {
+        } else if !target_exists(env, &c.target) {
             refuse(&mut rec, ItemStatus::NotFound, "already gone".into());
         } else {
             let e = evaluate(&ctx, c.group, &c.target);
             if !e.blocks.is_empty() {
                 refuse(&mut rec, ItemStatus::Blocked, first_block(&e.blocks));
-            } else if e.ident != c.ident {
+            } else if !same_ident(&e.ident, &c.ident) {
                 refuse(&mut rec, ItemStatus::Changed, "changed since the scan; left untouched".into());
             }
         }
@@ -473,12 +491,15 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
                 }
                 rec.quarantine = Some(dst);
             }
-            Target::RegKey { .. } | Target::RegValue { .. } | Target::RegRevert { .. } => rec.reg_backup = Some(c.ident.clone()),
+            Target::RegKey { .. } | Target::RegValue { .. } | Target::RegRevert { .. } | Target::Service { .. } | Target::Task { .. } => rec.reg_backup = Some(c.ident.clone()),
         }
         op.items[idx] = rec.clone();
         save(env, &op)?;
+        let mut deferred = false;
         let result: std::io::Result<()> = match &c.target {
             Target::Path { path, .. } => paths::move_path(path, rec.quarantine.as_ref().expect("set above")),
+            Target::Service { name } => sysobj::remove_service(env, name).map(|d| deferred = d),
+            Target::Task { path } => sysobj::delete_task(env, path),
             Target::RegKey { key } => registry::delete_key(key),
             Target::RegValue { key, name } => registry::delete_value(key, name),
             Target::RegRevert { key, name, previous } => registry::write_value(key, &RegVal { name: name.clone(), ..previous.clone() }),
@@ -488,6 +509,9 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
                 rec.status = if matches!(c.target, Target::RegRevert { .. }) { ItemStatus::Reverted } else { ItemStatus::Removed };
                 if let Target::Path { path, .. } = &c.target {
                     moved.push(path.clone());
+                }
+                if deferred {
+                    rec.detail = Some(sysobj::DEFERRED.into());
                 }
             }
             Err(e) => {
@@ -524,7 +548,7 @@ pub fn apply(env: &Env, op_id: &str, candidate_ids: &[String]) -> Result<Operati
     // Verify.
     let listed = list_apps(env, true)?;
     let app_still_listed = listed.iter().any(|a| a.id == op.app.id || a.sources.iter().any(|s| op.app.sources.iter().any(|x| x.same(s))));
-    let reappeared = op.items.iter().filter(|i| i.status == ItemStatus::Removed && target_exists(&i.target)).map(|i| i.candidate_id.clone()).collect();
+    let reappeared = op.items.iter().filter(|i| i.status == ItemStatus::Removed && target_exists(env, &i.target)).map(|i| i.candidate_id.clone()).collect();
     op.verify = Some(Verify { app_still_listed, reappeared });
     if let Some(n) = &op.native {
         op.entry_after = Some(entry_state(&op.app, &op.launch, n.exit_code, &env.folders.windows_dir));
@@ -591,6 +615,7 @@ pub fn restore(env: &Env, op_id: &str) -> Result<Operation> {
                     }
                 }
             },
+            Target::Service { .. } | Target::Task { .. } => item.reg_backup.as_ref().map(|b| restore_system(env, &item.target, b)),
             t => match &item.reg_backup {
                 None => None,
                 Some(backup) => {
@@ -610,6 +635,34 @@ pub fn restore(env: &Env, op_id: &str) -> Result<Operation> {
     (op.status, op.status_detail) = overall_status(&op);
     save(env, &op)?;
     Ok(op)
+}
+
+/// Recreates a removed service or task from its backup. A backup is recreated only if it would have been offered: the same name, a
+/// Win32 service, a program that is not Windows', a task outside `\Microsoft`. A manifest is user-writable (see `save`), so these
+/// checks run again here and nothing is created when one fails.
+fn restore_system(env: &Env, t: &Target, backup: &Ident) -> (RestoreStatus, Option<String>) {
+    let blocked = |bs: Vec<Block>| (RestoreStatus::Failed, Some(format!("blocked: {}", first_block(&bs))));
+    match (t, backup) {
+        (Target::Service { name }, Ident::Service { node, .. }) => {
+            if !node.name.eq_ignore_ascii_case(name) {
+                return (RestoreStatus::Failed, Some("blocked: the backup is of another service".into()));
+            }
+            let s = sysobj::svc_of_node(name, node, &env.folders.windows_dir);
+            let bs = service_blocks(&s, &[], program_protected(env, &sysobj::service_binary(&s, &env.folders.system_dir)));
+            if !bs.is_empty() {
+                return blocked(bs);
+            }
+            sysobj::recreate_service(env, name, node)
+        }
+        (Target::Task { path }, Ident::Task { xml, actions, enabled }) => {
+            let bs = task_blocks(&sysobj::Task { path: path.clone(), actions: actions.clone(), other: 0, enabled: *enabled });
+            if !bs.is_empty() {
+                return blocked(bs);
+            }
+            sysobj::recreate_task(env, path, xml, actions, *enabled)
+        }
+        _ => (RestoreStatus::Failed, Some("backup does not match the target".into())),
+    }
 }
 
 fn restore_registry(t: &Target, backup: &Ident) -> (RestoreStatus, Option<String>) {
@@ -840,6 +893,26 @@ mod tests {
         let p = |s: &str| Target::Path { path: PathBuf::from(s), kind: PathKind::File };
         assert_eq!(target_key(&p(r"C:\A\B\")), target_key(&p("c:/a/b")));
         assert_eq!(target_key(&p(r"C:\A\B")), r"path:c:\a\b");
+        // Services and tasks: any case is the same id.
+        let svc = |n: &str| Target::Service { name: n.into() };
+        assert_eq!(target_key(&svc("LabSvcTool")), "service:labsvctool");
+        assert_eq!(target_key(&svc("LabSvcTool")), target_key(&svc("LABSVCTOOL")));
+        let task = |n: &str| Target::Task { path: n.into() };
+        assert_eq!(target_key(&task(r"\Lab Vendor\Update")), r"task:\lab vendor\update");
+        assert_eq!(target_key(&task(r"\Lab Vendor\Update")), target_key(&task(r"\LAB vendor\UPDATE")));
+    }
+
+    #[test]
+    fn same_ident_ignores_running() {
+        let node = |v: &str| RegNode { name: "S".into(), values: vec![RegVal { name: "ImagePath".into(), kind: 1, data: v.as_bytes().to_vec() }], keys: vec![] };
+        let svc = |n: &str, running| Ident::Service { node: node(n), running };
+        assert!(same_ident(&svc("a", None), &svc("a", Some(true))), "only the running state differs");
+        assert!(same_ident(&svc("a", Some(false)), &svc("a", Some(true))));
+        assert!(!same_ident(&svc("a", None), &svc("b", None)), "a different key");
+        let task = |x: &str| Ident::Task { xml: x.into(), actions: vec![], enabled: true };
+        assert!(same_ident(&task("a"), &task("a")));
+        assert!(!same_ident(&task("a"), &task("b")));
+        assert!(!same_ident(&task("a"), &Ident::None {}));
     }
 
     #[test]
