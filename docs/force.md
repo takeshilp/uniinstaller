@@ -19,7 +19,7 @@ treating a path as a program that something else owns. The GUI entry is "Уда�
   8 an Uninstall key outside the list whose InstallLocation, icon or uninstall command points into the pick and whose uninstaller exists (`Installed`; a key with a missing
   uninstaller is ignored); 9 Windows Installer component registrations (`Env::installer_data`) at or below the pick, or in a folder that holds it (never a root): any product
   not in the list is `Installed`, one listed program is `Listed Installer`, several are `OtherPrograms`; 10 a shortcut to the pick named after a listed program
-  (`Listed Shortcut`); 11 a registered service whose `ImagePath` runs from the pick (`Service`); 12 what was found (uninstallers `unins*` directly in the folder, `.exe` in
+  (`Listed Shortcut`); 11 a registered service (a driver too) whose `ImagePath` or `ServiceDll` runs from the pick (`Service`; scheduled tasks are not a refusal, the scan offers them, see docs/services.md); 12 what was found (uninstallers `unins*` directly in the folder, `.exe` in
   the real system and `.cmd`/`.bat` in the sandbox; version info read as data; shortcuts; other volume; outside the zones; suggested name = ProductName, else the exe's
   stem or the folder's name, never a parent folder's name).
 - Scan rules for a forced target (`scan::scan(.., forced)`): never corroborated, nothing preselected, settings folders and keys looked for only by `Forced.search_names`

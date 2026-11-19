@@ -6,7 +6,8 @@ The lab that runs real installers inside Windows Sandbox: the commands, the guar
 The lab runs real installers and the real `uni_core::ops` flow inside Windows Sandbox. Nothing in `crates/core` changed for it.
 - `uni-lab` commands: `check`, `list`, `begin <app>`, `native <op>`, `scan <op>`, `apply <op> default|unblocked [--crash-after-first-move]`,
   `restore <op>`, `show <op>`. Exit codes: 2 = refused by the guard, 99 = the deliberate kill of `--crash-after-first-move`, 1 = error.
-  `apply` policies: `default` is the product's preselection; `unblocked` ticks every candidate without a hard block and without
+  `apply` policies: `default` is the product's preselection; `default+reverts` and `default+system` add every unblocked revert or every unblocked service and task
+  (the groups the product never preselects); `unblocked` ticks every candidate without a hard block and without
   `UserDataLikely`, like a user who ticks everything the product does not warn about.
 - Guard: every command except `check` needs `UNIINSTALLER_SANDBOX` (the fixture sandbox, as in the GUI and `uni`) or a Windows Sandbox
   guest: the process token user (`GetUserNameW`, never `%USERNAME%`) is `WDAGUtilityAccount` AND `UNIINSTALLER_LAB` names a local absolute
@@ -35,6 +36,16 @@ The lab runs real installers and the real `uni_core::ops` flow inside Windows Sa
   bug); 15e FAIL when a control value the install changed is offered as a revert; 15f FAIL when a revert is preselected. Rule 17 (all scenarios) FAILs when a
   removed item covers a place the inventory skips but the product captures (`d3dscache`, `connecteddevicesplatform`). Metrics: `traceCreated`, `traceEvidence`,
   `reverted`.
+- Services and tasks: the NSIS test app with `SERVICE` creates the service `LabSvcTool` (`sc create`, demand start, the inert payload as its binary) and the task
+  `\Lab Vendor\Lab Service Tool Update` (`schtasks /create /sc onlogon`); the NSIS uninstaller leaves both. The inventory (`inventory.ps1`) records tasks outside `\Microsoft`
+  through the Task Scheduler API (`t` lines with the XML hashed, `n` lines for folders; the task files are not listed because re-registering a task rewrites its file) and, besides the
+  depth-1 names under `Services`, the full key (values and subkeys) of every third-party service (image under `{PF}`, `{PF86}` or `{PD}`, no `Windows*` or `Microsoft*` folder).
+  `analyze.ps1` maps `service:<name>` onto `key:hklm64:system\currentcontrolset\services\<name>`, treats `task:<path>` like a path, counts `t` lines as leftovers and has the policy
+  `default+system`. Rule 18 (all scenarios): FAIL when a candidate of the group `services` is preselected. Metric `systemRemoved`: removed service and task items.
+  `nsis-machine-svc` (policy `default+system`, `owned` includes `service:labsvctool` and `task:\lab vendor\lab service tool update`, `gap`: the emptied task folder and the two Classes keys):
+  PASS in runs 20261119-180421 and 20261119-180600 (the full run, 15 scenarios all PASS): 12 leftovers found of 12, 0 false deletions, 5 items removed (the service and the task among them, 80 Safe,
+  not preselected), the service's six values (ImagePath as ExpandString) and the task XML hash equal after the restore (`s3` equals `s5` line for line), `force-service` still `refused:service`.
+  The stop of a running service is not exercised (the payload is not a service binary).
 - Hidden entries: the NSIS test app has a `HIDDEN` flag (`SystemComponent=1`); `labhidden.exe` is the scenario `hidden-user`, `labpluginhidden.exe` the nested
   plugin of `shared-suite-hidden`. `uni-lab list` includes hidden entries and `uni-lab begin` passes `hidden_ok = true` (the lab acts as a user who ticked
   the confirmation; the refusal is tested in `tests/ops.rs`).

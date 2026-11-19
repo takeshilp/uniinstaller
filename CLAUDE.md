@@ -33,4 +33,5 @@ Stage 1 plus install tracing (stage 2): core crate (`uni-core`), read-only CLI (
 - `docs/tracing.md`: install tracing: capture, diff, trusted journals, reverts, budget.
 - `docs/force.md`: forced removal by path: checks, scan rules, GUI, lab scenarios.
 - `docs/lab.md`: Windows Sandbox lab: commands, guard, snapshots, trace and hidden-entry scenarios.
+- `docs/services.md`: Windows services and scheduled tasks as leftovers: detection, blocks, apply, restore, measurements.
 - `docs/bugs.md`: verified pitfalls and fixed bugs.

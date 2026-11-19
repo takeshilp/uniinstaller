@@ -18,7 +18,10 @@ entries, Classes, Services, Microsoft, Policies, outside every root) is `Protect
 
 Hard blocks (never overridable, recomputed at apply): ProtectedPath, OutsideAllowedZone, NonCanonicalPath (parent is not canonical:
 8.3 names, trailing dot or space, junctions, SUBST), SharedWithOtherApp, AppStillInstalled, ProtectedRegistry, TooLarge (over 200000 files or
-5000 registry nodes), Unverifiable (any failure while computing identity: fail closed), OtherVolume (backups live on the data dir's volume).
+5000 registry nodes), Unverifiable (any failure while computing identity: fail closed), OtherVolume (backups live on the data dir's volume),
+Unsupported (a driver, a per-user service, an unknown service type, a task with an action other than a program: report only).
+Windows services and scheduled tasks have their own rules (a program that belongs to Windows, `\Microsoft` tasks, dependents, places of other programs):
+see docs/services.md.
 
 SharedWithOtherApp (`safety::Anchors`, applied in `scan::evaluate`, so a scan and an apply use the same rule):
 - Who counts as another app: every `list_apps(env, true)` entry except the target's own (`ops::others`), read live at scan and again at apply:
@@ -44,7 +47,7 @@ InInstallDir +45, InstallDirCorroborated +35 (reference candidates only, never i
 TargetMissing +15, OwnUninstallEntry +60, ExactAnchor +60, ExactName +20, PublisherMatch +10, UserDataLikely -50, OutsideKnownZones -20.
 Trace evidence (a trusted journal only, see docs/tracing.md): TraceCreated +100 (`W_TRACE_CREATED`) when the candidate is the confirmed install folder,
 holds it or lies inside it, or also has positive heuristic evidence; +50 (`W_TRACE_FAR`) otherwise; TraceModified +50 (`W_TRACE_MODIFIED`) on reverts.
-Tiers: any block Blocked; >=80 Safe; 40-79 Review; below 40 Weak. Preselected only if Safe, not in the Data or Revert group and without
+Tiers: any block Blocked; >=80 Safe; 40-79 Review; below 40 Weak. Preselected only if Safe, not in the Data, Revert or Services group and without
 `UserDataLikely` (`default_selected`), so install-dir children (at most 45 without a trace) are never preselected. Expected values are asserted in
 `tests/scan.rs` and `tests/trace.rs`. The weights are calibrations, not measurements.
 

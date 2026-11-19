@@ -161,6 +161,8 @@ Verified pitfalls and fixed bugs. Entry template: symptom, cause, fix, how it wa
 - Symptom: the first lab run of the four `force-*` scenarios ended ERROR for all of them: "analyzer failed: Unrecognized escape sequence" while reading `scenario.json`.
 - Cause: the files had been created with `cat <<EOF` from an agent shell that halves every double backslash, so the JSON string `"{LOCALAPPDATA}\\Programs"` became `"{LOCALAPPDATA}\Programs"` (an invalid escape); the guests ran against the broken copy and did nothing useful.
 - Fix: write scenario files with a file-writing tool and check them with `python -c "import json,sys; json.load(open(sys.argv[1]))" <file>` before a lab run.
+- Seen again while adding services: Rust and Python source pasted through a heredoc lost its double backslashes (`'\\'` became `'\'`, `"\\Microsoft"` became `"\Microsoft"`). Most of it failed to compile, but
+  a char literal that still compiled would have changed behaviour silently. Write source edits with the file tool (or a script file written by it) and read the diff for every `\`.
 
 ## Forced removal: the component scan is slow in a debug build
 - Symptom: the read-only probe took 9 to 14 s per check that reached the Windows Installer rule (budget 3 s) on the owner's machine (25,087 component keys, 25,418 values).

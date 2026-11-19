@@ -4,7 +4,7 @@
 `crates/core` (`uni_core`): `model` (serde types), `env` (Env, Folders, sandbox), `paths` (normalisation, canonical form, file id,
 walk, move/restore), `safety` (protected paths, registry shapes, tiers), `registry` (view-aware access, capture, restore),
 `inventory` (list apps, hidden entries, entry state), `command` (UninstallString to Launch), `native` (run uninstaller, process tree), `shortcuts` (.lnk),
-`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals), `force` (forced removal by path), `icon` (program icons for the GUI: DisplayIcon or uninstaller exe read as data, 64 px PNG). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see docs/lab.md). `src-tauri`: Tauri commands.
+`scan` (evidence, candidates, plan), `ops` (journalled flow), `elevation`, `sandbox`, `trace` (install tracing: snapshots, diff, journals), `force` (forced removal by path), `icon` (program icons for the GUI: DisplayIcon or uninstaller exe read as data, 64 px PNG), `sysobj` (Windows services and scheduled tasks: readers, Service Control Manager and Task Scheduler calls, sandbox stand-ins). `crates/cli`: read-only `uni`. `crates/lab`: `uni-lab`, the lab-only driver (never shipped, see docs/lab.md). `src-tauri`: Tauri commands.
 
 ## Pipeline
 `describe` parses the uninstall command; `begin` records the pre-uninstall snapshot; `run_native` runs the vendor uninstaller and waits for
@@ -53,6 +53,9 @@ PartiallyRestored (`ops::overall_status`, a pure ordered rule list; InProgress c
 
 See docs/safety.md.
 
+## Services and tasks
+`Target::Service { name }` (id `service:<lower name>`) and `Target::Task { path }` (id `task:<lower path>`), `Ident::Service { node, running }` (the whole service key; `running` is display-only and ignored by `ops::same_ident`) and `Ident::Task { xml, actions, enabled }`, `Group::Services` (appended after Revert, never preselected), `BlockCode::Unsupported`, and `Env.tasks` (the sandbox's stand-in for the Task Scheduler; `None` on the real system). All additive: the schema stays 2, a manifest without a service or task is byte-identical, and an older build (0.2.0, hidden-apps, force, icons) lists an operation whose plan holds one as `Broken`. Do not rescan or restore such an operation in an older build. See docs/services.md.
+
 See docs/tracing.md.
 
 See docs/safety.md.
@@ -63,7 +66,7 @@ See docs/lab.md.
 
 ## Known shortcuts (each is also a `// shortcut:` comment)
 - Elevation (`elevation.rs`, `main.rs`): the whole UI becomes elevated after "restart as administrator", no privilege separation; narrow helper in stage 2.
-- Elevated backups are user-writable (`ops.rs`, README): same-user malware could tamper with them before an elevated restore; per-machine install and protected store in stage 2.
+- Elevated backups are user-writable (`ops.rs`, README): same-user malware could tamper with them before an elevated restore (a service or task backup could make it create a LocalSystem service or a SYSTEM task; `restore_system` re-checks the blocks); per-machine install and protected store in stage 2.
 - Debug builds (`ops.rs`): destructive operations refuse non-sandbox Env; intended, keep.
 - Process tree (`native.rs`): 150 ms polling can miss a short-lived orphaned grandchild; job object in the helper.
 - Waiting (`native.rs`, `ops.rs`): on timeout or "stop waiting" nothing is killed and scanning is allowed once the entry is gone.
@@ -92,7 +95,7 @@ See docs/lab.md.
 - Lab, UAC (`lab/`): the guest is a single elevated administrator with UAC off, so UAC prompts, standard-user AccessDenied paths and other profiles are not tested; add a `runas /trustlevel:0x20000` scenario with the stage-2 elevated helper.
 - Lab, installers: no Inno Setup app (ISCC is not installed); add `lab/apps/app.iss` when it is available without elevation. NSIS uninstallers are silent by design, add a wizard-clicking scenario if real wizard uninstallers misbehave.
 - Lab, clicker (`lab/guest/clicker.ps1`): only IDYES (6) and the MSI confirmation Yes (3001) in msiexec `#32770` dialogs; add other ids or processes when a scenario needs them.
-- Lab, inventory (`lab/guest/inventory.ps1`): scoped roots (plus `LocalLow`), depth-1 names for Classes and Services, size+mtime fingerprints; widen the roots or hash contents when a product change touches new places. `analyze.ps1` folds the 32-bit view of `...\CurrentVersion\App Paths` onto the 64-bit one because Windows mirrors it.
+- Lab, inventory (`lab/guest/inventory.ps1`): scoped roots (plus `LocalLow`), depth-1 names for Classes and Services plus full keys of third-party services (image under {PF}/{PF86}/{PD}, no `Windows*`/`Microsoft*` folder), tasks outside `\Microsoft` through the Task Scheduler API (XML hashed; the task files are not listed), size+mtime fingerprints; widen the roots or hash contents when a product change touches new places. `analyze.ps1` folds the 32-bit view of `...\CurrentVersion\App Paths` onto the 64-bit one because Windows mirrors it.
 - Lab, metrics: recall and precision are reported, not gated; set thresholds after at least 3 stable full runs and recalibrate the `safety.rs` weights from that data.
 - Lab, crash point (`uni-lab`): the kill is only "after the first quarantined path"; add a registry-phase kill if resume bugs show up there.
 - Lab, cost: one fresh sandbox per scenario (about 30 s of boot each) and a full `_in` copy per run (delete old runs by hand with `cmd /c rmdir /s /q`); batch scenarios if full runs get too slow.
@@ -133,7 +136,7 @@ See docs/lab.md.
   2. Uninstallers are found only by `unins*` names directly in the folder; deeper folders and other names (`remove.exe`, `setup.exe /uninstall`) are missed, widen this if users report misses.
   3. A folder inside a listed program's folder is refused (`ListedHow::Inside`): plugins and mods dropped into a host cannot be forced.
   4. Unlisted Uninstall keys whose uninstaller is gone are ignored; adopt them as the target's own entry if they show up as leftovers.
-  5. Services refuse the pick (the services feature will offer removal instead); `ServiceDll` (svchost) services, drivers given as `\SystemRoot\...` and scheduled tasks are not checked.
+  5. Services (including svchost `ServiceDll` services and drivers) refuse the pick; scheduled tasks are not checked, the scan offers them instead (never Safe, never preselected).
   6. The MSI component scan reads every component key on each check; cache it per session if it gets slow.
   7. Version info uses the first translation only; the main exe is the single exe in the folder or the one whose stem equals the folder's name.
   8. The identity check runs at begin; a program installed later around the folder is seen only by the usual scan and apply blocks.
@@ -147,4 +150,24 @@ See docs/lab.md.
   16. Shortcuts are resolved by the file dialog only; core accepts an `.exe` or a folder.
   17. The clean-exit gate sees only the launcher's exit code (an NSIS uninstaller copies itself and the launcher exits 0).
   18. Lab, `force-*`: the 1-to-5 comparison of an `expect_force` scenario skips folders the inventory could not read; the real data shapes of the SCM and Windows Installer checks are proven by `force-service` and `force-msi-bare` only for one product each.
+- Services and tasks (`sysobj.rs`, `scan.rs`, `ops.rs`, one comment per item in the code, details in docs/services.md):
+  1. Detection is by reference only (image, `ServiceDll` or an exec action into the confirmed folder or picked file): no trace evidence (services and tasks are not captured), no name match, and an app without a confirmed folder gets none. Add a trace capture of service names and task paths when the budget allows.
+  2. Never preselected (`default_selected`); the tier comes from the uncalibrated weights (65 Review, 80 Safe when the program is gone). Revisit with lab statistics.
+  3. Any dependent blocks, including one of the same program and a group dependency; remove the program that owns the dependent first. After a first apply the operation offers no rescan.
+  4. The stop waits 30 s with no stop button and never kills; a service that does not stop ends Locked. Add Restart Manager or a "stop waiting" button.
+  5. A service the SCM only marked for deletion ends `Removed` with a detail; there is no per-item PendingReboot status.
+  6. Restore sets only the `CreateServiceW` fields and delayed start through the API; the other values (description, failure actions, triggers, parameters, security descriptor) are written into the key and apply at the latest after a restart. Account passwords are not restored.
+  7. Tasks with a stored password cannot be recreated, and a task's security descriptor is not backed up.
+  8. Emptied task folders, the `TaskCache` tree entry and the svchost group list entries stay.
+  9. Non-exec task actions are not matched, and a task that has one is Unsupported. The working directory is not matched.
+  10. Indirect display names show the key name.
+  11. Non-elevated, a service with an unreadable `Security` subkey is Unverifiable (9 of 38 third-party services on the owner's machine) and tasks the user cannot read are not seen. The fix is to restart as administrator before removing anything; after a first apply the operation offers no rescan.
+  12. Drivers and per-user services are report-only.
+  13. Backups are user-writable (the shortcut above): an elevated restore could create a LocalSystem service or a SYSTEM task from a tampered manifest; the stage-2 helper and a protected store fix this.
+  14. `%VAR%` expands in our environment; another user's per-user paths are matched against ours.
+  15. A recreated service or task that differs from its backup ends Conflict although it exists again.
+  16. Each scan enumerates all services and tasks once; cache per session if previews get slow (111 s for 282 programs in a debug build).
+  17. Lab: a running service, a custom security descriptor and password tasks are not exercised (the payload is not a service binary).
+  18. The "outside the program's folder" rule checks Program Files roots only and fails closed: the program's own second folder (its x86 half, the vendor's Common Files) blocks too; widen `own` to the program's other registered folders if users report blocked services of their own program.
+  19. An existing program whose owner cannot be read blocks the service (fail closed); measure on real data before relaxing.
 - Lab, analyzer: `analyze.ps1` has no unit tests; its rules are checked against the scenario verdicts, add a synthetic-run self-test if the rules change often.
